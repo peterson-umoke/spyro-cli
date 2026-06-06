@@ -21,6 +21,10 @@ from .commands import (
     cmd_watch,
     cmd_artisan,
     cmd_wp,
+    cmd_pin,
+    cmd_unpin,
+    cmd_pins,
+    cmd_sync,
     cmd_db_shell,
     cmd_db_tunnel,
 )
@@ -66,6 +70,10 @@ main.add_command(cmd_cp, "cp")
 main.add_command(cmd_db_tunnel, "db-tunnel")
 main.add_command(cmd_db_shell, "db-shell")
 main.add_command(cmd_wp, "wp")
+main.add_command(cmd_pin, "pin")
+main.add_command(cmd_unpin, "unpin")
+main.add_command(cmd_pins, "pins")
+main.add_command(cmd_sync, "sync")
 
 
 if __name__ == "__main__":

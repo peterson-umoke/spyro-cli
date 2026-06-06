@@ -188,7 +188,7 @@ Spyro uses a dual-strategy approach:
 
 | Command | Description |
 |---------|-------------|
-| `spyro doctor` | Automated audit: SSH connectivity, remote paths, port conflicts, artisan/WordPress detection. |
+| `spyro doctor` | Automated audit: SSH, paths, ports, artisan, WordPress, Redis, Supervisor, PHP-FPM, Node.js. |
 | `spyro init` | Bootstrap `spyro.toml` and run toolchain audit. |
 | `spyro pull-env -p staging` | Mirror remote `.env` to local `.env.remote`. |
 
@@ -196,7 +196,11 @@ Spyro uses a dual-strategy approach:
 
 | Command | Description |
 |---------|-------------|
-| `spyro watch ./src /var/www/app/src -p staging` | Real-time file sync using native OS filesystem watchers. Requires `pip install watchdog`. |
+| `spyro pin ./src /var/www/app/src -p staging` | Pin a local directory for automatic sync. Auto-detects framework and applies exclusions. |
+| `spyro pins` | List all pinned sync directories. |
+| `spyro unpin ./src -p staging` | Remove a pinned directory. |
+| `spyro sync -p staging` | Watch all pinned dirs and auto-sync on save. Use `--dry-run` to preview. |
+| `spyro watch ./src /var/www/app/src -p staging` | Legacy manual sync (use `spyro pin` + `spyro sync` instead). |
 
 ## Architecture
 
@@ -239,6 +243,34 @@ The STS (`src/supervisor/tunnel.py`) replaces `autossh` with a Python-native sup
 - Handles network roaming and sleep/wake cycles
 - Uses `psutil` for cross-platform process tree management
 - Tracks PIDs/PGIDs in `~/.spyro/tunnels.json` for orphan cleanup
+
+### Service Detection
+
+`spyro doctor` auto-detects these remote services:
+
+| Service | Detection Method |
+|---------|-----------------|
+| Redis | `redis-server` binary, process check, `redis-cli info` |
+| Supervisor | `supervisorctl` binary, `supervisord` process, managed process counts |
+| PHP-FPM | `php-fpm*` binary (version-aware), `php-fpm -tt` pool count |
+| Node.js | `node` binary, version, running processes |
+| npm | `npm` binary, version |
+
+### Smart Sync
+
+The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default:
+
+**Always excluded** (all frameworks):
+- `.env*` — all environment files
+- `*.local` — local config overrides
+- `node_modules/`, `vendor/`, `__pycache__/`
+- `*.swp`, `*~`, `.DS_Store`, `*.log`
+
+**Framework-specific** (auto-detected or manual):
+- **Laravel**: `.env`, `storage/logs/`, `bootstrap/cache/`, `vendor/`, `node_modules/`
+- **WordPress**: `.env`, `wp-config.php`, `wp-content/cache/`, `vendor/`
+- **Node.js**: `.env.local`, `.env.*.local`, `node_modules/`, `.next/`, `dist/`
+- **Python**: `.env`, `__pycache__/`, `.venv/`, `*.pyc`
 
 ### Security Model
 

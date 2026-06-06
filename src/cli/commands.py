@@ -20,6 +20,12 @@ from ..utils.config import (
     load_config,
 )
 from ..core.db import generate_connection_url, resolve_db_credentials
+from ..core.services import detect_all_services
+from ..core.sync import (
+    SyncPin, load_pins, add_pin, remove_pin,
+    detect_framework, should_exclude, filter_files,
+    FRAMEWORK_EXCLUSIONS, SENSITIVE_PATTERNS,
+)
 from ..core.pty_engine import PTYRunner, build_scp_args, build_ssh_args
 from ..supervisor.state import (
     all_tunnels,
@@ -389,6 +395,25 @@ def cmd_doctor() -> None:
                 console.print(f"  [yellow]⚠[/yellow] {name}: WordPress not detected")
                 issues.append(f"WordPress not detected on {name} (wordpress=true in config)")
 
+    # Remote service detection
+    console.print("\n[bold]6. Remote services[/bold]")
+    for name, profile in config.profiles.items():
+        console.print(f"\n  [cyan]{name}[/cyan] ({profile.host})")
+        services = detect_all_services(
+            host=profile.host,
+            user=profile.user,
+            port=profile.port,
+            key=profile.key,
+        )
+        for svc in services:
+            line = f"    {svc.icon} {svc.summary}"
+            if svc.path:
+                line += f" ({svc.path})"
+            console.print(line)
+            if svc.details:
+                for k, v in svc.details.items():
+                    console.print(f"      {k}: {v}")
+
     console.print(f"\n[bold]Summary:[/bold] {len(issues)} issue(s) found")
     if issues:
         for issue in issues:
@@ -654,6 +679,202 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> N
 
     if exit_code != 0:
         console.print(f"\n[red]Exit code: {exit_code}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# spyro pin
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.argument("local_path")
+@click.argument("remote_path")
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--framework", "-f", default="auto", help="Framework: auto, laravel, wordpress, node, python, or empty")
+@click.option("--exclude", "-e", multiple=True, help="Additional glob patterns to exclude")
+def cmd_pin(local_path: str, remote_path: str, profile: str, framework: str, exclude: tuple[str, ...]) -> None:
+    """Pin a local directory for automatic sync to remote server."""
+    local = Path(local_path).resolve()
+    if not local.exists():
+        console.print(f"[red]Local path does not exist: {local}[/red]")
+        return
+
+    detected = ""
+    if framework == "auto":
+        detected = detect_framework(local)
+        if detected:
+            console.print(f"[cyan]Detected framework: {detected}[/cyan]")
+
+    pin = SyncPin(
+        local_path=str(local),
+        remote_path=remote_path,
+        profile=profile,
+        framework=detected if framework == "auto" else framework,
+        exclude_files=list(exclude),
+    )
+
+    exclude_files, exclude_dirs = pin.get_all_excludes()
+    console.print(f"[green]Pinned: {local} -> {remote_path}[/green]")
+    console.print(f"  Profile: {profile}")
+    console.print(f"  Framework: {pin.framework or 'none'}")
+    console.print(f"  Excluded files: {len(exclude_files)} patterns")
+    console.print(f"  Excluded dirs: {len(exclude_dirs)} patterns")
+
+    add_pin(pin)
+    console.print("[green]Pin saved. Use 'spyro sync' to start watching.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# spyro unpin
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.argument("local_path")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def cmd_unpin(local_path: str, profile: str) -> None:
+    """Remove a pinned sync directory."""
+    local = str(Path(local_path).resolve())
+    remaining = remove_pin(local, profile)
+    console.print(f"[green]Removed pin for {local} ({profile})[/green]")
+    if remaining:
+        console.print(f"  {len(remaining)} pin(s) remaining")
+
+
+# ---------------------------------------------------------------------------
+# spyro pins
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+def cmd_pins() -> None:
+    """List all pinned sync directories."""
+    pins = load_pins()
+    if not pins:
+        console.print("[yellow]No pinned directories. Use 'spyro pin' to add one.[/yellow]")
+        return
+
+    table = Table(title="Pinned Sync Directories")
+    table.add_column("Local", style="cyan")
+    table.add_column("Remote")
+    table.add_column("Profile")
+    table.add_column("Framework")
+
+    for pin in pins:
+        table.add_row(pin.local_path, pin.remote_path, pin.profile, pin.framework or "—")
+
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# spyro sync (enhanced watch with exclusions)
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--dry-run", is_flag=True, help="Show what would be synced without uploading")
+def cmd_sync(profile: str, dry_run: bool) -> None:
+    """Watch pinned directories and auto-sync to remote server."""
+    import time
+
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except ImportError:
+        console.print("[red]watchdog not installed. Run: pip install watchdog[/red]")
+        return
+
+    config = load_config()
+    p = config.get_profile(profile)
+
+    all_pins = load_pins()
+    pins = [pin for pin in all_pins if pin.profile == profile]
+
+    if not pins:
+        console.print(f"[yellow]No pinned directories for profile '{profile}'[/yellow]")
+        console.print("Use 'spyro pin <local> <remote> -p <profile>' to add one.")
+        return
+
+    console.print(f"[cyan]Syncing {len(pins)} pinned director(y/ies) for {profile}[/cyan]")
+    for pin in pins:
+        exclude_files, exclude_dirs = pin.get_all_excludes()
+        console.print(f"  {pin.local_path} -> {pin.remote_path} ({len(exclude_files)} exclude patterns)")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run mode -- no files will be uploaded[/yellow]\n")
+
+    class SyncHandler(FileSystemEventHandler):
+        def __init__(self) -> None:
+            self._debounce: dict[str, float] = {}
+
+        def on_any_event(self, event: object) -> None:
+            if event.is_directory:  # type: ignore[attr-defined]
+                return
+
+            src = Path(event.src_path)  # type: ignore[attr-defined]
+
+            matched_pin = None
+            for pin in pins:
+                local = Path(pin.local_path)
+                try:
+                    src.relative_to(local)
+                    matched_pin = pin
+                    break
+                except ValueError:
+                    continue
+
+            if not matched_pin:
+                return
+
+            now = time.time()
+            key = str(src)
+            if key in self._debounce and now - self._debounce[key] < 0.1:
+                return
+            self._debounce[key] = now
+
+            local_base = Path(matched_pin.local_path)
+            exclude_files, exclude_dirs = matched_pin.get_all_excludes()
+
+            if should_exclude(src, local_base, exclude_files, exclude_dirs, matched_pin.include_patterns):
+                if dry_run:
+                    console.print(f"  [dim]Skipped (excluded): {src.relative_to(local_base)}[/dim]")
+                return
+
+            rel = src.relative_to(local_base)
+            remote_dest = f"{p.host}:{matched_pin.remote_path}/{rel}"
+
+            if dry_run:
+                console.print(f"  [green]Would sync: {rel}[/green]")
+                return
+
+            scp_args = build_scp_args(src=str(src), dest=remote_dest, host=p.host, user=p.user, port=p.port, key=p.key, recursive=False)
+
+            try:
+                proc = subprocess.run(scp_args, capture_output=True, timeout=15)
+                if proc.returncode == 0:
+                    console.print(f"  [green]Synced: {rel}[/green]")
+                else:
+                    console.print(f"  [red]Failed: {rel}[/red]")
+            except Exception as e:
+                console.print(f"  [red]Error syncing {rel}: {e}[/red]")
+
+    observer = Observer()
+    for pin in pins:
+        local = Path(pin.local_path)
+        if local.exists():
+            observer.schedule(SyncHandler(), str(local), recursive=True)
+            console.print(f"  [dim]Watching: {local}[/dim]")
+
+    observer.start()
+    console.print("\n[cyan]Syncing... (Ctrl+C to stop)[/cyan]\n")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
 
 
 # ---------------------------------------------------------------------------
