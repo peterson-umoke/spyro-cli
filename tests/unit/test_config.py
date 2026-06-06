@@ -15,6 +15,25 @@ from src.utils.config import (
 )
 
 
+SAMPLE_WP_TOML = """\
+[profiles.wp]
+host = "wp.example.com"
+user = "deploy"
+remote_path = "/var/www/html"
+wordpress = true
+wp_cli_path = "/usr/local/bin/wp"
+sudo = false
+forwarded_ports = [33062]
+
+[profiles.wp.db]
+host = "127.0.0.1"
+port = 33062
+name = "wordpress"
+user = "wp_user"
+password = ""
+driver = "mysql"
+"""
+
 SAMPLE_TOML = """\
 [profiles.staging]
 host = "staging.example.com"
@@ -145,6 +164,26 @@ class TestParseConfig:
         config = parse_config(config_file)
         assert isinstance(config, SpyroConfig)
         assert "app" in config.profiles
+
+
+class TestWordPressConfig:
+    def test_wordpress_fields(self, tmp_path):
+        config_file = tmp_path / "spyro.toml"
+        config_file.write_text(SAMPLE_WP_TOML)
+        config = parse_config(config_file)
+        p = config.profiles["wp"]
+        assert p.wordpress is True
+        assert p.wp_cli_path == "/usr/local/bin/wp"
+        assert p.host == "wp.example.com"
+        assert p.remote_path == "/var/www/html"
+
+    def test_wordpress_default_false(self, tmp_path):
+        config_file = tmp_path / "spyro.toml"
+        config_file.write_text(SAMPLE_TOML)
+        config = parse_config(config_file)
+        p = config.profiles["staging"]
+        assert p.wordpress is False
+        assert p.wp_cli_path == ""
 
 
 class TestGenerateConfig:

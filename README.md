@@ -112,6 +112,8 @@ driver = "mysql"
 | `remote_path` | string | `/var/www` | Working directory on remote server |
 | `forwarded_ports` | list[int] | `[]` | Remote ports to forward locally |
 | `artisan` | bool | `false` | Detect Laravel artisan on remote |
+| `wordpress` | bool | `false` | Detect WordPress / WP-CLI on remote |
+| `wp_cli_path` | string | `""` | Custom path to WP-CLI binary |
 | `sudo` | bool | `false` | Enable JIT sudo escalation |
 | `env_files` | list[str] | `[".env"]` | Remote env files to scan for credentials |
 
@@ -125,6 +127,26 @@ driver = "mysql"
 | `user` | string | `""` | Database user |
 | `password` | string | `""` | Database password (or leave empty for auto-detection) |
 | `driver` | string | `mysql` | `mysql`, `postgres`, or `sqlite` |
+
+### WordPress Profile
+
+```toml
+[profiles.wordpress]
+host = "wp.example.com"
+user = "deploy"
+remote_path = "/var/www/html"
+wordpress = true
+sudo = false
+forwarded_ports = [33062]
+
+[profiles.wordpress.db]
+host = "127.0.0.1"
+port = 33062
+name = "wordpress"
+user = "wp_user"
+password = ""
+driver = "mysql"
+```
 
 ### Credential Resolution
 
@@ -151,6 +173,7 @@ Spyro uses a dual-strategy approach:
 | `spyro run --all "cmd"` | Execute command across all profiles concurrently. |
 | `spyro run -p staging "cmd"` | Execute on specific profile(s). |
 | `spyro artisan <cmd>` | Run Laravel Artisan on remote host with auto-sudo. |
+| `spyro wp <cmd>` | Run WP-CLI on remote host with auto-sudo. |
 | `spyro cp <src> <dest>` | Secure file copy with auto-sudo escalation. |
 
 ### Database Tools
@@ -165,7 +188,7 @@ Spyro uses a dual-strategy approach:
 
 | Command | Description |
 |---------|-------------|
-| `spyro doctor` | Automated audit: SSH connectivity, remote paths, port conflicts, artisan detection. |
+| `spyro doctor` | Automated audit: SSH connectivity, remote paths, port conflicts, artisan/WordPress detection. |
 | `spyro init` | Bootstrap `spyro.toml` and run toolchain audit. |
 | `spyro pull-env -p staging` | Mirror remote `.env` to local `.env.remote`. |
 

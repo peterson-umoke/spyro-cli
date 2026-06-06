@@ -20,6 +20,7 @@ from .commands import (
     cmd_up,
     cmd_watch,
     cmd_artisan,
+    cmd_wp,
     cmd_db_shell,
     cmd_db_tunnel,
 )
@@ -64,6 +65,7 @@ main.add_command(cmd_artisan, "artisan")
 main.add_command(cmd_cp, "cp")
 main.add_command(cmd_db_tunnel, "db-tunnel")
 main.add_command(cmd_db_shell, "db-shell")
+main.add_command(cmd_wp, "wp")
 
 
 if __name__ == "__main__":

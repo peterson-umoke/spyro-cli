@@ -53,6 +53,8 @@ class ProfileConfig:
     remote_path: str = "/var/www"
     forwarded_ports: list[int] = field(default_factory=list)
     artisan: bool = False  # detect Laravel artisan
+    wordpress: bool = False  # detect WordPress / WP-CLI
+    wp_cli_path: str = ""  # custom path to wp-cli (default: auto-detect)
     sudo: bool = False  # whether sudo is available
     env_files: list[str] = field(default_factory=lambda: [".env"])
     extra: dict[str, Any] = field(default_factory=dict)
@@ -108,6 +110,8 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
         remote_path=raw.get("remote_path", "/var/www"),
         forwarded_ports=raw.get("forwarded_ports", []),
         artisan=raw.get("artisan", False),
+        wordpress=raw.get("wordpress", False),
+        wp_cli_path=raw.get("wp_cli_path", ""),
         sudo=raw.get("sudo", False),
         env_files=raw.get("env_files", [".env"]),
         extra={
@@ -123,6 +127,8 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
                 "remote_path",
                 "forwarded_ports",
                 "artisan",
+                "wordpress",
+                "wp_cli_path",
                 "sudo",
                 "env_files",
             }
@@ -216,6 +222,23 @@ name = "app_production"
 user = "forge"
 password = ""
 driver = "mysql"
+
+# WordPress profile example
+# [profiles.wordpress]
+# host = "wp.example.com"
+# user = "deploy"
+# remote_path = "/var/www/html"
+# wordpress = true
+# sudo = false
+# forwarded_ports = [33062]
+#
+# [profiles.wordpress.db]
+# host = "127.0.0.1"
+# port = 33062
+# name = "wordpress"
+# user = "wp_user"
+# password = ""
+# driver = "mysql"
 """
 
 

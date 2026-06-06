@@ -206,6 +206,61 @@ def _show_log(path: Path, follow: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# WordPress detection helpers
+# ---------------------------------------------------------------------------
+
+
+def _detect_wordpress(ssh_args: list[str], remote_path: str) -> dict[str, bool]:
+    """Detect WordPress installation on remote server.
+
+    Checks for wp-config.php, wp-content/, wp-includes/, and WP-CLI.
+    """
+    indicators = {
+        "wp_config": False,
+        "wp_content": False,
+        "wp_includes": False,
+        "wp_cli": False,
+    }
+
+    checks = [
+        ("wp_config", f"test -f {remote_path}/wp-config.php"),
+        ("wp_content", f"test -d {remote_path}/wp-content"),
+        ("wp_includes", f"test -d {remote_path}/wp-includes"),
+        ("wp_cli", "which wp || test -f /usr/local/bin/wp || test -f /usr/bin/wp"),
+    ]
+
+    for key, check_cmd in checks:
+        cmd = ssh_args + [check_cmd]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            indicators[key] = result.returncode == 0
+        except Exception:
+            pass
+
+    return indicators
+
+
+def _find_wp_cli(ssh_args: list[str], wp_cli_path: str = "") -> str:
+    """Find WP-CLI on the remote server."""
+    if wp_cli_path:
+        return wp_cli_path
+
+    candidates = ["wp", "/usr/local/bin/wp", "/usr/bin/wp", "~/bin/wp", "wp-cli.phar"]
+
+    for candidate in candidates:
+        cmd = ssh_args + [f"which {candidate} 2>/dev/null || test -x {candidate}"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=5)
+            if result.returncode == 0:
+                output = result.stdout.decode().strip()
+                return output if output else candidate
+        except Exception:
+            pass
+
+    return "wp"
+
+
+# ---------------------------------------------------------------------------
 # spyro doctor
 # ---------------------------------------------------------------------------
 
@@ -308,6 +363,31 @@ def cmd_doctor() -> None:
                 issues.append(f"Artisan not found on {name}")
         except Exception:
             console.print(f"  [yellow]⚠[/yellow] {name}: could not verify")
+
+    # WordPress detection
+    wp_profiles = [n for n, p in config.profiles.items() if p.wordpress]
+    if wp_profiles:
+        console.print("\n[bold]5. WordPress detection[/bold]")
+        for name in wp_profiles:
+            profile = config.profiles[name]
+            ssh_args = build_ssh_args(
+                host=profile.host,
+                user=profile.user,
+                port=profile.port,
+                key=profile.key,
+            )
+            indicators = _detect_wordpress(ssh_args, profile.remote_path)
+
+            if indicators["wp_config"]:
+                console.print(f"  [green]✓[/green] {name}: WordPress detected")
+                if indicators["wp_cli"]:
+                    console.print(f"    [green]✓[/green] WP-CLI available")
+                else:
+                    console.print(f"    [yellow]⚠[/yellow] WP-CLI not found")
+                    issues.append(f"WP-CLI not found on {name}")
+            else:
+                console.print(f"  [yellow]⚠[/yellow] {name}: WordPress not detected")
+                issues.append(f"WordPress not detected on {name} (wordpress=true in config)")
 
     console.print(f"\n[bold]Summary:[/bold] {len(issues)} issue(s) found")
     if issues:
@@ -552,6 +632,70 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> N
         key=p.key,
     )
     ssh_args.append(artisan_cmd)
+
+    from ..utils.keychain import prompt_for_credential
+
+    sudo_pw = ""
+    if p.sudo and not no_escalate:
+        sudo_pw = prompt_for_credential(profile, "sudo", p.user)
+
+    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
+
+    def output_line(line: str) -> None:
+        console.print(line)
+
+    exit_code = runner.run(
+        ssh_args,
+        password=ssh_pw,
+        sudo_password=sudo_pw,
+        on_output=output_line,
+        timeout=60.0,
+    )
+
+    if exit_code != 0:
+        console.print(f"\n[red]Exit code: {exit_code}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# spyro wp
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.argument("cmd_args", nargs=-1)
+@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
+    """Run WP-CLI commands on the remote host."""
+    if not cmd_args:
+        console.print("[red]Usage: spyro wp <command> [--profile NAME][/red]")
+        return
+
+    config = load_config()
+    p = config.get_profile(profile)
+
+    if not p.wordpress:
+        console.print(f"[yellow]Profile '{profile}' is not configured for WordPress[/yellow]")
+        return
+
+    runner = PTYRunner()
+
+    # Find WP-CLI on remote
+    ssh_args = build_ssh_args(
+        host=p.host,
+        user=p.user,
+        port=p.port,
+        key=p.key,
+    )
+    wp_bin = _find_wp_cli(ssh_args, p.wp_cli_path)
+
+    # Build command
+    wp_cmd = f"cd {safe_quote(p.remote_path)} && {wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
+
+    if not no_escalate and p.sudo:
+        wp_cmd = f"sudo {wp_cmd}"
+
+    ssh_args.append(wp_cmd)
 
     from ..utils.keychain import prompt_for_credential
 
