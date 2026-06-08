@@ -6,7 +6,7 @@ import socket
 
 import pytest
 
-from src.supervisor.tunnel import _port_available, _resolve_port
+from spyro.supervisor.tunnel import _port_available, _resolve_port
 
 
 class TestPortAvailable:

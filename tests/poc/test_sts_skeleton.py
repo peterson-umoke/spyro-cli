@@ -23,8 +23,8 @@ import subprocess
 import sys
 import time
 
-from src.supervisor.state import TunnelState, set_tunnel, get_tunnel, remove_tunnel
-from src.supervisor.tunnel import _port_available, _pid_alive, _pgid_alive
+from spyro.supervisor.state import TunnelState, set_tunnel, get_tunnel, remove_tunnel
+from spyro.supervisor.tunnel import _port_available, _pid_alive, _pgid_alive
 
 
 def test_tunnel_process_lifecycle():

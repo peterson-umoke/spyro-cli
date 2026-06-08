@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.config import DatabaseConfig, ProfileConfig
-from src.core.db import (
+from spyro.utils.config import DatabaseConfig, ProfileConfig
+from spyro.core.db import (
     _env_to_db_config,
     _parse_env_file,
     generate_connection_url,

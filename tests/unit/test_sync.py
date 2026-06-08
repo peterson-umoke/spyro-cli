@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.core.sync import (
+from spyro.core.sync import (
     SyncPin,
     should_exclude,
     filter_files,
@@ -233,7 +233,7 @@ class TestSyncPin:
 
 class TestPinPersistence:
     def test_save_and_load(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.core.sync._pins_path", lambda: tmp_path / "pins.json")
+        monkeypatch.setattr("spyro.core.sync._pins_path", lambda: tmp_path / "pins.json")
 
         pin = SyncPin(
             local_path="/tmp/app",
@@ -249,7 +249,7 @@ class TestPinPersistence:
         assert loaded[0].framework == "laravel"
 
     def test_add_pin(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.core.sync._pins_path", lambda: tmp_path / "pins.json")
+        monkeypatch.setattr("spyro.core.sync._pins_path", lambda: tmp_path / "pins.json")
 
         pin1 = SyncPin(local_path="/tmp/a", remote_path="/var/a", profile="staging")
         pin2 = SyncPin(local_path="/tmp/b", remote_path="/var/b", profile="staging")
@@ -260,7 +260,7 @@ class TestPinPersistence:
         assert len(pins) == 2
 
     def test_add_pin_replaces_existing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.core.sync._pins_path", lambda: tmp_path / "pins.json")
+        monkeypatch.setattr("spyro.core.sync._pins_path", lambda: tmp_path / "pins.json")
 
         pin1 = SyncPin(local_path="/tmp/a", remote_path="/var/old", profile="staging")
         pin2 = SyncPin(local_path="/tmp/a", remote_path="/var/new", profile="staging")
@@ -272,7 +272,7 @@ class TestPinPersistence:
         assert pins[0].remote_path == "/var/new"
 
     def test_remove_pin(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.core.sync._pins_path", lambda: tmp_path / "pins.json")
+        monkeypatch.setattr("spyro.core.sync._pins_path", lambda: tmp_path / "pins.json")
 
         pin = SyncPin(local_path="/tmp/a", remote_path="/var/a", profile="staging")
         add_pin(pin)

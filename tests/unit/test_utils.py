@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from src.security.ansi import strip_ansi, sanitize_output
-from src.utils.paths import discover_config, ensure_private, safe_quote, spyro_home
+from spyro.security.ansi import strip_ansi, sanitize_output
+from spyro.utils.paths import discover_config, ensure_private, safe_quote, spyro_home
 
 
 class TestStripAnsi:

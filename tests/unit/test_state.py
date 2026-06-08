@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.supervisor.state import (
+from spyro.supervisor.state import (
     TunnelState,
     all_tunnels,
     cleanup_stale,
@@ -67,7 +67,7 @@ class TestTunnelState:
 def _patch_state_file(tmp_path, monkeypatch):
     """Redirect state file to a temp directory for each test."""
     state_file = tmp_path / "tunnels.json"
-    monkeypatch.setattr("src.supervisor.state._state_path", lambda: state_file)
+    monkeypatch.setattr("spyro.supervisor.state._state_path", lambda: state_file)
     return state_file
 
 
@@ -138,5 +138,5 @@ class TestStateOperations:
 
 def _state_file_path() -> str:
     """Helper to get the current state file path."""
-    from src.supervisor.state import _state_path
+    from spyro.supervisor.state import _state_path
     return str(_state_path())

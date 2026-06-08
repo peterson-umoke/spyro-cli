@@ -4,7 +4,7 @@ Spawns native ssh in a pseudo-terminal, reads stdout/stderr byte-by-byte,
 matches authentication/sudo prompts, and injects credentials directly into
 the PTY buffer without environmental exposure.
 
-Uses SecureCredential from src.security.memory for in-memory zeroing.
+Uses SecureCredential from spyro.security.memory for in-memory zeroing.
 """
 
 from __future__ import annotations

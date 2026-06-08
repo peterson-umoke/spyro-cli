@@ -21,9 +21,9 @@ from __future__ import annotations
 import os
 import sys
 
-from src.security.ansi import strip_ansi, sanitize_output
-from src.security.memory import SecureCredential
-from src.core.pty_engine import PTYRunner, build_ssh_args
+from spyro.security.ansi import strip_ansi, sanitize_output
+from spyro.security.memory import SecureCredential
+from spyro.core.pty_engine import PTYRunner, build_ssh_args
 
 
 def test_basic_pty_spawn():

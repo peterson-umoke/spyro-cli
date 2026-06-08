@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import sys
 
-from src.security.ansi import strip_ansi, sanitize_output
+from spyro.security.ansi import strip_ansi, sanitize_output
 
 
 # ---------------------------------------------------------------------------

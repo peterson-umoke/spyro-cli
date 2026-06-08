@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
-from src.security.memory import SecureCredential, SecureString
+from spyro.security.memory import SecureCredential, SecureString
 
 
 def test_basic_zeroing():

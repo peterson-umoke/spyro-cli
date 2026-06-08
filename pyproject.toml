@@ -37,13 +37,13 @@ watch = [
 ]
 
 [project.scripts]
-spyro = "src.cli.main:main"
+spyro = "spyro.cli.main:main"
 
 [tool.setuptools.packages.find]
-include = ["src*"]
+where = ["src"]
 
 [tool.setuptools.package-dir]
-src = "src"
+spyro = "src/spyro"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.utils.config import (
+from spyro.utils.config import (
     DatabaseConfig,
     ProfileConfig,
     SpyroConfig,

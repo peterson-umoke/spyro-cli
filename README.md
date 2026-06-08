@@ -15,12 +15,35 @@ Developers working with remote servers spend significant time on repetitive SSH 
 
 ## Installation
 
+### Using uv (recommended)
+
 ```bash
-# Install spyro and core dependencies
+# Clone and sync (creates .venv + installs deps)
+git clone <repo-url> && cd spyro
+uv sync
+
+# Run commands
+uv run spyro --version
+uv run spyro doctor
+
+# Or install globally via uv tool
+uv tool install .
+spyro --version
+
+# Optional: filesystem watcher
+uv tool install . --with watchdog
+
+# Dev dependencies
+uv pip install pytest pytest-cov
+```
+
+### Using pip
+
+```bash
 cd spyro
 pip install -e .
 
-# Optional: install filesystem watcher for spyro sync/watch
+# Optional: filesystem watcher for spyro sync/watch
 pip install spyro-cli[watch]
 
 # For development
