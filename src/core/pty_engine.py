@@ -237,6 +237,26 @@ class PTYRunner:
                         sent_password = True
                     continue
 
+            # Process any remaining buffer data (prompts without trailing newline)
+            if self._buffer:
+                buf_str = strip_ansi(self._buffer).rstrip()
+                if any(p.search(buf_str) for p in _AUTH_PROMPTS):
+                    if pw_bytes and not sent_password:
+                        os.write(master_fd, pw_bytes + b"\n")
+                        sent_password = True
+                        self._buffer = b""
+                    continue
+                if any(p.search(buf_str) for p in _SUDO_PROMPTS):
+                    if sudo_bytes and not sent_sudo:
+                        os.write(master_fd, sudo_bytes + b"\n")
+                        sent_sudo = True
+                        self._buffer = b""
+                    continue
+                if any(p.search(buf_str) for p in _HOST_KEY_PROMPTS):
+                    os.write(master_fd, b"yes\n")
+                    self._buffer = b""
+                    continue
+
         return 0
 
     def _drain_output(self, master_fd: int, on_output: OutputCallback | None) -> None:
@@ -270,9 +290,17 @@ def build_ssh_args(
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Build ssh command arguments."""
+    import os, tempfile
+
     args = ["ssh"]
     args.extend(["-o", "BatchMode=no"])
     args.extend(["-o", "ConnectTimeout=10"])
+
+    # Enable connection sharing to speed up multiple SSH calls to the same host
+    ctrl_path = os.path.join(tempfile.gettempdir(), f"spyro-{user or 'anon'}@{host}:{port}")
+    args.extend(["-o", f"ControlPath={ctrl_path}"])
+    args.extend(["-o", "ControlMaster=auto"])
+    args.extend(["-o", "ControlPersist=15s"])
 
     if not strict_host_checking:
         args.extend(["-o", "StrictHostKeyChecking=no"])

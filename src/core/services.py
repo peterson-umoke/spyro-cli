@@ -45,8 +45,17 @@ class ServiceStatus:
         return " ".join(parts)
 
 
-def _run_check(ssh_args: list[str], cmd: str, timeout: int = 10) -> tuple[int, str]:
-    """Run a command on the remote server via SSH."""
+def _run_check(ssh_args: list[str], cmd: str, timeout: int = 3) -> tuple[int, str]:
+    """Run a command on the remote server via SSH.
+
+    Args:
+        ssh_args: Base SSH arguments
+        cmd: Command to run on remote
+        timeout: Seconds to wait before killing (default 3)
+
+    Returns:
+        Tuple of (return_code, stdout_string)
+    """
     full_cmd = ssh_args + [cmd]
     try:
         result = subprocess.run(
@@ -87,20 +96,17 @@ def detect_redis(ssh_args: list[str]) -> ServiceStatus:
     """Detect Redis server on remote host."""
     status = ServiceStatus(name="Redis")
 
-    # Check if redis-server is installed
-    rc, path = _run_check(ssh_args, "which redis-server 2>/dev/null || echo ''")
+    # Find redis-server binary (single SSH call)
+    rc, path = _run_check(ssh_args, "command -v redis-server 2>/dev/null || echo ''")
     if rc == 0 and path:
         status.available = True
         status.path = path
     else:
-        # Try common locations
-        for loc in ["/usr/bin/redis-server", "/usr/local/bin/redis-server",
-                     "/opt/redis/bin/redis-server"]:
-            rc, _ = _run_check(ssh_args, f"test -x {loc} && echo {loc}")
-            if rc == 0:
-                status.available = True
-                status.path = loc
-                break
+        # Try common locations with a single test call
+        rc, path = _run_check(ssh_args, "for p in /usr/bin/redis-server /usr/local/bin/redis-server /opt/redis/bin/redis-server; do test -x \"$p\" && echo \"$p\" && break; done")
+        if rc == 0 and path:
+            status.available = True
+            status.path = path
 
     if not status.available:
         status.error = "redis-server not found"
@@ -115,7 +121,7 @@ def detect_redis(ssh_args: list[str]) -> ServiceStatus:
 
     # Get redis-cli info if running
     if status.running:
-        rc, info = _run_check(ssh_args, "redis-cli info server 2>/dev/null | grep -E 'redis_version|tcp_port|os'", timeout=5)
+        rc, info = _run_check(ssh_args, "timeout 5 redis-cli info server 2>/dev/null | grep -E 'redis_version|tcp_port|os'", timeout=5)
         if rc == 0 and info:
             for line in info.split("\n"):
                 if ":" in line:
@@ -140,18 +146,11 @@ def detect_supervisor(ssh_args: list[str]) -> ServiceStatus:
     """Detect Supervisor (supervisord/supervisorctl) on remote host."""
     status = ServiceStatus(name="Supervisor")
 
-    # Check if supervisorctl is installed
-    rc, path = _run_check(ssh_args, "which supervisorctl 2>/dev/null || echo ''")
+    # Find supervisorctl (single SSH call)
+    rc, path = _run_check(ssh_args, "command -v supervisorctl 2>/dev/null || for p in /usr/bin/supervisorctl /usr/local/bin/supervisorctl; do test -x \"$p\" && echo \"$p\" && break; done")
     if rc == 0 and path:
         status.available = True
         status.path = path
-    else:
-        for loc in ["/usr/bin/supervisorctl", "/usr/local/bin/supervisorctl"]:
-            rc, _ = _run_check(ssh_args, f"test -x {loc} && echo {loc}")
-            if rc == 0:
-                status.available = True
-                status.path = loc
-                break
 
     if not status.available:
         status.error = "supervisorctl not found"
@@ -185,19 +184,11 @@ def detect_php_fpm(ssh_args: list[str]) -> ServiceStatus:
     """Detect PHP-FPM on remote host."""
     status = ServiceStatus(name="PHP-FPM")
 
-    # Find php-fpm binary (name varies by version: php8.1-fpm, php-fpm, etc.)
-    candidates = [
-        "php-fpm",
-        "php-fpm8.3", "php-fpm8.2", "php-fpm8.1", "php-fpm8.0", "php-fpm7.4",
-        "php8.3-fpm", "php8.2-fpm", "php8.1-fpm", "php8.0-fpm", "php7.4-fpm",
-    ]
-
-    for candidate in candidates:
-        rc, path = _run_check(ssh_args, f"which {candidate} 2>/dev/null || echo ''")
-        if rc == 0 and path:
-            status.available = True
-            status.path = path
-            break
+    # Find php-fpm binary (single SSH call for all candidates)
+    rc, path = _run_check(ssh_args, "for c in php-fpm php-fpm8.3 php-fpm8.2 php-fpm8.1 php-fpm8.0 php-fpm7.4 php8.3-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do command -v \"$c\" 2>/dev/null && break; done")
+    if rc == 0 and path:
+        status.available = True
+        status.path = path
 
     if not status.available:
         # Try to find via php -i
@@ -240,18 +231,11 @@ def detect_nodejs(ssh_args: list[str]) -> ServiceStatus:
     """Detect Node.js on remote host."""
     status = ServiceStatus(name="Node.js")
 
-    rc, path = _run_check(ssh_args, "which node 2>/dev/null || echo ''")
+    # Find node binary (single SSH call)
+    rc, path = _run_check(ssh_args, "command -v node 2>/dev/null || for p in /usr/bin/node /usr/local/bin/node /opt/node/bin/node; do test -x \"$p\" 2>/dev/null && echo \"$p\" && break; done")
     if rc == 0 and path:
         status.available = True
         status.path = path
-    else:
-        for loc in ["/usr/bin/node", "/usr/local/bin/node", "/opt/node/bin/node",
-                     "$HOME/.nvm/versions/node/*/bin/node"]:
-            rc, _ = _run_check(ssh_args, f"test -x {loc} 2>/dev/null && echo ok")
-            if rc == 0:
-                status.available = True
-                status.path = loc
-                break
 
     if not status.available:
         status.error = "node not found"
@@ -271,17 +255,11 @@ def detect_npm(ssh_args: list[str]) -> ServiceStatus:
     """Detect npm on remote host."""
     status = ServiceStatus(name="npm")
 
-    rc, path = _run_check(ssh_args, "which npm 2>/dev/null || echo ''")
+    # Find npm binary (single SSH call)
+    rc, path = _run_check(ssh_args, "command -v npm 2>/dev/null || for p in /usr/bin/npm /usr/local/bin/npm; do test -x \"$p\" && echo \"$p\" && break; done")
     if rc == 0 and path:
         status.available = True
         status.path = path
-    else:
-        for loc in ["/usr/bin/npm", "/usr/local/bin/npm"]:
-            rc, _ = _run_check(ssh_args, f"test -x {loc} && echo {loc}")
-            if rc == 0:
-                status.available = True
-                status.path = loc
-                break
 
     if not status.available:
         status.error = "npm not found"
@@ -299,7 +277,10 @@ def detect_npm(ssh_args: list[str]) -> ServiceStatus:
 
 
 def detect_all_services(host: str, user: str = "", port: int = 22, key: str = "") -> list[ServiceStatus]:
-    """Run all service detectors and return results."""
+    """Run all service detectors and return results.
+
+    Each service check has a per-command timeout of 5s, controlled by _run_check().
+    """
     ssh_args = build_ssh_args(host=host, user=user, port=port, key=key)
 
     return [

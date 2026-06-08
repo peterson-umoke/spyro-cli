@@ -395,24 +395,28 @@ def cmd_doctor() -> None:
                 console.print(f"  [yellow]⚠[/yellow] {name}: WordPress not detected")
                 issues.append(f"WordPress not detected on {name} (wordpress=true in config)")
 
-    # Remote service detection
+    # Remote service detection (with per-profile timeout guard)
     console.print("\n[bold]6. Remote services[/bold]")
     for name, profile in config.profiles.items():
         console.print(f"\n  [cyan]{name}[/cyan] ({profile.host})")
-        services = detect_all_services(
-            host=profile.host,
-            user=profile.user,
-            port=profile.port,
-            key=profile.key,
-        )
-        for svc in services:
-            line = f"    {svc.icon} {svc.summary}"
-            if svc.path:
-                line += f" ({svc.path})"
-            console.print(line)
-            if svc.details:
-                for k, v in svc.details.items():
-                    console.print(f"      {k}: {v}")
+        try:
+            services = detect_all_services(
+                host=profile.host,
+                user=profile.user,
+                port=profile.port,
+                key=profile.key,
+            )
+            for svc in services:
+                line = f"    {svc.icon} {svc.summary}"
+                if svc.path:
+                    line += f" ({svc.path})"
+                console.print(line)
+                if svc.details:
+                    for k, v in svc.details.items():
+                        console.print(f"      {k}: {v}")
+        except Exception as e:
+            console.print(f"    [yellow]⚠ Service check interrupted: {e}[/yellow]")
+            issues.append(f"Service check failed for {name}: {e}")
 
     console.print(f"\n[bold]Summary:[/bold] {len(issues)} issue(s) found")
     if issues:
@@ -499,6 +503,11 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], command: str) -> None:
             port=p.port,
             key=p.key,
         )
+
+        # Force PTY allocation so remote sudo can prompt for password
+        if p.sudo:
+            ssh_args.insert(1, "-t")
+
         ssh_args.append(command)
 
         def output_line(line: str) -> None:
@@ -645,10 +654,11 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> N
 
     runner = PTYRunner()
 
-    artisan_cmd = f"cd {safe_quote(p.remote_path)} && php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
-
+    sudo_prefix = ""
     if not no_escalate and p.sudo:
-        artisan_cmd = f"sudo {artisan_cmd}"
+        sudo_prefix = "sudo "
+
+    artisan_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
 
     ssh_args = build_ssh_args(
         host=p.host,
@@ -656,6 +666,11 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> N
         port=p.port,
         key=p.key,
     )
+
+    # Force PTY allocation so remote sudo can prompt for password
+    if p.sudo and not no_escalate:
+        ssh_args.insert(1, "-t")
+
     ssh_args.append(artisan_cmd)
 
     from ..utils.keychain import prompt_for_credential
@@ -911,12 +926,17 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
     wp_bin = _find_wp_cli(ssh_args, p.wp_cli_path)
 
     # Build command
-    wp_cmd = f"cd {safe_quote(p.remote_path)} && {wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
-
+    sudo_prefix = ""
     if not no_escalate and p.sudo:
-        wp_cmd = f"sudo {wp_cmd}"
+        sudo_prefix = "sudo "
+
+    wp_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}{wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
 
     ssh_args.append(wp_cmd)
+
+    # Force PTY allocation so remote sudo can prompt for password
+    if p.sudo and not no_escalate:
+        ssh_args.insert(1, "-t")
 
     from ..utils.keychain import prompt_for_credential
 
