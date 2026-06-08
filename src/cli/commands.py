@@ -1472,3 +1472,396 @@ def restart(profile: str) -> None:
     ec = _run_svc_cmd(profile, "sudo systemctl restart caddy 2>/dev/null || sudo service caddy restart 2>/dev/null || (sudo kill -USR1 $(pgrep -x caddy | head -1) 2>/dev/null && echo 'Sent reload signal') || echo 'Could not restart Caddy'", timeout=30)
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# spyro tinker — Laravel Tinker REPL
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.option("--eval", "-e", default="", help="Evaluate expression and exit")
+@click.option("--file", "-f", type=click.Path(exists=True), help="Run PHP file")
+@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> None:
+    """Run Laravel Tinker interactively or with --eval/--file.
+
+    Examples:
+      spyro tinker -p staging                          # Interactive REPL
+      spyro tinker -p staging -e "User::count()"       # One-shot eval
+      spyro tinker -p staging -f script.php            # Run file
+    """
+    config = load_config()
+    p = config.get_profile(profile)
+
+    if not p.artisan:
+        console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
+        return
+
+    runner = PTYRunner()
+
+    sudo_prefix = ""
+    if not no_escalate and p.sudo:
+        sudo_prefix = "sudo "
+
+    if eval:
+        tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker --execute={safe_quote(eval)}"
+    elif file:
+        remote_path = f"/tmp/spyro-tinker-{os.path.basename(file)}"
+        console.print(f"[cyan]Uploading {file} to {p.host}:{remote_path}...[/cyan]")
+        from ..core.pty_engine import _scp_target
+        scp_args = build_scp_args(
+            src=file,
+            dest=_scp_target(remote_path, p.host, p.user),
+            host=p.host, user=p.user, port=p.port, key=p.key,
+        )
+        from ..utils.keychain import prompt_for_credential as pfc
+        ssh_pw = pfc(profile, "ssh", p.user) if not no_escalate else ""
+        runner.run(scp_args, password=ssh_pw, timeout=30)
+        tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker < {remote_path}; {sudo_prefix}rm -f {remote_path}"
+    else:
+        tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker"
+
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+
+    if not no_escalate and p.sudo:
+        ssh_args.insert(1, "-t")
+
+    if not eval and not file:
+        ssh_args.insert(1, "-tt")
+
+    ssh_args.append(tinker_cmd)
+
+    from ..utils.keychain import prompt_for_credential as pfc2
+
+    sudo_pw = pfc2(profile, "sudo", p.user) if p.sudo and not no_escalate else ""
+    ssh_pw = pfc2(profile, "ssh", p.user)
+
+    if eval or file:
+        def output_line(line: str) -> None:
+            console.print(line)
+        exit_code = runner.run(
+            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+            on_output=output_line, timeout=120,
+        )
+        if exit_code != 0:
+            console.print(f"  [red]Exit code: {exit_code}[/red]")
+    else:
+        console.print(f"[cyan]Starting Tinker on {profile}...[/cyan]")
+        exit_code = runner.run(
+            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+            on_output=lambda line: None, timeout=30,
+        )
+
+
+# ---------------------------------------------------------------------------
+# spyro db — Database commands (MySQL/MariaDB/PostgreSQL)
+# ---------------------------------------------------------------------------
+
+
+def _detect_db_client(profile: str) -> str:
+    """Detect which database client is available locally (mysql, mariadb, psql)."""
+    for client in ["mariadb", "mysql", "psql"]:
+        if shutil.which(client):
+            return client
+    return "mysql"
+
+
+def _run_db_query(profile: str, query: str, tunnel_port: int | None = None) -> tuple[int, str]:
+    """Run a SQL query through the tunnel and return (exit_code, output)."""
+    config = load_config()
+    p = config.get_profile(profile)
+
+    manager = TunnelManager(config)
+    tunnel = get_tunnel(profile)
+    if not tunnel or tunnel.status != "running":
+        tunnel = manager.start(profile)
+    local_port = tunnel_port or (tunnel.local_port if tunnel else p.db.port)
+
+    client = _detect_db_client(profile)
+    if client in ("mysql", "mariadb"):
+        pw_flag = f"-p{p.db.password}" if p.db.password else "--skip-password"
+        cmd_list = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}",
+                    "--ssl-mode=DISABLED", pw_flag, p.db.name, "-e", query]
+    elif client == "psql":
+        env = os.environ.copy()
+        env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name})
+        if p.db.password:
+            env["PGPASSWORD"] = p.db.password
+        cmd_list = [client, "-c", query]
+        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=10, env=env)
+        return result.returncode, result.stdout + result.stderr
+    else:
+        return 1, f"Unknown client: {client}"
+
+    try:
+        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=10)
+        return result.returncode, result.stdout
+    except FileNotFoundError:
+        return 1, f"Client not found. Install mysql-client, mariadb-client, or postgresql-client."
+    except subprocess.TimeoutExpired:
+        return 1, "Query timed out"
+
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cmd_db(ctx: click.Context) -> None:
+    """Database commands (MySQL/MariaDB/PostgreSQL).
+
+    If no subcommand is given, starts a tunnel and shows connection info.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(tunnel)
+
+
+@cmd_db.command()
+@click.option("--port", type=int, help="Override local port")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def tunnel(port: int | None, profile: str) -> None:
+    """Start tunnel and print connection URL."""
+    config = load_config()
+    manager = TunnelManager(config)
+    tunnel_state = get_tunnel(profile)
+    if not tunnel_state or tunnel_state.status != "running":
+        console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
+        tunnel_state = manager.start(profile)
+    local_port = port or (tunnel_state.local_port if tunnel_state else 3306)
+    p = config.get_profile(profile)
+    db_url = generate_connection_url(p.db, port_override=local_port)
+    console.print(f"\n[bold green]Database tunnel active[/bold green]")
+    console.print(f"  Profile:   {profile}")
+    console.print(f"  Local:     127.0.0.1:{local_port}")
+    console.print(f"  Remote:    {p.host}:{p.db.port}")
+    console.print(f"  URL:       {db_url}")
+
+
+@cmd_db.command()
+@click.option("--no-tunnel", is_flag=True, help="Skip tunnel management")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def shell(no_tunnel: bool, profile: str) -> None:
+    """Launch pre-authenticated database CLI (mysql/mariadb/psql)."""
+    config = load_config()
+    p = config.get_profile(profile)
+    if not no_tunnel:
+        manager = TunnelManager(config)
+        tunnel_state = get_tunnel(profile)
+        if not tunnel_state or tunnel_state.status != "running":
+            console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
+            tunnel_state = manager.start(profile)
+        local_port = tunnel_state.local_port
+    else:
+        local_port = p.db.port
+    client = _detect_db_client(profile)
+    if client in ("mysql", "mariadb"):
+        args = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}", "--ssl-mode=DISABLED"]
+        args.append(f"-p{p.db.password}" if p.db.password else "--skip-password")
+        args.append(p.db.name)
+        env = None
+    elif client == "psql":
+        env = os.environ.copy()
+        env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name})
+        if p.db.password:
+            env["PGPASSWORD"] = p.db.password
+        args = [client]
+    else:
+        console.print("[red]No database client found. Install mysql, mariadb, or psql.[/red]")
+        return
+    console.print(f"[cyan]Connecting to {p.db.name} via {client}...[/cyan]")
+    try:
+        if env:
+            os.execvpe(client, args, env)
+        else:
+            os.execvp(client, args)
+    except FileNotFoundError:
+        console.print(f"[red]'{client}' not found locally[/red]")
+
+
+@cmd_db.command()
+@click.option("--port", type=int, help="Override local port")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def ping(port: int | None, profile: str) -> None:
+    """Test database connectivity through the tunnel."""
+    config = load_config()
+    p = config.get_profile(profile)
+    manager = TunnelManager(config)
+    tunnel_state = get_tunnel(profile)
+    if not tunnel_state or tunnel_state.status != "running":
+        console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
+        tunnel_state = manager.start(profile)
+    local_port = port or (tunnel_state.local_port if tunnel_state else p.db.port)
+    client = _detect_db_client(profile)
+    console.print(f"[cyan]Pinging {p.db.driver}@{p.host}:{p.db.port} via 127.0.0.1:{local_port}...[/cyan]")
+    if client in ("mysql", "mariadb"):
+        cmd = ["mysqladmin", f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}",
+               "--skip-ssl"]
+        if p.db.password:
+            cmd.append(f"-p{p.db.password}")
+        cmd.extend(["ping", "--silent"])
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            stdout = result.stdout.decode()
+            stderr = result.stderr.decode()
+            # mysqladmin returns exit code 0 on success even with SSL warnings
+            if result.returncode == 0 or "mysqld is alive" in stdout:
+                console.print("[green]✓ mysqld is alive[/green]")
+            elif "Access denied" in stderr:
+                console.print("[red]✗ Access denied[/red]")
+            else:
+                console.print(f"[red]✗ Ping failed[/red]")
+                if stderr:
+                    console.print(f"  {stderr.strip()}")
+        except FileNotFoundError:
+            console.print("[red]mysqladmin not found locally[/red]")
+    elif client == "psql":
+        env = os.environ.copy()
+        env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name or "postgres"})
+        if p.db.password:
+            env["PGPASSWORD"] = p.db.password
+        try:
+            result = subprocess.run(["psql", "-c", "SELECT 1"], capture_output=True, timeout=10, env=env)
+            if result.returncode == 0:
+                console.print("[green]✓ PONG[/green]")
+            else:
+                console.print(f"[red]✗ {result.stderr.decode()[:200]}[/red]")
+        except FileNotFoundError:
+            console.print("[red]psql not found locally[/red]")
+
+
+@cmd_db.command()
+@click.argument("query")
+@click.option("--port", type=int, help="Override local port")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def query(profile: str, query: str, port: int | None) -> None:
+    """Run a SQL query through the tunnel."""
+    ec, output = _run_db_query(profile, query, tunnel_port=port)
+    if ec == 0:
+        console.print(output)
+    else:
+        console.print(f"[red]{output}[/red]")
+
+
+@cmd_db.command()
+@click.option("--port", type=int, help="Override local port")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def list_databases(port: int | None, profile: str) -> None:
+    """List databases on the remote server."""
+    client = _detect_db_client(profile)
+    if client in ("mysql", "mariadb"):
+        ec, output = _run_db_query(profile, "SHOW DATABASES", tunnel_port=port)
+    elif client == "psql":
+        ec, output = _run_db_query(profile, "\\l", tunnel_port=port)
+    else:
+        console.print("[red]Unknown client[/red]")
+        return
+    if ec == 0:
+        console.print(output)
+    else:
+        console.print(f"[red]{output}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# spyro logs — Remote log viewing (Laravel, Nginx, Apache, PHP)
+# ---------------------------------------------------------------------------
+
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cmd_logs(ctx: click.Context) -> None:
+    """View remote logs (Laravel, Nginx, Apache, PHP-FPM).
+
+    Subcommands:
+      laravel      Tail the Laravel log file
+      nginx        Tail Nginx access log
+      nginx-error  Tail Nginx error log
+      apache       Tail Apache access log
+      php          Tail PHP-FPM log
+      supervisor   Tail Spyro supervisor tunnel log (default)
+    """
+    if ctx.invoked_subcommand is None:
+        from ..utils.paths import spyro_home
+        log_dir = spyro_home() / "logs"
+        if not log_dir.exists() or not any(log_dir.iterdir()):
+            console.print("[yellow]No supervisor log files found[/yellow]")
+            console.print("Try: spyro logs laravel -p staging  or  spyro logs supervisor staging")
+            return
+        console.print("[cyan]Available supervisor logs:[/cyan]")
+        for log_file in sorted(log_dir.glob("*.log")):
+            console.print(f"  {log_file.stem}.log")
+        console.print("\n[yellow]Use: spyro logs supervisor <profile> [-f][/yellow]")
+
+
+@cmd_logs.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--lines", "-n", default=50, help="Number of lines")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+def laravel(profile: str, lines: int, follow: bool) -> None:
+    """Tail the Laravel log file."""
+    config = load_config()
+    p = config.get_profile(profile)
+    log_path = f"{p.remote_path}/storage/logs/laravel.log"
+    tail_flag = " -f" if follow else ""
+    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} {log_path} 2>/dev/null || echo 'Log not found'", timeout=60 if follow else 15)
+    if ec != 0:
+        console.print(f"  [red]Exit code: {ec}[/red]")
+
+
+@cmd_logs.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--lines", "-n", default=50, help="Number of lines")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+def nginx(profile: str, lines: int, follow: bool) -> None:
+    """Tail Nginx access log."""
+    tail_flag = " -f" if follow else ""
+    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/nginx/access.log 2>/dev/null || tail -n {lines}{tail_flag} /var/log/nginx/*access* 2>/dev/null || echo 'Nginx access log not found'", timeout=60 if follow else 15)
+    if ec != 0:
+        console.print(f"  [red]Exit code: {ec}[/red]")
+
+
+@cmd_logs.command(name="nginx-error")
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--lines", "-n", default=50, help="Number of lines")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+def nginx_error(profile: str, lines: int, follow: bool) -> None:
+    """Tail Nginx error log."""
+    tail_flag = " -f" if follow else ""
+    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/nginx/error.log 2>/dev/null || echo 'Nginx error log not found'", timeout=60 if follow else 15)
+    if ec != 0:
+        console.print(f"  [red]Exit code: {ec}[/red]")
+
+
+@cmd_logs.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--lines", "-n", default=50, help="Number of lines")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+def apache(profile: str, lines: int, follow: bool) -> None:
+    """Tail Apache access log."""
+    tail_flag = " -f" if follow else ""
+    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/apache2/access.log 2>/dev/null || tail -n {lines}{tail_flag} /var/log/httpd/access_log 2>/dev/null || echo 'Apache access log not found'", timeout=60 if follow else 15)
+    if ec != 0:
+        console.print(f"  [red]Exit code: {ec}[/red]")
+
+
+@cmd_logs.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--lines", "-n", default=50, help="Number of lines")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+def php(profile: str, lines: int, follow: bool) -> None:
+    """Tail PHP-FPM error log."""
+    tail_flag = " -f" if follow else ""
+    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/php*-fpm.log 2>/dev/null || tail -n {lines}{tail_flag} /var/log/php*.log 2>/dev/null || echo 'PHP-FPM log not found'", timeout=60 if follow else 15)
+    if ec != 0:
+        console.print(f"  [red]Exit code: {ec}[/red]")
+
+
+@cmd_logs.command()
+@click.argument("profile_name", required=True)
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+def supervisor(profile_name: str, follow: bool) -> None:
+    """Tail Spyro supervisor tunnel log."""
+    from ..utils.paths import spyro_home
+    log_file = spyro_home() / "logs" / f"{profile_name}.log"
+    if not log_file.exists():
+        console.print(f"[red]No supervisor log for '{profile_name}'[/red]")
+        return
+    _show_log(log_file, follow)

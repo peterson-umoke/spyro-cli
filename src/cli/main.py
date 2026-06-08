@@ -33,6 +33,8 @@ from .commands import (
     cmd_apache,
     cmd_nginx,
     cmd_caddy,
+    cmd_tinker,
+    cmd_db,
 )
 
 
@@ -86,6 +88,8 @@ main.add_command(cmd_php, "php")
 main.add_command(cmd_apache, "apache")
 main.add_command(cmd_nginx, "nginx")
 main.add_command(cmd_caddy, "caddy")
+main.add_command(cmd_tinker, "tinker")
+main.add_command(cmd_db, "db")
 
 
 if __name__ == "__main__":
