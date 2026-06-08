@@ -189,22 +189,79 @@ Spyro uses a dual-strategy approach:
 | `spyro run -p staging "cmd"` | Execute on specific profile(s). |
 | `spyro artisan <cmd>` | Run Laravel Artisan on remote host with auto-sudo. |
 | `spyro wp <cmd>` | Run WP-CLI on remote host with auto-sudo. |
+| `spyro tinker -p staging` | Laravel Tinker REPL (interactive, `--eval`, or `--file`). |
 | `spyro cp /local/file /remote/path -p staging` | Upload local file to remote host. |
-| `spyro cp :/remote/file /local/path -p staging` | Download remote file to local machine. Prefix remote paths with `:` for downloads. |
+| `spyro cp :/remote/file /local/path -p staging` | Download remote file. Prefix with `:` for remote paths. |
+
+### Laravel Tinker
+
+| Command | Description |
+|---------|-------------|
+| `spyro tinker -p staging` | Interactive REPL via SSH. |
+| `spyro tinker -p staging -e "User::count()"` | One-shot eval with `--eval`. |
+| `spyro tinker -p staging -f script.php` | Upload and run a PHP file. |
 
 ### Database Tools
 
 | Command | Description |
 |---------|-------------|
 | `spyro db tunnel -p staging` | Start tunnel and print connection URL. |
-| `spyro db shell -p staging` | Launch pre-authenticated `mysql` or `psql` client. |
-| `spyro proxy-url -p staging` | Generate connection string for GUI tools (copies to clipboard with `\| pbcopy`). |
+| `spyro db shell -p staging` | Launch pre-authenticated `mysql`/`mariadb`/`psql`. |
+| `spyro db ping -p staging` | Test database connectivity through tunnel. |
+| `spyro db query "SELECT 1" -p staging` | Run a SQL query through the tunnel. |
+| `spyro db list-databases -p staging` | List databases on the remote server. |
+| `spyro db dump -p staging` | Full database dump to local file. |
+| `spyro db dump -p staging -t users,posts` | Dump specific tables only. |
+| `spyro db dump -p staging -t users -w "id>100"` | Dump with WHERE filter. |
+| `spyro db dump -p staging -z` | Gzip-compressed dump. |
+| `spyro db dump -p staging -d` | Schema only (no data). |
+| `spyro proxy-url -p staging` | Generate connection string for GUI tools. |
+
+### Service Management
+
+| Command | Description |
+|---------|-------------|
+| `spyro supervisor status -p staging` | Show Supervisor process status. |
+| `spyro supervisor restart -p staging` | Restart all or named processes. |
+| `spyro supervisor tail laravel-queue -p staging` | Tail process stderr logs. |
+| `spyro redis ping -p staging` | Ping Redis server. |
+| `spyro redis info -p staging -s server` | Show Redis info (optional section). |
+| `spyro redis cli DBSIZE -p staging` | Run arbitrary redis-cli command. |
+| `spyro redis stats -p staging` | Key metrics (connections, commands, keyspace). |
+| `spyro php version -p staging` | PHP version. |
+| `spyro php fpm-status -p staging` | PHP-FPM pool status. |
+| `spyro php extensions -p staging --filter pdo` | List loaded extensions. |
+| `spyro php info -p staging --option memory_limit` | PHP configuration info. |
+| `spyro php restart -p staging` | Restart PHP-FPM. |
+| `spyro apache version -p staging` | Apache version. |
+| `spyro apache modules -p staging` | Loaded modules. |
+| `spyro apache status -p staging` | Server status. |
+| `spyro apache sites -p staging` | Enabled virtual hosts. |
+| `spyro apache restart -p staging` | Restart Apache. |
+| `spyro nginx version -p staging` | Nginx version. |
+| `spyro nginx status -p staging` | Config test + process check. |
+| `spyro nginx sites -p staging` | Enabled site configs. |
+| `spyro nginx restart -p staging` | Restart Nginx. |
+| `spyro caddy version -p staging` | Caddy version. |
+| `spyro caddy status -p staging` | Running check + version. |
+| `spyro caddy restart -p staging` | Restart Caddy. |
+
+### Logs
+
+| Command | Description |
+|---------|-------------|
+| `spyro logs laravel -p staging -n 100` | Tail Laravel log file. |
+| `spyro logs nginx -p staging -f` | Tail Nginx access log (follow). |
+| `spyro logs nginx-error -p staging` | Tail Nginx error log. |
+| `spyro logs apache -p staging` | Tail Apache access log. |
+| `spyro logs php -p staging` | Tail PHP-FPM error log. |
+| `spyro logs supervisor staging` | Tail Spyro supervisor log. |
 
 ### Diagnostics
 
 | Command | Description |
 |---------|-------------|
-| `spyro doctor` | Automated audit: SSH, paths, ports, artisan, WordPress, Redis, Supervisor, PHP-FPM, Node.js. |
+| `spyro doctor` | Automated audit: SSH, paths, ports, artisan, WordPress, 9 services. |
 | `spyro init` | Bootstrap `spyro.toml` and run toolchain audit. |
 | `spyro pull-env -p staging` | Mirror remote `.env` to local `.env.remote`. |
 
@@ -212,11 +269,11 @@ Spyro uses a dual-strategy approach:
 
 | Command | Description |
 |---------|-------------|
-| `spyro pin ./src /var/www/app/src -p staging` | Pin a local directory for automatic sync. Auto-detects framework and applies exclusions. |
+| `spyro pin ./src /var/www/app/src -p staging` | Pin a local directory for automatic sync. |
 | `spyro pins` | List all pinned sync directories. |
 | `spyro unpin ./src -p staging` | Remove a pinned directory. |
-| `spyro sync -p staging` | Watch all pinned dirs and auto-sync on save. Use `--dry-run` to preview. |
-| `spyro watch ./src /var/www/app/src -p staging` | Legacy manual sync (use `spyro pin` + `spyro sync` instead). |
+| `spyro sync -p staging` | Watch pinned dirs and auto-sync. Use `--dry-run` to preview. |
+| `spyro watch ./src /var/www/app/src -p staging` | Legacy manual sync. |
 
 ## Architecture
 
@@ -224,7 +281,7 @@ Spyro uses a dual-strategy approach:
 src/
 ├── cli/            # Click CLI entry point and command implementations
 │   ├── main.py     # Group registration, version, logging setup
-│   └── commands.py # All 19 command functions
+│   └── commands.py # All 25+ command functions
 ├── core/           # SSH handshake and database logic
 │   ├── pty_engine.py  # PTY-based secure handshake engine
 │   └── db.py          # Dual-strategy credential resolution
@@ -269,6 +326,10 @@ The STS (`src/supervisor/tunnel.py`) replaces `autossh` with a Python-native sup
 | Redis | `redis-server` binary, process check, `redis-cli info` |
 | Supervisor | `supervisorctl` binary, `supervisord` process, managed process counts |
 | PHP-FPM | `php-fpm*` binary (version-aware), `php-fpm -tt` pool count |
+| PHP | `php` binary, version, extension count, FPM pool children |
+| Apache | `apache2`/`httpd` binary, version, module count |
+| Nginx | `nginx` binary, version, worker processes, site count |
+| Caddy | `caddy` binary, version, process count |
 | Node.js | `node` binary, version, running processes |
 | npm | `npm` binary, version |
 
