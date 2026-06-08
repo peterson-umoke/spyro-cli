@@ -293,6 +293,17 @@ def build_ssh_args(
     return args
 
 
+def _scp_target(path: str, host: str, user: str = "") -> str:
+    """Prepend user@host to a remote SCP path, ignoring any profile: or : prefix."""
+    # Strip leading ':' (remote marker) or 'profile:' prefix
+    if path.startswith(":"):
+        path = path.lstrip(":")
+    if ":" in path and not path.startswith("/"):
+        _, path = path.split(":", 1)
+    prefix = f"{user}@{host}" if user else host
+    return f"{prefix}:{path}"
+
+
 def build_scp_args(
     src: str,
     dest: str,
@@ -306,7 +317,7 @@ def build_scp_args(
     args = ["scp"]
     args.extend(["-o", "BatchMode=no"])
     args.extend(["-o", "ConnectTimeout=10"])
-    args.extend(["-o", "StrictHostKeyChecking=yes"])
+    args.extend(["-o", "StrictHostKeyChecking=accept-new"])
 
     if port != 22:
         args.extend(["-P", str(port)])

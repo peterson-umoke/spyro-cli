@@ -946,6 +946,16 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _is_local_path(path: str) -> bool:
+    """Check if a path is a local absolute path (not a remote scp-style path).
+
+    A path starting with ':' is always treated as a remote path.
+    """
+    if path.startswith(":"):
+        return False
+    return path.startswith("/") or path.startswith("~") or path.startswith("./")
+
+
 @click.command()
 @click.argument("src")
 @click.argument("dest")
@@ -958,11 +968,15 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
 
     runner = PTYRunner()
 
-    if src.startswith("/") or src.startswith("~"):
-        remote_src = f"{p.host}:{src}"
+    src_is_local = _is_local_path(src)
+
+    from ..core.pty_engine import _scp_target
+
+    if src_is_local:
+        # Local -> remote (dest is on the remote host via profile)
         scp_args = build_scp_args(
-            src=remote_src,
-            dest=dest,
+            src=src,
+            dest=_scp_target(dest, p.host, p.user),
             host=p.host,
             user=p.user,
             port=p.port,
@@ -970,10 +984,10 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
             recursive=recursive,
         )
     else:
-        remote_dest = f"{p.host}:{dest}"
+        # Remote -> local (dest is a local path)
         scp_args = build_scp_args(
-            src=src,
-            dest=remote_dest,
+            src=_scp_target(src, p.host, p.user),
+            dest=dest,
             host=p.host,
             user=p.user,
             port=p.port,

@@ -27,7 +27,7 @@ def _keyring_available() -> bool:
         # Test if a backend is available
         backend = keyring.get_keyring()
         return backend is not None and not isinstance(
-            backend, keyring.fail.Keyring
+            backend, keyring.backends.fail.Keyring
         )
     except Exception:
         return False
