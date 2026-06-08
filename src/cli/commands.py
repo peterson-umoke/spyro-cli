@@ -1583,7 +1583,7 @@ def _run_db_query(profile: str, query: str, tunnel_port: int | None = None) -> t
     if client in ("mysql", "mariadb"):
         pw_flag = f"-p{p.db.password}" if p.db.password else "--skip-password"
         cmd_list = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}",
-                    "--ssl-mode=DISABLED", pw_flag, p.db.name, "-e", query]
+                    "--skip-ssl", pw_flag, p.db.name, "-e", query]
     elif client == "psql":
         env = os.environ.copy()
         env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name})
@@ -1654,7 +1654,7 @@ def shell(no_tunnel: bool, profile: str) -> None:
         local_port = p.db.port
     client = _detect_db_client(profile)
     if client in ("mysql", "mariadb"):
-        args = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}", "--ssl-mode=DISABLED"]
+        args = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}", "--skip-ssl"]
         args.append(f"-p{p.db.password}" if p.db.password else "--skip-password")
         args.append(p.db.name)
         env = None
@@ -1865,3 +1865,134 @@ def supervisor(profile_name: str, follow: bool) -> None:
         console.print(f"[red]No supervisor log for '{profile_name}'[/red]")
         return
     _show_log(log_file, follow)
+
+
+@cmd_db.command()
+@click.option("--tables", "-t", default="", help="Comma-separated tables (e.g. users,posts)")
+@click.option("--output", "-o", default="", help="Output path (default: ./<profile>-<db>-<timestamp>.sql)")
+@click.option("--gzip", "-z", is_flag=True, help="Compress with gzip")
+@click.option("--no-data", "-d", is_flag=True, help="Schema only, no data")
+@click.option("--where", "-w", default="", help="WHERE clause for row filter")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, where: str) -> None:
+    """Dump remote database to local file.
+
+    \b
+    Examples:
+      spyro db dump -p staging                          # Full dump
+      spyro db dump -p staging -t users,posts           # Specific tables
+      spyro db dump -p staging -t users -w "id > 100"   # Filtered rows
+      spyro db dump -p staging -z                       # Gzipped
+      spyro db dump -p staging -d                       # Schema only
+      spyro db dump -p staging -o ./backups/latest.sql  # Custom path
+    """
+    config = load_config()
+    p = config.get_profile(profile)
+    table_list = [t.strip() for t in tables.split(",") if t.strip()] if tables else []
+
+    if p.db.driver not in ("mysql", "mariadb"):
+        console.print(f"[red]Dump not yet supported for driver: {p.db.driver}[/red]")
+        return
+
+    # Build remote mysqldump command — run through SSH on remote server
+    # This avoids tunnel port mapping issues and uses the remote mysqldump
+    dump_cmd_parts = [
+        "mysqldump",
+        f"-h{p.db.host}",
+        f"-P3306",  # Remote MySQL always on 3306 for remote execution
+        f"-u{p.db.user}",
+        f"-p{p.db.password}" if p.db.password else "--skip-password",
+        "--single-transaction", "--quick", "--no-tablespaces",
+        "--routines", "--triggers",
+    ]
+    if no_data:
+        dump_cmd_parts.append("--no-data")
+    if where:
+        dump_cmd_parts += ["--where", where]
+    dump_cmd_parts.append(p.db.name)
+    dump_cmd_parts += table_list
+
+    # Quote args for remote shell
+    import shlex
+    quoted = []
+    for a in dump_cmd_parts:
+        if not a.startswith("-"):
+            quoted.append(a)
+        elif a.startswith("-p") and len(a) > 2:
+            # Password arg: use -p with quoted password
+            quoted.append(f"-p{shlex.quote(a[2:])}")
+        else:
+            quoted.append(shlex.quote(a))
+    ssh_cmd = " ".join(quoted)
+    if gzip:
+        ssh_cmd += " | gzip -c"
+
+    # Determine output path
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not output:
+        suffix = ".sql.gz" if gzip else ".sql"
+        tbl_suffix = f"-{tables.replace(',', '-')}" if tables else ""
+        output_path = Path.cwd() / f"{profile}-{p.db.name}{tbl_suffix}-{ts}{suffix}"
+    else:
+        output_path = Path(output).expanduser().resolve()
+        if gzip and not str(output_path).endswith(".gz"):
+            output_path = Path(str(output_path) + ".gz")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"[cyan]Dumping '{p.db.name}' from {p.host}...[/cyan]")
+    if table_list:
+        console.print(f"  Tables: {', '.join(table_list)}")
+    if where:
+        console.print(f"  WHERE: {where}")
+    console.print(f"  Output: {output_path}")
+
+    # Run mysqldump on remote server via SSH, pipe output to local file
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    if p.sudo:
+        ssh_args.insert(1, "-t")
+    ssh_args.append(ssh_cmd)
+
+    dump_buf: list[str] = []
+
+    def capture(line: str) -> None:
+        dump_buf.append(line)
+
+    from ..utils.keychain import prompt_for_credential
+
+    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
+    sudo_pw = prompt_for_credential(profile, "sudo", p.user) if p.sudo else ""
+
+    runner = PTYRunner()
+    ec = runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+                    on_output=capture, timeout=600)
+
+    if ec != 0:
+        console.print(f"[red]Dump failed (exit code: {ec})[/red]")
+        return
+
+    raw = "\n".join(dump_buf)
+
+    if gzip:
+        # Write gzipped directly
+        import gzip as gz
+        with gz.open(str(output_path), "wt", encoding="utf-8") as f:
+            f.write(raw)
+    else:
+        output_path.write_text(raw, encoding="utf-8")
+
+    size = output_path.stat().st_size
+    size_str = f"{size/1024:.1f} KB" if size < 1024**2 else f"{size/1024**2:.1f} MB"
+    # Count lines (approximate)
+    line_count = 0
+    try:
+        with open(output_path, "rb") as f:
+            for _ in f:
+                line_count += 1
+    except Exception:
+        line_count = 0
+    console.print(f"[green]✓ Dump complete[/green]")
+    console.print(f"  File:  {output_path}")
+    console.print(f"  Size:  {size_str}")
+    console.print(f"  Lines: ~{line_count}")
