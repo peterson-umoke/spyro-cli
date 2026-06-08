@@ -27,6 +27,12 @@ from .commands import (
     cmd_sync,
     cmd_db_shell,
     cmd_db_tunnel,
+    cmd_supervisor,
+    cmd_redis,
+    cmd_php,
+    cmd_apache,
+    cmd_nginx,
+    cmd_caddy,
 )
 
 
@@ -74,6 +80,12 @@ main.add_command(cmd_pin, "pin")
 main.add_command(cmd_unpin, "unpin")
 main.add_command(cmd_pins, "pins")
 main.add_command(cmd_sync, "sync")
+main.add_command(cmd_supervisor, "supervisor")
+main.add_command(cmd_redis, "redis")
+main.add_command(cmd_php, "php")
+main.add_command(cmd_apache, "apache")
+main.add_command(cmd_nginx, "nginx")
+main.add_command(cmd_caddy, "caddy")
 
 
 if __name__ == "__main__":

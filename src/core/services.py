@@ -272,6 +272,191 @@ def detect_npm(ssh_args: list[str]) -> ServiceStatus:
 
 
 # ---------------------------------------------------------------------------
+# PHP
+# ---------------------------------------------------------------------------
+
+
+def detect_php(ssh_args: list[str]) -> ServiceStatus:
+    """Detect PHP CLI on remote host."""
+    status = ServiceStatus(name="PHP")
+
+    rc, path = _run_check(ssh_args, "command -v php 2>/dev/null || echo ''")
+    if rc == 0 and path:
+        status.available = True
+        status.path = path
+    else:
+        for loc in ["/usr/bin/php", "/usr/local/bin/php", "/opt/php/bin/php"]:
+            rc, _ = _run_check(ssh_args, f"test -x {loc} 2>/dev/null && echo ok")
+            if rc == 0:
+                status.available = True
+                status.path = loc
+                break
+
+    if not status.available:
+        status.error = "php not found"
+        return status
+
+    rc, ver = _run_check(ssh_args, "php -v 2>/dev/null | head -1")
+    if rc == 0 and ver:
+        parts = ver.split()
+        if len(parts) >= 2:
+            status.version = parts[1]  # "PHP 8.4.5" -> "8.4.5"
+
+    rc, _ = _run_check(ssh_args, "pgrep -x php-fpm >/dev/null 2>&1 || pgrep -f 'php-fpm: master' >/dev/null 2>&1")
+    status.running = rc == 0
+
+    if status.running:
+        rc, count = _run_check(ssh_args, "pgrep -cf 'php-fpm: pool' 2>/dev/null || pgrep -cf php-fpm 2>/dev/null || echo 0")
+        if rc == 0 and count.strip().isdigit():
+            status.details["pool_children"] = count.strip()
+
+    # Count loaded extensions
+    rc, ext_count = _run_check(ssh_args, "php -m 2>/dev/null | tail -n +2 | wc -l | tr -d ' '")
+    if rc == 0 and ext_count.strip().isdigit():
+        status.details["extensions"] = ext_count.strip()
+
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Apache
+# ---------------------------------------------------------------------------
+
+
+def detect_apache(ssh_args: list[str]) -> ServiceStatus:
+    """Detect Apache httpd on remote host."""
+    status = ServiceStatus(name="Apache")
+
+    # Try both apache2 and httpd
+    rc, path = _run_check(ssh_args, "command -v apache2 2>/dev/null || command -v httpd 2>/dev/null || echo ''")
+    if rc == 0 and path:
+        status.available = True
+        status.path = path
+    else:
+        for loc in ["/usr/sbin/apache2", "/usr/sbin/httpd", "/usr/local/sbin/httpd"]:
+            rc, _ = _run_check(ssh_args, f"test -x {loc} 2>/dev/null && echo ok")
+            if rc == 0:
+                status.available = True
+                status.path = loc
+                break
+
+    if not status.available:
+        status.error = "apache2/httpd not found"
+        return status
+
+    rc, ver = _run_check(ssh_args, f"{status.path} -v 2>/dev/null | head -1")
+    if rc == 0 and ver:
+        # "Server version: Apache/2.4.62 (Ubuntu)" -> "2.4.62"
+        import re
+        m = re.search(r"Apache/([\d.]+)", ver)
+        if m:
+            status.version = m.group(1)
+
+    rc, _ = _run_check(ssh_args, "pgrep -x apache2 >/dev/null 2>&1 || pgrep -x httpd >/dev/null 2>&1")
+    status.running = rc == 0
+
+    if status.running:
+        rc, modules = _run_check(ssh_args, f"{status.path} -M 2>/dev/null | wc -l | tr -d ' '")
+        if rc == 0 and modules.strip().isdigit():
+            status.details["modules"] = modules.strip()
+
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Nginx
+# ---------------------------------------------------------------------------
+
+
+def detect_nginx(ssh_args: list[str]) -> ServiceStatus:
+    """Detect Nginx on remote host."""
+    status = ServiceStatus(name="Nginx")
+
+    rc, path = _run_check(ssh_args, "command -v nginx 2>/dev/null || echo ''")
+    if rc == 0 and path:
+        status.available = True
+        status.path = path
+    else:
+        for loc in ["/usr/sbin/nginx", "/usr/local/sbin/nginx", "/opt/nginx/sbin/nginx"]:
+            rc, _ = _run_check(ssh_args, f"test -x {loc} 2>/dev/null && echo ok")
+            if rc == 0:
+                status.available = True
+                status.path = loc
+                break
+
+    if not status.available:
+        status.error = "nginx not found"
+        return status
+
+    rc, ver = _run_check(ssh_args, f"{status.path} -v 2>&1")
+    if rc == 0 and ver:
+        # "nginx version: nginx/1.26.3" -> "1.26.3"
+        import re
+        m = re.search(r"nginx/([\d.]+)", ver)
+        if m:
+            status.version = m.group(1)
+
+    rc, _ = _run_check(ssh_args, "pgrep -x nginx >/dev/null 2>&1")
+    status.running = rc == 0
+
+    if status.running:
+        rc, sites = _run_check(ssh_args, "ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | wc -l | tr -d ' ' || echo 0")
+        if rc == 0 and sites.strip().isdigit():
+            status.details["sites_enabled"] = sites.strip()
+        rc, procs = _run_check(ssh_args, "pgrep -cf 'nginx: worker' 2>/dev/null || echo 0")
+        if rc == 0 and procs.strip().isdigit():
+            status.details["worker_processes"] = procs.strip()
+
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Caddy
+# ---------------------------------------------------------------------------
+
+
+def detect_caddy(ssh_args: list[str]) -> ServiceStatus:
+    """Detect Caddy web server on remote host."""
+    status = ServiceStatus(name="Caddy")
+
+    rc, path = _run_check(ssh_args, "command -v caddy 2>/dev/null || echo ''")
+    if rc == 0 and path:
+        status.available = True
+        status.path = path
+    else:
+        for loc in ["/usr/bin/caddy", "/usr/local/bin/caddy", "/opt/caddy/caddy"]:
+            rc, _ = _run_check(ssh_args, f"test -x {loc} 2>/dev/null && echo ok")
+            if rc == 0:
+                status.available = True
+                status.path = loc
+                break
+
+    if not status.available:
+        status.error = "caddy not found"
+        return status
+
+    rc, ver = _run_check(ssh_args, f"{status.path} version 2>&1")
+    if rc == 0 and ver:
+        # "v2.9.1 h1:hash..." -> "2.9.1"
+        import re
+        m = re.search(r"v?(\d+\.\d+\.\d+)", ver)
+        if m:
+            status.version = m.group(1)
+        else:
+            status.version = ver.split()[0].lstrip("v") if ver.split() else ver[:30]
+
+    rc, _ = _run_check(ssh_args, "pgrep -x caddy >/dev/null 2>&1 || pgrep -f 'caddy run' >/dev/null 2>&1")
+    status.running = rc == 0
+
+    if status.running:
+        rc, procs = _run_check(ssh_args, "pgrep -cf caddy 2>/dev/null || echo 0")
+        if rc == 0 and procs.strip().isdigit():
+            status.details["processes"] = procs.strip()
+
+    return status
+
+
+# ---------------------------------------------------------------------------
 # Aggregate detector
 # ---------------------------------------------------------------------------
 
@@ -287,6 +472,10 @@ def detect_all_services(host: str, user: str = "", port: int = 22, key: str = ""
         detect_redis(ssh_args),
         detect_supervisor(ssh_args),
         detect_php_fpm(ssh_args),
+        detect_php(ssh_args),
+        detect_apache(ssh_args),
+        detect_nginx(ssh_args),
+        detect_caddy(ssh_args),
         detect_nodejs(ssh_args),
         detect_npm(ssh_args),
     ]
