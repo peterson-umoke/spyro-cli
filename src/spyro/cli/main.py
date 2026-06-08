@@ -35,6 +35,7 @@ from .commands import (
     cmd_caddy,
     cmd_tinker,
     cmd_db,
+    cmd_auth,
 )
 
 
@@ -90,6 +91,7 @@ main.add_command(cmd_nginx, "nginx")
 main.add_command(cmd_caddy, "caddy")
 main.add_command(cmd_tinker, "tinker")
 main.add_command(cmd_db, "db")
+main.add_command(cmd_auth, "auth")
 
 
 if __name__ == "__main__":

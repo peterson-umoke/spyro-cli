@@ -63,15 +63,25 @@ pip install -e ".[dev]"
 ### Credential Storage
 
 Spyro stores SSH and sudo passwords in your OS keychain (macOS Keychain, Linux Secret Service).
-Store them before first use:
 
-```python
-import keyring
-keyring.set_password("spyro-cli", "profile:ssh:username", "your-ssh-password")
-keyring.set_password("spyro-cli", "profile:sudo:username", "your-sudo-password")
+```bash
+# Store credentials for a profile (you'll be prompted securely)
+spyro auth set --profile staging
+
+# Store only SSH password
+spyro auth set --profile staging --type ssh
+
+# Store with password flag (non-interactive, for scripting)
+spyro auth set --profile staging --type sudo --password 'your-sudo-password'
+
+# List stored credentials
+spyro auth list
+
+# Delete stored credentials
+spyro auth delete --profile staging
 ```
 
-If no keychain entry exists, Spyro falls back to prompting via `getpass`.
+If no keychain entry exists, Spyro falls back to prompting via `getpass` when needed.
 
 ## Quick Start
 

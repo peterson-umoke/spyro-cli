@@ -1138,6 +1138,121 @@ def _print_tunnel_info(name: str, state: object) -> None:
 
 
 # ---------------------------------------------------------------------------
+# spyro auth — Keychain credential management
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def cmd_auth() -> None:
+    """Manage stored credentials (macOS Keychain / Linux Secret Service)."""
+
+
+@cmd_auth.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--type", "cred_type", type=click.Choice(["ssh", "sudo"]), default=None,
+              help="Credential type (omit for both SSH + sudo)")
+@click.option("--password", "-w", default="", help="Password (omit to prompt)")
+def set(profile: str, cred_type: str | None, password: str) -> None:
+    """Store a credential in the OS keychain.
+
+    If --password is omitted, you'll be prompted securely (no echo).
+    If --type is omitted, both SSH and sudo passwords are stored.
+    """
+    import getpass
+    from ..utils.keychain import store_credential, get_credential
+
+    # Load profile to get username
+    config = load_config()
+    try:
+        p = config.get_profile(profile)
+        username = p.user
+    except Exception:
+        username = profile
+
+    types = [cred_type] if cred_type else ["ssh", "sudo"]
+
+    for t in types:
+        # Check existing
+        existing = get_credential(profile, t, username)
+        if existing:
+            console.print(f"[yellow]  {t} credential for {username}@{profile} already exists[/yellow]")
+            if not click.confirm(f"  Overwrite?"):
+                continue
+
+        pw = password or getpass.getpass(f"  {t} password for {username}@{profile}: ")
+        if not pw:
+            console.print(f"  [red]No password provided, skipping {t}[/red]")
+            continue
+
+        if store_credential(profile, t, username, pw):
+            console.print(f"[green]  ✓ {t} credential stored for {username}@{profile}[/green]")
+        else:
+            console.print(f"[red]  ✗ Failed to store {t} credential[/red]")
+
+
+@cmd_auth.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--type", "cred_type", type=click.Choice(["ssh", "sudo"]), default=None,
+              help="Credential type (omit to delete both)")
+def delete(profile: str, cred_type: str | None) -> None:
+    """Remove stored credentials from the OS keychain."""
+    from ..utils.keychain import delete_credential, get_credential
+
+    config = load_config()
+    try:
+        p = config.get_profile(profile)
+        username = p.user
+    except Exception:
+        username = profile
+
+    types = [cred_type] if cred_type else ["ssh", "sudo"]
+
+    for t in types:
+        if get_credential(profile, t, username):
+            if delete_credential(profile, t, username):
+                console.print(f"[green]  ✓ {t} credential deleted for {username}@{profile}[/green]")
+            else:
+                console.print(f"[red]  ✗ Failed to delete {t} credential[/red]")
+        else:
+            console.print(f"  [yellow]No {t} credential found for {username}@{profile}[/yellow]")
+
+
+@cmd_auth.command("list")
+def list_credentials() -> None:
+    """Show which credentials are stored in the keychain."""
+    from ..utils.keychain import SERVICE_NAME
+    import keyring
+
+    try:
+        # Keyring backends don't support listing passwords directly,
+        # so scan known patterns from config if available
+        config = load_config()
+        profiles = [(name, config.get_profile(name).user) for name in config.profile_names]
+    except Exception:
+        profiles = []
+
+    found = False
+
+    if profiles:
+        from ..utils.keychain import get_credential
+
+        for name, username in profiles:
+            for t in ["ssh", "sudo"]:
+                pw = get_credential(name, t, username)
+                if pw is not None:
+                    masked = pw[:2] + "••••" + pw[-2:] if len(pw) > 4 else "••••"
+                    console.print(f"  [green]✓[/green] {name} {t}: {username} / {masked}")
+                    found = True
+
+    if not found:
+        console.print("[yellow]No credentials stored.[/yellow]")
+        if not profiles:
+            console.print("[yellow]No spyro.toml found. Run 'spyro auth set -p <profile>' after creating one.[/yellow]")
+        else:
+            console.print("[yellow]Use: spyro auth set -p <profile>[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # spyro supervisor — Supervisor process management
 # ---------------------------------------------------------------------------
 
