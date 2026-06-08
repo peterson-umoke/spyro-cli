@@ -16,12 +16,14 @@ Developers working with remote servers spend significant time on repetitive SSH 
 ## Installation
 
 ```bash
+# Install spyro and core dependencies
+cd spyro
 pip install -e .
-```
 
-For development:
+# Optional: install filesystem watcher for spyro sync/watch
+pip install spyro-cli[watch]
 
-```bash
+# For development
 pip install -e ".[dev]"
 ```
 
@@ -33,7 +35,20 @@ pip install -e ".[dev]"
 | `rich` | Terminal output formatting |
 | `psutil` | Cross-platform process tree management |
 | `keyring` | Native OS keychain integration (macOS Keychain, Linux Secret Service) |
-| `watchdog` | Filesystem watching for `spyro watch` (optional) |
+| `watchdog` | Filesystem watching for `spyro watch` (optional — install via `spyro-cli[watch]`) |
+
+### Credential Storage
+
+Spyro stores SSH and sudo passwords in your OS keychain (macOS Keychain, Linux Secret Service).
+Store them before first use:
+
+```python
+import keyring
+keyring.set_password("spyro-cli", "profile:ssh:username", "your-ssh-password")
+keyring.set_password("spyro-cli", "profile:sudo:username", "your-sudo-password")
+```
+
+If no keychain entry exists, Spyro falls back to prompting via `getpass`.
 
 ## Quick Start
 
@@ -174,7 +189,8 @@ Spyro uses a dual-strategy approach:
 | `spyro run -p staging "cmd"` | Execute on specific profile(s). |
 | `spyro artisan <cmd>` | Run Laravel Artisan on remote host with auto-sudo. |
 | `spyro wp <cmd>` | Run WP-CLI on remote host with auto-sudo. |
-| `spyro cp <src> <dest>` | Secure file copy with auto-sudo escalation. |
+| `spyro cp /local/file /remote/path -p staging` | Upload local file to remote host. |
+| `spyro cp :/remote/file /local/path -p staging` | Download remote file to local machine. Prefix remote paths with `:` for downloads. |
 
 ### Database Tools
 
@@ -208,7 +224,7 @@ Spyro uses a dual-strategy approach:
 src/
 ├── cli/            # Click CLI entry point and command implementations
 │   ├── main.py     # Group registration, version, logging setup
-│   └── commands.py # All 14 command functions
+│   └── commands.py # All 19 command functions
 ├── core/           # SSH handshake and database logic
 │   ├── pty_engine.py  # PTY-based secure handshake engine
 │   └── db.py          # Dual-strategy credential resolution
@@ -286,7 +302,7 @@ The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default
 ## Testing
 
 ```bash
-# Unit tests (63 tests)
+# Unit tests (89 tests)
 python3 -m pytest tests/unit/ -v
 
 # Security tests — ANSI attack vectors (20 vectors)
@@ -298,8 +314,8 @@ python3 tests/security/test_memory_zeroing.py
 # Phase 1 PoC — PTY engine validation
 python3 tests/poc/test_pty_engine.py
 
-# Dependency vulnerability scan
-python3 -m pip_audit
+# All tests including integration
+python3 -m pytest tests/ -v
 ```
 
 ## Development
@@ -311,6 +327,9 @@ pip install -e ".[dev]"
 
 # Run tests
 python3 -m pytest tests/unit/ -v
+
+# Run full suite
+python3 -m pytest tests/ -v
 
 # Run security suite
 python3 tests/security/test_ansi_attacks.py
