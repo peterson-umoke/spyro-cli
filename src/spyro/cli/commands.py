@@ -18,6 +18,7 @@ from ..utils.config import (
     SpyroConfig,
     generate_config,
     load_config,
+    resolve_profile,
 )
 from ..core.db import generate_connection_url, resolve_db_credentials
 from ..core.services import detect_all_services
@@ -638,9 +639,11 @@ def cmd_proxy_url(profile: str, port: int | None) -> None:
 @click.command()
 @click.argument("cmd_args", nargs=-1)
 @click.option("--no-escalate", is_flag=True, help="Don't use sudo")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
+@click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
+def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str | None) -> None:
     """Run Laravel Artisan commands on the remote host."""
+    profile = resolve_profile(profile)
+
     if not cmd_args:
         console.print("[red]Usage: spyro artisan <command> [--profile NAME][/red]")
         return

@@ -180,6 +180,37 @@ def load_config(start: Path | None = None) -> SpyroConfig:
     return config
 
 
+def resolve_profile(profile: str | None) -> str:
+    """Resolve profile name: use provided, or auto-detect if only one exists.
+
+    Args:
+        profile: Profile name from -p flag (may be None)
+
+    Returns:
+        Profile name to use
+
+    Raises:
+        SystemExit: If no profile specified and multiple profiles exist
+    """
+    config = load_config()
+
+    if profile:
+        # Explicit profile provided — validate it exists
+        config.get_profile(profile)  # Raises if not found
+        return profile
+
+    # No profile specified — check if there's only one
+    if len(config.profile_names) == 1:
+        return config.profile_names[0]
+
+    # Multiple profiles — require -p
+    available = ", ".join(config.profile_names)
+    raise SystemExit(
+        f"Multiple profiles found ({available}). "
+        f"Use -p <profile> to specify which one."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Template generation for `spyro init`
 # ---------------------------------------------------------------------------
