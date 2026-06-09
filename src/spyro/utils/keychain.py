@@ -3,7 +3,7 @@
 The PRD requires: "Uses native OS secure stores to handle sensitive passwords."
 
 This module wraps the `keyring` library to provide:
-- Storing SSH/sudo passwords in the OS keychain
+- Storing one password per profile:user in the OS keychain
 - Retrieving them when needed
 - Graceful fallback to getpass prompts when keychain is unavailable
 """
@@ -35,15 +35,15 @@ def _keyring_available() -> bool:
 
 def store_credential(
     profile: str,
-    credential_type: str,
     username: str,
     password: str,
 ) -> bool:
     """Store a credential in the OS keychain.
 
+    One password per profile:user — used for both SSH and sudo.
+
     Args:
         profile: Profile name (e.g., "staging")
-        credential_type: "ssh" or "sudo"
         username: Remote username
         password: The password to store
 
@@ -57,7 +57,7 @@ def store_credential(
     try:
         import keyring
 
-        key = f"{profile}:{credential_type}:{username}"
+        key = f"{profile}:{username}"
         keyring.set_password(SERVICE_NAME, key, password)
         log.debug(f"Stored credential for {key}")
         return True
@@ -68,14 +68,12 @@ def store_credential(
 
 def get_credential(
     profile: str,
-    credential_type: str,
     username: str,
 ) -> Optional[str]:
     """Retrieve a credential from the OS keychain.
 
     Args:
         profile: Profile name
-        credential_type: "ssh" or "sudo"
         username: Remote username
 
     Returns:
@@ -87,7 +85,7 @@ def get_credential(
     try:
         import keyring
 
-        key = f"{profile}:{credential_type}:{username}"
+        key = f"{profile}:{username}"
         password = keyring.get_password(SERVICE_NAME, key)
         if password:
             log.debug(f"Retrieved credential for {key}")
@@ -99,7 +97,6 @@ def get_credential(
 
 def delete_credential(
     profile: str,
-    credential_type: str,
     username: str,
 ) -> bool:
     """Delete a credential from the OS keychain.
@@ -113,7 +110,7 @@ def delete_credential(
     try:
         import keyring
 
-        key = f"{profile}:{credential_type}:{username}"
+        key = f"{profile}:{username}"
         keyring.delete_password(SERVICE_NAME, key)
         log.debug(f"Deleted credential for {key}")
         return True
@@ -124,7 +121,6 @@ def delete_credential(
 
 def prompt_for_credential(
     profile: str,
-    credential_type: str,
     username: str,
     *,
     store: bool = True,
@@ -136,7 +132,6 @@ def prompt_for_credential(
 
     Args:
         profile: Profile name
-        credential_type: "ssh" or "sudo"
         username: Remote username
         store: Whether to store the prompted credential in keychain
 
@@ -144,16 +139,15 @@ def prompt_for_credential(
         The password string.
     """
     # Try keychain first
-    cached = get_credential(profile, credential_type, username)
+    cached = get_credential(profile, username)
     if cached:
         return cached
 
     # Prompt user
-    label = f"{credential_type} password for {username}@{profile}"
-    password = getpass.getpass(f"{label}: ")
+    password = getpass.getpass(f"  password for {username}@{profile}: ")
 
     # Store in keychain if available
     if store and password:
-        store_credential(profile, credential_type, username, password)
+        store_credential(profile, username, password)
 
     return password

@@ -517,9 +517,9 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], command: str) -> None:
 
         sudo_pw = ""
         if p.sudo:
-            sudo_pw = prompt_for_credential(name, "sudo", p.user)
+            sudo_pw = prompt_for_credential(name, p.user)
 
-        ssh_pw = prompt_for_credential(name, "ssh", p.user)
+        ssh_pw = prompt_for_credential(name, p.user)
 
         exit_code = runner.run(
             ssh_args,
@@ -677,9 +677,9 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> N
 
     sudo_pw = ""
     if p.sudo and not no_escalate:
-        sudo_pw = prompt_for_credential(profile, "sudo", p.user)
+        sudo_pw = prompt_for_credential(profile, p.user)
 
-    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
+    ssh_pw = prompt_for_credential(profile, p.user)
 
     def output_line(line: str) -> None:
         console.print(line)
@@ -942,9 +942,9 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
 
     sudo_pw = ""
     if p.sudo and not no_escalate:
-        sudo_pw = prompt_for_credential(profile, "sudo", p.user)
+        sudo_pw = prompt_for_credential(profile, p.user)
 
-    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
+    ssh_pw = prompt_for_credential(profile, p.user)
 
     def output_line(line: str) -> None:
         console.print(line)
@@ -1019,7 +1019,7 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
 
     from ..utils.keychain import prompt_for_credential
 
-    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
+    ssh_pw = prompt_for_credential(profile, p.user)
 
     def output_line(line: str) -> None:
         console.print(line)
@@ -1149,14 +1149,13 @@ def cmd_auth() -> None:
 
 @cmd_auth.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-@click.option("--type", "cred_type", type=click.Choice(["ssh", "sudo"]), default=None,
-              help="Credential type (omit for both SSH + sudo)")
 @click.option("--password", "-w", default="", help="Password (omit to prompt)")
-def set(profile: str, cred_type: str | None, password: str) -> None:
+@click.option("--force", "-f", is_flag=True, help="Overwrite without prompting")
+def set(profile: str, password: str, force: bool) -> None:
     """Store a credential in the OS keychain.
 
+    One password per profile — used for both SSH and sudo.
     If --password is omitted, you'll be prompted securely (no echo).
-    If --type is omitted, both SSH and sudo passwords are stored.
     """
     import getpass
     from ..utils.keychain import store_credential, get_credential
@@ -1169,32 +1168,27 @@ def set(profile: str, cred_type: str | None, password: str) -> None:
     except Exception:
         username = profile
 
-    types = [cred_type] if cred_type else ["ssh", "sudo"]
+    # Check existing
+    existing = get_credential(profile, username)
+    if existing and not force and not password:
+        console.print(f"[yellow]  Credential for {username}@{profile} already exists[/yellow]")
+        if not click.confirm(f"  Overwrite?"):
+            return
 
-    for t in types:
-        # Check existing
-        existing = get_credential(profile, t, username)
-        if existing:
-            console.print(f"[yellow]  {t} credential for {username}@{profile} already exists[/yellow]")
-            if not click.confirm(f"  Overwrite?"):
-                continue
+    pw = password or getpass.getpass(f"  password for {username}@{profile}: ")
+    if not pw:
+        console.print(f"  [red]No password provided, skipping[/red]")
+        return
 
-        pw = password or getpass.getpass(f"  {t} password for {username}@{profile}: ")
-        if not pw:
-            console.print(f"  [red]No password provided, skipping {t}[/red]")
-            continue
-
-        if store_credential(profile, t, username, pw):
-            console.print(f"[green]  ✓ {t} credential stored for {username}@{profile}[/green]")
-        else:
-            console.print(f"[red]  ✗ Failed to store {t} credential[/red]")
+    if store_credential(profile, username, pw):
+        console.print(f"[green]  ✓ Credential stored for {username}@{profile}[/green]")
+    else:
+        console.print(f"[red]  ✗ Failed to store credential[/red]")
 
 
 @cmd_auth.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-@click.option("--type", "cred_type", type=click.Choice(["ssh", "sudo"]), default=None,
-              help="Credential type (omit to delete both)")
-def delete(profile: str, cred_type: str | None) -> None:
+def delete(profile: str) -> None:
     """Remove stored credentials from the OS keychain."""
     from ..utils.keychain import delete_credential, get_credential
 
@@ -1205,16 +1199,13 @@ def delete(profile: str, cred_type: str | None) -> None:
     except Exception:
         username = profile
 
-    types = [cred_type] if cred_type else ["ssh", "sudo"]
-
-    for t in types:
-        if get_credential(profile, t, username):
-            if delete_credential(profile, t, username):
-                console.print(f"[green]  ✓ {t} credential deleted for {username}@{profile}[/green]")
-            else:
-                console.print(f"[red]  ✗ Failed to delete {t} credential[/red]")
+    if get_credential(profile, username):
+        if delete_credential(profile, username):
+            console.print(f"[green]  ✓ Credential deleted for {username}@{profile}[/green]")
         else:
-            console.print(f"  [yellow]No {t} credential found for {username}@{profile}[/yellow]")
+            console.print(f"[red]  ✗ Failed to delete credential[/red]")
+    else:
+        console.print(f"  [yellow]No credential found for {username}@{profile}[/yellow]")
 
 
 @cmd_auth.command("list")
@@ -1237,12 +1228,11 @@ def list_credentials() -> None:
         from ..utils.keychain import get_credential
 
         for name, username in profiles:
-            for t in ["ssh", "sudo"]:
-                pw = get_credential(name, t, username)
-                if pw is not None:
-                    masked = pw[:2] + "••••" + pw[-2:] if len(pw) > 4 else "••••"
-                    console.print(f"  [green]✓[/green] {name} {t}: {username} / {masked}")
-                    found = True
+            pw = get_credential(name, username)
+            if pw is not None:
+                masked = pw[:2] + "••••" + pw[-2:] if len(pw) > 4 else "••••"
+                console.print(f"  [green]✓[/green] {name}: {username} / {masked}")
+                found = True
 
     if not found:
         console.print("[yellow]No credentials stored.[/yellow]")
@@ -1273,8 +1263,8 @@ def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0) -> int:
 
     from ..utils.keychain import prompt_for_credential
 
-    sudo_pw = prompt_for_credential(profile, "sudo", p.user) if p.sudo else ""
-    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
+    sudo_pw = prompt_for_credential(profile, p.user) if p.sudo else ""
+    ssh_pw = prompt_for_credential(profile, p.user)
 
     def output_line(line: str) -> None:
         console.print(f"  {line}")
@@ -1632,7 +1622,7 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
             host=p.host, user=p.user, port=p.port, key=p.key,
         )
         from ..utils.keychain import prompt_for_credential as pfc
-        ssh_pw = pfc(profile, "ssh", p.user) if not no_escalate else ""
+        ssh_pw = pfc(profile, p.user) if not no_escalate else ""
         runner.run(scp_args, password=ssh_pw, timeout=30)
         tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker < {remote_path}; {sudo_prefix}rm -f {remote_path}"
     else:
@@ -1650,8 +1640,8 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
 
     from ..utils.keychain import prompt_for_credential as pfc2
 
-    sudo_pw = pfc2(profile, "sudo", p.user) if p.sudo and not no_escalate else ""
-    ssh_pw = pfc2(profile, "ssh", p.user)
+    sudo_pw = pfc2(profile, p.user) if p.sudo and not no_escalate else ""
+    ssh_pw = pfc2(profile, p.user)
 
     if eval or file:
         def output_line(line: str) -> None:
@@ -2076,8 +2066,8 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
 
     from ..utils.keychain import prompt_for_credential
 
-    ssh_pw = prompt_for_credential(profile, "ssh", p.user)
-    sudo_pw = prompt_for_credential(profile, "sudo", p.user) if p.sudo else ""
+    ssh_pw = prompt_for_credential(profile, p.user)
+    sudo_pw = prompt_for_credential(profile, p.user) if p.sudo else ""
 
     runner = PTYRunner()
     ec = runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
