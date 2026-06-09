@@ -62,26 +62,66 @@ pip install -e ".[dev]"
 
 ### Credential Storage
 
-Spyro stores SSH and sudo passwords in your OS keychain (macOS Keychain, Linux Secret Service).
+Spyro stores one password per profile in your OS keychain (macOS Keychain, Linux Secret Service). This password is used for both SSH and sudo — because they're the same.
 
 ```bash
 # Store credentials for a profile (you'll be prompted securely)
-spyro auth set --profile staging
-
-# Store only SSH password
-spyro auth set --profile staging --type ssh
+spyro auth set -p staging
 
 # Store with password flag (non-interactive, for scripting)
-spyro auth set --profile staging --type sudo --password 'your-sudo-password'
+spyro auth set -p staging -w 'your-password'
+
+# Overwrite existing without prompting
+spyro auth set -p staging -w 'new-password' -f
 
 # List stored credentials
 spyro auth list
 
 # Delete stored credentials
-spyro auth delete --profile staging
+spyro auth delete -p staging
 ```
 
 If no keychain entry exists, Spyro falls back to prompting via `getpass` when needed.
+
+### Multiple Users, Same Server
+
+When different services on the same server run as different users, create a profile per user:
+
+```toml
+[profiles.dev-api]
+host = "34.250.32.252"
+user = "peter.umoke"
+remote_path = "/var/www/dev-api.froggytalk.com/current"
+sudo = true
+
+[profiles.dev-ird]
+host = "34.250.32.252"
+user = "sftp-staging-ird"
+remote_path = "/home/sftp-staging-ird/uploads"
+sudo = false
+
+[profiles.dev-recharge]
+host = "34.250.32.252"
+user = "recharge-user"
+remote_path = "/var/www/recharge-app/current"
+sudo = false
+```
+
+Store separate credentials for each:
+
+```bash
+spyro auth set -p dev-api -w 'api-password'
+spyro auth set -p dev-ird -w 'ird-password'
+spyro auth set -p dev-recharge -w 'recharge-password'
+```
+
+Use them independently:
+
+```bash
+spyro artisan migrate:status -p dev-api
+spyro artisan tinker -p dev-ird
+spyro run "systemctl status nginx" -p dev-recharge
+```
 
 ## Quick Start
 

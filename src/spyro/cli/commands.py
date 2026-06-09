@@ -1256,6 +1256,12 @@ def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0) -> int:
     p = config.get_profile(profile)
     runner = PTYRunner()
 
+    # Check if command requires sudo but profile doesn't have sudo access
+    if not p.sudo and "sudo" in cmd:
+        console.print(f"[red]  ✗ User '{p.user}' does not have sudo access on {profile}[/red]")
+        console.print(f"[yellow]  Set sudo = true in your spyro.toml for this profile[/yellow]")
+        return 1
+
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
     if p.sudo:
         ssh_args.insert(1, "-t")
