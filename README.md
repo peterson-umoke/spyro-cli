@@ -1,97 +1,131 @@
 # Spyro
 
-Intelligent SSH tunneling and remote command CLI for developers.
+**The lazy developer's SSH tool.** One config file, zero terminal tabs.
 
-Spyro automates SSH port-forwarding, remote command execution, database credential resolution, and file synchronization through a declarative `spyro.toml` configuration. It replaces manual `ssh -L` coordination, `scp` routines, and `autossh` daemons with a single, self-healing tool.
+Spyro replaces manual `ssh -L`, `scp`, `autossh`, and "wait, which port was that tunnel on?" with a single CLI that handles tunnels, remote commands, database access, file sync, and service management — all from your project directory.
 
-## Why Spyro
+## What Spyro Does
 
-Developers working with remote servers spend significant time on repetitive SSH boilerplate: setting up port forwards, copying `.env` files, running artisan commands, syncing code. Spyro eliminates this by:
-
-- **Automating tunnels** with a self-healing supervisor that survives network drops, sleep/wake cycles, and process crashes
-- **Resolving credentials** from either local TOML config or remote `.env`/Rails config files
-- **Running remote commands** through a PTY engine that handles sudo escalation without leaking passwords
-- **Syncing files** in real-time using native OS filesystem watchers
+| Problem | Spyro Solution |
+|---------|---------------|
+| `ssh -L 3306:localhost:3306 user@server &` × 5 servers | `spyro up` — tunnels auto-heal, survive sleep/wake |
+| `ssh user@server "cd /var/www/app && php artisan migrate"` | `spyro artisan migrate -p staging` |
+| "What's the DB password for staging?" | Stored in your OS keychain, auto-resolved |
+| `scp .env user@server:/var/www/app/.env` | `spyro pull-env -p staging` |
+| "Is the queue worker running?" | `spyro supervisor status -p staging` |
+| Manual `supervisorctl restart` via SSH | `spyro supervisor restart -p staging` |
 
 ## Installation
 
-### Using uv (recommended)
+### macOS / Linux (recommended)
 
 ```bash
-# Clone and sync (creates .venv + installs deps)
-git clone <repo-url> && cd spyro
-uv sync
+# Install with uv (fast Python package manager)
+uv tool install git+https://github.com/peterson-umoke/spyro-cli.git
 
-# Run commands
-uv run spyro --version
-uv run spyro doctor
-
-# Or install globally via uv tool
-uv tool install .
+# Verify
 spyro --version
-
-# Optional: filesystem watcher
-uv tool install . --with watchdog
-
-# Dev dependencies
-uv pip install pytest pytest-cov
 ```
 
-### Using pip
+### From source
 
 ```bash
-cd spyro
-pip install -e .
-
-# Optional: filesystem watcher for spyro sync/watch
-pip install spyro-cli[watch]
-
-# For development
-pip install -e ".[dev]"
+git clone https://github.com/peterson-umoke/spyro-cli.git
+cd spyro-cli
+uv sync
+uv tool install .
 ```
 
-### Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `click` | CLI framework |
-| `rich` | Terminal output formatting |
-| `psutil` | Cross-platform process tree management |
-| `keyring` | Native OS keychain integration (macOS Keychain, Linux Secret Service) |
-| `watchdog` | Filesystem watching for `spyro watch` (optional — install via `spyro-cli[watch]`) |
-
-### Credential Storage
-
-Spyro stores one password per profile in your OS keychain (macOS Keychain, Linux Secret Service). This password is used for both SSH and sudo — because they're the same.
+### Update
 
 ```bash
-# Store credentials for a profile (you'll be prompted securely)
+uv tool install --force git+https://github.com/peterson-umoke/spyro-cli.git
+```
+
+## Getting Started
+
+### 1. Create your config
+
+```bash
+cd ~/Projects/my-app
+spyro init
+```
+
+This creates `spyro.toml` in your project root. Edit it:
+
+```toml
+[profiles.staging]
+host = "staging.example.com"
+user = "deploy"
+port = 22
+remote_path = "/var/www/app"
+artisan = true
+sudo = true
+forwarded_ports = [3306, 6379]
+
+[profiles.staging.db]
+host = "127.0.0.1"
+port = 3306
+name = "myapp_staging"
+user = "forge"
+password = ""
+driver = "mysql"
+```
+
+### 2. Store your password
+
+```bash
 spyro auth set -p staging
-
-# Store with password flag (non-interactive, for scripting)
-spyro auth set -p staging -w 'your-password'
-
-# Overwrite existing without prompting
-spyro auth set -p staging -w 'new-password' -f
-
-# List stored credentials
-spyro auth list
-
-# Delete stored credentials
-spyro auth delete -p staging
+# You'll be prompted once — stored in your OS keychain forever
 ```
 
-If no keychain entry exists, Spyro falls back to prompting via `getpass` when needed.
+### 3. Start working
 
-### Multiple Users, Same Server
+```bash
+spyro up staging              # Start DB tunnel
+spyro artisan migrate -p staging   # Run migrations
+spyro db shell -p staging     # Open MySQL prompt
+spyro down                    # Stop tunnels when done
+```
 
-When different services on the same server run as different users, create a profile per user:
+That's it. No more `ssh` tabs, no more port forwarding scripts.
+
+## Configuration
+
+### Profile basics
+
+```toml
+[profiles.myserver]
+host = "192.168.1.100"         # Server IP or hostname
+user = "deploy"                # SSH username
+port = 22                      # SSH port (default: 22)
+remote_path = "/var/www/app"   # Working directory on server
+artisan = true                 # Enable Laravel artisan commands
+sudo = true                    # Allow sudo when needed
+forwarded_ports = [3306, 6379] # Ports to tunnel locally
+```
+
+### Database config
+
+```toml
+[profiles.myserver.db]
+host = "127.0.0.1"    # Always localhost (via tunnel)
+port = 3306           # Must match forwarded_ports
+name = "myapp"
+user = "forge"
+password = ""         # Leave empty = auto-detect from remote .env
+driver = "mysql"      # mysql, postgres, or sqlite
+```
+
+### Multiple users, same server
+
+Different services running as different users? One profile per user:
 
 ```toml
 [profiles.dev-api]
 host = "34.250.32.252"
 user = "peter.umoke"
-remote_path = "/var/www/dev-api.froggytalk.com/current"
+remote_path = "/var/www/api/current"
 sudo = true
 
 [profiles.dev-ird]
@@ -103,380 +137,262 @@ sudo = false
 [profiles.dev-recharge]
 host = "34.250.32.252"
 user = "recharge-user"
-remote_path = "/var/www/recharge-app/current"
+remote_path = "/var/www/recharge/current"
 sudo = false
 ```
 
-Store separate credentials for each:
-
 ```bash
-spyro auth set -p dev-api -w 'api-password'
-spyro auth set -p dev-ird -w 'ird-password'
-spyro auth set -p dev-recharge -w 'recharge-password'
-```
+spyro auth set -p dev-api -w 'password1'
+spyro auth set -p dev-ird -w 'password2'
+spyro auth set -p dev-recharge -w 'password3'
 
-Use them independently:
-
-```bash
 spyro artisan migrate:status -p dev-api
 spyro artisan tinker -p dev-ird
-spyro run "systemctl status nginx" -p dev-recharge
+spyro run "ls -la" -p dev-recharge
 ```
 
-## Quick Start
-
-```bash
-# 1. Create configuration
-spyro init
-
-# 2. Edit spyro.toml with your server details
-vim spyro.toml
-
-# 3. Start tunnels
-spyro up staging
-
-# 4. Check status
-spyro status
-
-# 5. Run a remote command
-spyro run --profile staging "systemctl status nginx"
-
-# 6. Generate a DB connection URL for your GUI
-spyro proxy-url --profile staging | pbcopy
-
-# 7. Stop tunnels
-spyro down
-```
-
-## Configuration
-
-Create a `spyro.toml` in your project root (or any parent directory — Spyro walks up to find it):
+### Multiple servers
 
 ```toml
 [profiles.staging]
-host = "staging.example.com"
+host = "10.0.0.1"
 user = "deploy"
-port = 22
-# key = "~/.ssh/id_ed25519"
-remote_path = "/var/www/app"
-artisan = true
-sudo = true
-forwarded_ports = [33060, 63790]
-
-[profiles.staging.db]
-host = "127.0.0.1"
-port = 33060
-name = "app_staging"
-user = "forge"
-password = ""
-driver = "mysql"
+# ...
 
 [profiles.production]
-host = "production.example.com"
+host = "10.0.0.2"
 user = "deploy"
-port = 22
-remote_path = "/var/www/app"
-artisan = true
-sudo = false
-forwarded_ports = [33061]
-
-[profiles.production.db]
-host = "127.0.0.1"
-port = 33061
-name = "app_production"
-user = "forge"
-password = ""
-driver = "mysql"
+# ...
 ```
 
-### Configuration Fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `host` | string | *required* | Remote server hostname or IP |
-| `user` | string | `deploy` | SSH username |
-| `port` | int | `22` | SSH port |
-| `key` | string | `""` | Path to SSH private key |
-| `remote_path` | string | `/var/www` | Working directory on remote server |
-| `forwarded_ports` | list[int] | `[]` | Remote ports to forward locally |
-| `artisan` | bool | `false` | Detect Laravel artisan on remote |
-| `wordpress` | bool | `false` | Detect WordPress / WP-CLI on remote |
-| `wp_cli_path` | string | `""` | Custom path to WP-CLI binary |
-| `sudo` | bool | `false` | Enable JIT sudo escalation |
-| `env_files` | list[str] | `[".env"]` | Remote env files to scan for credentials |
-
-### Database Configuration
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `host` | string | `127.0.0.1` | Database host (usually localhost via tunnel) |
-| `port` | int | `3306` | Database port |
-| `name` | string | `""` | Database name |
-| `user` | string | `""` | Database user |
-| `password` | string | `""` | Database password (or leave empty for auto-detection) |
-| `driver` | string | `mysql` | `mysql`, `postgres`, or `sqlite` |
-
-### WordPress Profile
-
-```toml
-[profiles.wordpress]
-host = "wp.example.com"
-user = "deploy"
-remote_path = "/var/www/html"
-wordpress = true
-sudo = false
-forwarded_ports = [33062]
-
-[profiles.wordpress.db]
-host = "127.0.0.1"
-port = 33062
-name = "wordpress"
-user = "wp_user"
-password = ""
-driver = "mysql"
+```bash
+spyro artisan migrate -p staging     # staging only
+spyro artisan migrate -p production  # production only
+spyro artisan migrate --all          # both at once
 ```
 
-### Credential Resolution
+### Config file location
 
-Spyro uses a dual-strategy approach:
+Spyro walks up from your current directory looking for `spyro.toml`. Put it in your project root and run commands from anywhere inside the project.
 
-1. **Explicit TOML definition** — If `password` is set in `spyro.toml`, use it
-2. **Automatic detection fallback** — If empty, scan remote `.env`/config files for `DB_*` variables
+## Credentials
+
+### How it works
+
+Spyro stores **one password per profile** in your OS keychain (macOS Keychain / Linux Secret Service). Same password for SSH login and sudo — because they're the same.
+
+If no keychain entry exists, Spyro prompts you interactively and stores it for next time.
+
+### Commands
+
+```bash
+# Store (prompts securely)
+spyro auth set -p staging
+
+# Store non-interactively
+spyro auth set -p staging -w 'my-password'
+
+# List what's stored
+spyro auth list
+
+# Delete
+spyro auth delete -p staging
+```
+
+### Tips
+
+- **One password, all commands.** Set it once with `spyro auth set`, never think about it again.
+- **Different users = different profiles.** Each profile gets its own credential.
+- **No password in config files.** `spyro.toml` never stores passwords — keychain does.
 
 ## Commands
 
-### Tunnel Management
+### Tunnels
 
-| Command | Description |
-|---------|-------------|
-| `spyro up [profile]` | Start tunnels. Omit profile to start all. Runs as daemon by default. |
-| `spyro down [profile]` | Stop tunnels and clean up process trees. |
-| `spyro status [profile]` | Show health, active tunnels, PID, and port mappings. |
-| `spyro logs [profile]` | Stream supervisor logs. Use `-f` to follow. |
+```bash
+spyro up                     # Start all tunnels
+spyro up staging             # Start staging tunnel
+spyro down                   # Stop all tunnels
+spyro down staging           # Stop staging tunnel
+spyro status                 # Show all active tunnels
+spyro status staging         # Show staging tunnel details
+```
 
-### Remote Execution
+### Laravel Artisan
 
-| Command | Description |
-|---------|-------------|
-| `spyro run --all "cmd"` | Execute command across all profiles concurrently. |
-| `spyro run -p staging "cmd"` | Execute on specific profile(s). |
-| `spyro artisan <cmd>` | Run Laravel Artisan on remote host with auto-sudo. |
-| `spyro wp <cmd>` | Run WP-CLI on remote host with auto-sudo. |
-| `spyro tinker -p staging` | Laravel Tinker REPL (interactive, `--eval`, or `--file`). |
-| `spyro cp /local/file /remote/path -p staging` | Upload local file to remote host. |
-| `spyro cp :/remote/file /local/path -p staging` | Download remote file. Prefix with `:` for remote paths. |
+```bash
+spyro artisan migrate -p staging
+spyro artisan queue:status -p staging
+spyro artisan config:cache -p staging
+spyro artisan tinker -p staging          # Interactive REPL
+spyro artisan tinker -p staging -e "User::count()"  # One-shot
+```
 
-### Laravel Tinker
+### Database
 
-| Command | Description |
-|---------|-------------|
-| `spyro tinker -p staging` | Interactive REPL via SSH. |
-| `spyro tinker -p staging -e "User::count()"` | One-shot eval with `--eval`. |
-| `spyro tinker -p staging -f script.php` | Upload and run a PHP file. |
+```bash
+spyro db tunnel -p staging              # Start tunnel, show connection URL
+spyro db shell -p staging               # Open MySQL/MariaDB prompt
+spyro db ping -p staging                # Test connection
+spyro db query "SELECT COUNT(*) FROM users" -p staging
+spyro db dump -p staging                # Full dump
+spyro db dump -p staging -t users,posts # Specific tables
+spyro db dump -p staging -z             # Gzipped
+spyro proxy-url -p staging              # Connection string for GUI tools
+```
 
-### Database Tools
+### Services
 
-| Command | Description |
-|---------|-------------|
-| `spyro db tunnel -p staging` | Start tunnel and print connection URL. |
-| `spyro db shell -p staging` | Launch pre-authenticated `mysql`/`mariadb`/`psql`. |
-| `spyro db ping -p staging` | Test database connectivity through tunnel. |
-| `spyro db query "SELECT 1" -p staging` | Run a SQL query through the tunnel. |
-| `spyro db list-databases -p staging` | List databases on the remote server. |
-| `spyro db dump -p staging` | Full database dump to local file. |
-| `spyro db dump -p staging -t users,posts` | Dump specific tables only. |
-| `spyro db dump -p staging -t users -w "id>100"` | Dump with WHERE filter. |
-| `spyro db dump -p staging -z` | Gzip-compressed dump. |
-| `spyro db dump -p staging -d` | Schema only (no data). |
-| `spyro proxy-url -p staging` | Generate connection string for GUI tools. |
+```bash
+# Supervisor (queue workers, reverb, etc.)
+spyro supervisor status -p staging
+spyro supervisor restart -p staging
+spyro supervisor restart laravel-queue -p staging
+spyro supervisor tail laravel-reverb -p staging
 
-### Service Management
+# Redis
+spyro redis ping -p staging
+spyro redis stats -p staging
+spyro redis cli KEYS "*" -p staging
 
-| Command | Description |
-|---------|-------------|
-| `spyro supervisor status -p staging` | Show Supervisor process status. |
-| `spyro supervisor restart -p staging` | Restart all or named processes. |
-| `spyro supervisor tail laravel-queue -p staging` | Tail process stderr logs. |
-| `spyro redis ping -p staging` | Ping Redis server. |
-| `spyro redis info -p staging -s server` | Show Redis info (optional section). |
-| `spyro redis cli DBSIZE -p staging` | Run arbitrary redis-cli command. |
-| `spyro redis stats -p staging` | Key metrics (connections, commands, keyspace). |
-| `spyro php version -p staging` | PHP version. |
-| `spyro php fpm-status -p staging` | PHP-FPM pool status. |
-| `spyro php extensions -p staging --filter pdo` | List loaded extensions. |
-| `spyro php info -p staging --option memory_limit` | PHP configuration info. |
-| `spyro php restart -p staging` | Restart PHP-FPM. |
-| `spyro apache version -p staging` | Apache version. |
-| `spyro apache modules -p staging` | Loaded modules. |
-| `spyro apache status -p staging` | Server status. |
-| `spyro apache sites -p staging` | Enabled virtual hosts. |
-| `spyro apache restart -p staging` | Restart Apache. |
-| `spyro nginx version -p staging` | Nginx version. |
-| `spyro nginx status -p staging` | Config test + process check. |
-| `spyro nginx sites -p staging` | Enabled site configs. |
-| `spyro nginx restart -p staging` | Restart Nginx. |
-| `spyro caddy version -p staging` | Caddy version. |
-| `spyro caddy status -p staging` | Running check + version. |
-| `spyro caddy restart -p staging` | Restart Caddy. |
+# PHP
+spyro php version -p staging
+spyro php restart -p staging
+
+# Web servers
+spyro caddy version -p staging
+spyro caddy status -p staging
+spyro caddy restart -p staging
+spyro nginx restart -p staging
+spyro apache restart -p staging
+```
+
+### Remote commands
+
+```bash
+spyro run "df -h" -p staging              # Run any command
+spyro run "cat /var/log/syslog" -p staging
+spyro cp ./README.md :/var/www/app/ -p staging  # Upload file
+spyro cp :/var/www/app/.env ./              # Download file
+```
+
+### Environment
+
+```bash
+spyro pull-env -p staging    # Copy remote .env to local .env.remote
+```
 
 ### Logs
 
-| Command | Description |
-|---------|-------------|
-| `spyro logs laravel -p staging -n 100` | Tail Laravel log file. |
-| `spyro logs nginx -p staging -f` | Tail Nginx access log (follow). |
-| `spyro logs nginx-error -p staging` | Tail Nginx error log. |
-| `spyro logs apache -p staging` | Tail Apache access log. |
-| `spyro logs php -p staging` | Tail PHP-FPM error log. |
-| `spyro logs supervisor staging` | Tail Spyro supervisor log. |
+```bash
+spyro logs laravel -p staging -n 100    # Last 100 lines
+spyro logs laravel -p staging -f        # Follow (tail -f)
+spyro logs nginx -p staging
+spyro logs php -p staging
+```
 
 ### Diagnostics
 
-| Command | Description |
-|---------|-------------|
-| `spyro doctor` | Automated audit: SSH, paths, ports, artisan, WordPress, 9 services. |
-| `spyro init` | Bootstrap `spyro.toml` and run toolchain audit. |
-| `spyro pull-env -p staging` | Mirror remote `.env` to local `.env.remote`. |
+```bash
+spyro doctor                 # Full audit of all profiles
+```
 
-### File Sync
+## Tips & Tricks
 
-| Command | Description |
-|---------|-------------|
-| `spyro pin ./src /var/www/app/src -p staging` | Pin a local directory for automatic sync. |
-| `spyro pins` | List all pinned sync directories. |
-| `spyro unpin ./src -p staging` | Remove a pinned directory. |
-| `spyro sync -p staging` | Watch pinned dirs and auto-sync. Use `--dry-run` to preview. |
-| `spyro watch ./src /var/www/app/src -p staging` | Legacy manual sync. |
+### Use `-p` everywhere
+
+Almost every command takes `-p <profile>`. Make it a habit:
+
+```bash
+spyro artisan migrate -p staging
+spyro db shell -p staging
+spyro caddy restart -p staging
+```
+
+### Short aliases
+
+Add these to your shell profile (`~/.zshrc` or `~/.bashrc`):
+
+```bash
+alias su='spyro up'
+alias sd='spyro down'
+alias ss='spyro status'
+alias sa='spyro artisan'
+```
+
+### Quick DB access
+
+```bash
+# One-liner: tunnel + open shell
+spyro db shell -p staging
+
+# Or just get the connection string for TablePlus/Sequel Ace
+spyro proxy-url -p staging | pbcopy
+```
+
+### Run across all environments
+
+```bash
+spyro artisan queue:status --all
+spyro run "uptime" --all
+```
+
+### Check before you deploy
+
+```bash
+spyro doctor                  # Audit all profiles
+spyro supervisor status -p staging  # Are queue workers healthy?
+spyro redis ping -p staging         # Is Redis alive?
+spyro db ping -p staging            # Can we reach the database?
+```
+
+### Non-interactive auth (CI/CD)
+
+```bash
+spyro auth set -p staging -w "$STAGING_PASSWORD" -f
+```
+
+### Debug tunnel issues
+
+```bash
+spyro status                  # See what's running
+spyro logs -p staging         # Supervisor logs
+ssh deploy@staging.example.com  # Raw SSH fallback
+```
 
 ## Architecture
 
 ```
-src/
-├── cli/            # Click CLI entry point and command implementations
-│   ├── main.py     # Group registration, version, logging setup
-│   └── commands.py # All 25+ command functions
-├── core/           # SSH handshake and database logic
-│   ├── pty_engine.py  # PTY-based secure handshake engine
-│   └── db.py          # Dual-strategy credential resolution
-├── supervisor/     # Tunnel lifecycle and state management
-│   ├── tunnel.py   # TunnelManager + STS supervisor (psutil-integrated)
-│   └── state.py    # ~/.spyro/tunnels.json state store
-├── security/       # Security boundaries
-│   ├── ansi.py     # ANSI escape sequence sanitization
-│   └── memory.py   # SecureCredential / SecureString (bytearray zeroing)
-└── utils/          # Shared utilities
-    ├── config.py   # TOML parsing, config discovery (walk-up)
-    ├── keychain.py  # Native OS keychain via keyring
-    └── paths.py    # Shell quoting, path helpers
+spyro.toml          ← Your config (per-project)
+    ↓
+CLI (click)         ← Command routing
+    ↓
+PTY Engine          ← SSH with pseudo-terminal (handles sudo prompts)
+    ↓
+Keychain (keyring)  ← Passwords stored in OS keychain
+    ↓
+Tunnel Supervisor   ← Self-healing SSH tunnels (survives sleep/wake)
 ```
-
-### PTY Engine
-
-The PTY engine (`src/core/pty_engine.py`) spawns native `ssh` in a pseudo-terminal using `pty.openpty()` and `os.fork()`. It:
-
-- Reads stdout/stderr byte-by-byte
-- Matches authentication prompts via regex
-- Injects credentials directly into the PTY buffer
-- Wraps credentials in `SecureCredential` for memory zeroing
-- Sanitizes all output through the ANSI filter before printing
-
-### Tunnel Supervisor (STS)
-
-The STS (`src/supervisor/tunnel.py`) replaces `autossh` with a Python-native supervisor that:
-
-- Monitors tunnel health via process liveness and port connectivity
-- Restarts failed tunnels with exponential backoff (1s to 5min)
-- Handles network roaming and sleep/wake cycles
-- Uses `psutil` for cross-platform process tree management
-- Tracks PIDs/PGIDs in `~/.spyro/tunnels.json` for orphan cleanup
-
-### Service Detection
-
-`spyro doctor` auto-detects these remote services:
-
-| Service | Detection Method |
-|---------|-----------------|
-| Redis | `redis-server` binary, process check, `redis-cli info` |
-| Supervisor | `supervisorctl` binary, `supervisord` process, managed process counts |
-| PHP-FPM | `php-fpm*` binary (version-aware), `php-fpm -tt` pool count |
-| PHP | `php` binary, version, extension count, FPM pool children |
-| Apache | `apache2`/`httpd` binary, version, module count |
-| Nginx | `nginx` binary, version, worker processes, site count |
-| Caddy | `caddy` binary, version, process count |
-| Node.js | `node` binary, version, running processes |
-| npm | `npm` binary, version |
-
-### Smart Sync
-
-The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default:
-
-**Always excluded** (all frameworks):
-- `.env*` — all environment files
-- `*.local` — local config overrides
-- `node_modules/`, `vendor/`, `__pycache__/`
-- `*.swp`, `*~`, `.DS_Store`, `*.log`
-
-**Framework-specific** (auto-detected or manual):
-- **Laravel**: `.env`, `storage/logs/`, `bootstrap/cache/`, `vendor/`, `node_modules/`
-- **WordPress**: `.env`, `wp-config.php`, `wp-content/cache/`, `vendor/`
-- **Node.js**: `.env.local`, `.env.*.local`, `node_modules/`, `.next/`, `dist/`
-- **Python**: `.env`, `__pycache__/`, `.venv/`, `*.pyc`
-
-### Security Model
-
-| Concern | Mitigation |
-|---------|------------|
-| Credential exposure | `SecureCredential` wraps passwords in `bytearray`, zeros with triple-pass (zero → random → zero) after use |
-| Terminal injection | `sanitize_output()` strips all ANSI/OSC/DCS/C0 sequences, null bytes, BEL, and BS before printing |
-| Shell injection | All user input passed through `shlex.quote()` |
-| Config file permissions | Enforces `0600` on `spyro.toml` if it contains passwords |
-| Keychain storage | Uses `keyring` library for native OS secure stores (macOS Keychain, Linux Secret Service) |
-| Process isolation | PTY credentials are read into local variables and zeroed immediately after the interaction loop |
 
 ## Testing
 
 ```bash
-# Unit tests (89 tests)
+# Unit tests
 python3 -m pytest tests/unit/ -v
 
-# Security tests — ANSI attack vectors (20 vectors)
-python3 tests/security/test_ansi_attacks.py
-
-# Security tests — Memory zeroing (8 tests)
-python3 tests/security/test_memory_zeroing.py
-
-# Phase 1 PoC — PTY engine validation
-python3 tests/poc/test_pty_engine.py
-
-# All tests including integration
-python3 -m pytest tests/ -v
-```
-
-## Development
-
-```bash
-# Clone and install
-git clone <repo-url> && cd spyro
-pip install -e ".[dev]"
-
-# Run tests
-python3 -m pytest tests/unit/ -v
-
-# Run full suite
-python3 -m pytest tests/ -v
-
-# Run security suite
+# Security tests
 python3 tests/security/test_ansi_attacks.py
 python3 tests/security/test_memory_zeroing.py
+
+# All tests
+python3 -m pytest tests/ -v
 ```
 
 ## Platform Support
 
-POSIX-compliant systems only:
-
 - macOS (native)
 - Linux (native)
-- Windows Subsystem for Linux (WSL)
+- Windows (WSL only)
 
 ## License
 
