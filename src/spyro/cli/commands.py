@@ -1170,7 +1170,7 @@ def set(profile: str, password: str, force: bool) -> None:
 
     # Check existing
     existing = get_credential(profile, username)
-    if existing and not force and not password:
+    if existing and not force:
         console.print(f"[yellow]  Credential for {username}@{profile} already exists[/yellow]")
         if not click.confirm(f"  Overwrite?"):
             return
