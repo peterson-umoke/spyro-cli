@@ -833,6 +833,82 @@ python3 -m pytest tests/ -v
 - **Linux** — native (Secret Service / kwallet)
 - **Windows** — WSL only
 
+## Planned Features
+
+### Deployment (Capistrano-style)
+
+Zero-downtime deployment for Laravel, React, Angular, Next.js, and Vue.js projects.
+
+```bash
+spyro deploy -p staging              # Deploy to staging
+spyro deploy -p staging --dry-run    # Preview what would happen
+spyro rollback -p staging            # Rollback to previous release
+```
+
+**How it works:**
+
+1. Sync local code → remote via rsync
+2. Create timestamped release directory
+3. Run build steps (composer install, npm build, etc.)
+4. Swap symlink: `/var/www/app/current` → new release
+5. Health check to verify deployment
+6. Cleanup old releases (keeps last 5)
+7. Auto-rollback on failure
+
+**Configuration:**
+
+```toml
+[profiles.staging]
+branch = "main"
+deploy_strategy = "laravel"    # laravel, node, static, nextjs, vuejs
+
+[profiles.staging.deploy]
+keep_releases = 5
+shared_dirs = ["storage", "bootstrap/cache"]
+shared_files = [".env"]
+health_check = "/health"
+health_timeout = 30
+post_deploy = [
+    "php artisan migrate --force",
+    "php artisan config:cache",
+    "php artisan route:cache",
+    "php artisan view:cache",
+    "php artisan queue:restart",
+]
+```
+
+**Project type strategies:**
+
+| Strategy | Build Steps | Use Case |
+|----------|-------------|----------|
+| `laravel` | composer install, artisan migrate, artisan optimize | Laravel PHP apps |
+| `node` | npm ci, npm run build | React, Vue, Angular |
+| `static` | (none) | HTML/CSS/JS sites |
+| `nextjs` | npm ci, npm run build, pm2 restart | Next.js apps |
+| `vuejs` | npm ci, npm run build | Vue.js apps |
+
+**Rollback:**
+
+```bash
+spyro rollback -p staging
+# Swaps symlink to previous release
+# Re-runs post-deploy hooks
+```
+
+**Health check:**
+
+After deployment, Spyro verifies the app is healthy by hitting your health endpoint. If it fails, the deployment is rolled back automatically.
+
+```toml
+[profiles.staging.deploy]
+health_check = "/health"    # HTTP endpoint to check
+health_timeout = 30         # Seconds to wait
+```
+
+**Status:** Planned — implementation in progress.
+
+---
+
 ## License
 
 MIT
