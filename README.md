@@ -530,6 +530,25 @@ spyro run "uptime" --all
 spyro run "free -m" --all
 ```
 
+### Interactive Shell
+
+```bash
+# Open an interactive SSH session for a profile
+spyro ssh -p staging
+spyro shell -p staging       # Alias for ssh
+
+# Auto-detects profile if only one is configured
+spyro ssh
+
+# Once connected, you're in a full interactive shell:
+#   - Colors, tab completion, vim, htop — all pass through
+#   - Ctrl+C, arrows, history work normally
+#   - Password or key-based auth — both handled automatically
+# Exit with Ctrl+D or type "exit"
+```
+
+**How it works:** Uses the same PTY engine as `spyro run` to inject credentials from the OS keychain during auth, then hands over to a raw terminal relay. Handles both password-based and key-based SSH authentication. After auth, credentials are zeroed from memory — the interactive session has no access to them.
+
 ### File Transfer
 
 ```bash
@@ -749,11 +768,13 @@ Tunnel Supervisor       ← Self-healing SSH tunnels
 The PTY engine (`src/core/pty_engine.py`) spawns native `ssh` in a pseudo-terminal using `pty.openpty()` and `os.fork()`. It:
 
 - Reads stdout/stderr byte-by-byte
-- Matches authentication prompts via regex (`password:`, `[sudo] password`, etc.)
-- Injects credentials directly into the PTY buffer
+- Handles both **password-based** and **key-based** SSH auth automatically
+  - Password auth: matches prompts via regex (`password:`, `[sudo] password`, etc.), injects credentials directly into the PTY buffer
+  - Key auth: detects shell output (MOTD, prompt) and skips directly to raw relay mode
 - Wraps credentials in `SecureCredential` for memory zeroing
 - Sanitizes all output through ANSI filter before printing
 - Handles SSH host key verification prompts automatically
+- Uses `~/.spyro/sockets/` for connection sharing (avoids macOS Unix socket path length limits)
 
 ### Tunnel Supervisor (STS)
 

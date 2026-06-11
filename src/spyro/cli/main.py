@@ -16,6 +16,8 @@ from .commands import (
     cmd_proxy_url,
     cmd_pull_env,
     cmd_run,
+    cmd_ssh,
+    cmd_shell,
     cmd_status,
     cmd_up,
     cmd_watch,
@@ -92,6 +94,8 @@ main.add_command(cmd_caddy, "caddy")
 main.add_command(cmd_tinker, "tinker")
 main.add_command(cmd_db, "db")
 main.add_command(cmd_auth, "auth")
+main.add_command(cmd_ssh, "ssh")
+main.add_command(cmd_shell, "shell")
 
 
 if __name__ == "__main__":

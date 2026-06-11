@@ -2110,3 +2110,61 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
     console.print(f"  File:  {output_path}")
     console.print(f"  Size:  {size_str}")
     console.print(f"  Lines: ~{line_count}")
+
+
+# ---------------------------------------------------------------------------
+# spyro ssh / spyro shell
+# ---------------------------------------------------------------------------
+
+
+def _interactive_ssh(profile: str) -> None:
+    """Open an interactive SSH session for the given profile."""
+    config = load_config()
+    p = config.get_profile(profile)
+
+    runner = PTYRunner()
+
+    ssh_args = build_ssh_args(
+        host=p.host,
+        user=p.user,
+        port=p.port,
+        key=p.key,
+    )
+    # Force PTY allocation for interactive session
+    ssh_args.insert(1, "-t")
+    # Don't append a command — SSH opens an interactive shell
+
+    from ..utils.keychain import prompt_for_credential
+
+    sudo_pw = prompt_for_credential(profile, p.user) if p.sudo else ""
+    ssh_pw = prompt_for_credential(profile, p.user)
+
+    console.print(f"[cyan]Connecting to {p.host} ({profile})...[/cyan]")
+
+    exit_code = runner.interactive_run(
+        ssh_args,
+        password=ssh_pw,
+        sudo_password=sudo_pw,
+        timeout=30.0,
+    )
+
+    if exit_code != 0 and exit_code != 124:
+        console.print(f"\n[red]Session exited with code: {exit_code}[/red]")
+
+
+@click.command()
+@click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
+def cmd_ssh(profile: str | None) -> None:
+    """Open an interactive SSH session for a profile.\n
+    Uses keychain-stored credentials and handles auth automatically.
+    """
+    profile = resolve_profile(profile)
+    _interactive_ssh(profile)
+
+
+@click.command()
+@click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
+def cmd_shell(profile: str | None) -> None:
+    """Alias for spyro ssh — open an interactive remote shell."""
+    profile = resolve_profile(profile)
+    _interactive_ssh(profile)
