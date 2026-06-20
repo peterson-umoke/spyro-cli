@@ -213,6 +213,26 @@ def _show_log(path: Path, follow: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Capistrano deployment detection
+# ---------------------------------------------------------------------------
+
+
+def _capistrano_cd(remote_path: str) -> str:
+    """Build a ``cd`` fragment that enters the Capistrano ``current`` symlink if present.
+
+    Returns a shell fragment like::
+
+        cd /var/www/app && [ -L current ] && cd current
+
+    Falls back to just ``cd /var/www/app`` when no symlink exists.
+    """
+    return (
+        f"cd {safe_quote(remote_path)}"
+        f" && [ -L current ] && cd current || cd {safe_quote(remote_path)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # WordPress detection helpers
 # ---------------------------------------------------------------------------
 
@@ -354,8 +374,12 @@ def cmd_doctor() -> None:
             port=profile.port,
             key=profile.key,
         )
-        artisan_path = f"{profile.remote_path}/artisan"
-        ssh_args.extend(["test", "-f", artisan_path])
+        check_cmd = (
+            f"cd {safe_quote(profile.remote_path)}"
+            f" && ([ -L current ] && cd current)"
+            f" && test -f artisan"
+        )
+        ssh_args.extend([check_cmd])
 
         try:
             result = subprocess.run(
@@ -661,14 +685,16 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str | Non
     if not no_escalate and p.sudo:
         sudo_prefix = "sudo "
 
-    artisan_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
-
     ssh_args = build_ssh_args(
         host=p.host,
         user=p.user,
         port=p.port,
         key=p.key,
     )
+
+    cd_cmd = _capistrano_cd(p.remote_path)
+
+    artisan_cmd = f"{cd_cmd} && {sudo_prefix}php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
 
     # Force PTY allocation so remote sudo can prompt for password
     if p.sudo and not no_escalate:
@@ -928,12 +954,14 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
     )
     wp_bin = _find_wp_cli(ssh_args, p.wp_cli_path)
 
+    cd_cmd = _capistrano_cd(p.remote_path)
+
     # Build command
     sudo_prefix = ""
     if not no_escalate and p.sudo:
         sudo_prefix = "sudo "
 
-    wp_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}{wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
+    wp_cmd = f"{cd_cmd} && {sudo_prefix}{wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
 
     ssh_args.append(wp_cmd)
 
@@ -970,13 +998,19 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
 
 
 def _is_local_path(path: str) -> bool:
-    """Check if a path is a local absolute path (not a remote scp-style path).
+    """Check if a path is local (not a remote scp-style path).
 
-    A path starting with ':' is always treated as a remote path.
+    A path starting with ':' is always treated as remote.
+    Everything else that looks like a filesystem path is local.
     """
     if path.startswith(":"):
         return False
-    return path.startswith("/") or path.startswith("~") or path.startswith("./")
+    return (
+        path.startswith("/")
+        or path.startswith("~")
+        or path.startswith("./")
+        or path.startswith("../")
+    )
 
 
 @click.command()
@@ -997,6 +1031,7 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
 
     if src_is_local:
         # Local -> remote (dest is on the remote host via profile)
+        src = str(Path(src).expanduser().resolve())
         scp_args = build_scp_args(
             src=src,
             dest=_scp_target(dest, p.host, p.user),
@@ -1008,6 +1043,7 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
         )
     else:
         # Remote -> local (dest is a local path)
+        dest = str(Path(dest).expanduser().resolve())
         scp_args = build_scp_args(
             src=_scp_target(src, p.host, p.user),
             dest=dest,
@@ -1619,25 +1655,27 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
     if not no_escalate and p.sudo:
         sudo_prefix = "sudo "
 
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+
+    cd_cmd = _capistrano_cd(p.remote_path)
+
     if eval:
-        tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker --execute={safe_quote(eval)}"
+        tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker --execute={safe_quote(eval)}"
     elif file:
-        remote_path = f"/tmp/spyro-tinker-{os.path.basename(file)}"
-        console.print(f"[cyan]Uploading {file} to {p.host}:{remote_path}...[/cyan]")
+        tmp_path = f"/tmp/spyro-tinker-{os.path.basename(file)}"
+        console.print(f"[cyan]Uploading {file} to {p.host}:{tmp_path}...[/cyan]")
         from ..core.pty_engine import _scp_target
         scp_args = build_scp_args(
             src=file,
-            dest=_scp_target(remote_path, p.host, p.user),
+            dest=_scp_target(tmp_path, p.host, p.user),
             host=p.host, user=p.user, port=p.port, key=p.key,
         )
         from ..utils.keychain import prompt_for_credential as pfc
         ssh_pw = pfc(profile, p.user) if not no_escalate else ""
         runner.run(scp_args, password=ssh_pw, timeout=30)
-        tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker < {remote_path}; {sudo_prefix}rm -f {remote_path}"
+        tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker < {tmp_path}; {sudo_prefix}rm -f {tmp_path}"
     else:
-        tinker_cmd = f"cd {safe_quote(p.remote_path)} && {sudo_prefix}php artisan tinker"
-
-    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker"
 
     if not no_escalate and p.sudo:
         ssh_args.insert(1, "-t")
