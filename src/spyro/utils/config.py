@@ -82,6 +82,131 @@ class SpyroConfig:
 
 
 # ---------------------------------------------------------------------------
+# SSH config parsing
+# ---------------------------------------------------------------------------
+
+
+SSH_CONFIG_PATH = Path.home() / ".ssh" / "config"
+
+
+def parse_ssh_config(path: Path | None = None) -> dict[str, dict[str, str]]:
+    """Parse ~/.ssh/config into a {host_pattern: {settings}} mapping.
+
+    Returns a dict where keys are Host patterns (e.g. "myserver", "*")
+    and values are dicts with optional keys: hostname, user, port, identityfile.
+    Wildcard patterns (``*``) are included but must be matched specifically.
+    """
+    result: dict[str, dict[str, str]] = {}
+    cfg = path or SSH_CONFIG_PATH
+
+    if not cfg.exists() or not cfg.is_file():
+        return result
+
+    current_hosts: list[str] = []
+    current_block: dict[str, str] = {}
+
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except (OSError, PermissionError):
+        return result
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        # Skip comments and blank lines
+        if not line or line.startswith("#"):
+            continue
+
+        # Host directive starts a new block
+        if line.lower().startswith("host "):
+            # Save previous block
+            if current_hosts and current_block:
+                for h in current_hosts:
+                    result.setdefault(h, {}).update(current_block)
+            current_hosts = line[5:].strip().split()
+            current_block = {}
+            continue
+
+        if not current_hosts:
+            continue
+
+        # Parse key-value pairs
+        if "=" in line:
+            key, _, val = line.partition("=")
+        else:
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            key, val = parts
+
+        key = key.strip().lower()
+        val = val.strip()
+
+        if key == "hostname":
+            current_block["hostname"] = val
+        elif key == "user":
+            current_block["user"] = val
+        elif key == "port":
+            current_block["port"] = val
+        elif key == "identityfile":
+            current_block["identityfile"] = val
+        elif key == "host":
+            # Already handled above
+            pass
+
+    # Save last block
+    if current_hosts and current_block:
+        for h in current_hosts:
+            result.setdefault(h, {}).update(current_block)
+
+    return result
+
+
+def resolve_ssh_for_profile(profile_name: str) -> dict[str, str]:
+    """Look up SSH config settings for a profile name.
+
+    Checks exact Host matches first, then wildcard ``*``.
+    Returns a dict with optional keys: hostname, user, port, identityfile.
+    """
+    ssh_cfg = parse_ssh_config()
+
+    # 1. Exact match on profile name
+    if profile_name in ssh_cfg:
+        return dict(ssh_cfg[profile_name])
+
+    # 2. Wildcard fallback
+    if "*" in ssh_cfg:
+        return dict(ssh_cfg["*"])
+
+    return {}
+
+
+def apply_ssh_to_profile(profile: ProfileConfig) -> None:
+    """Mutate a ProfileConfig in-place, inheriting SSH config settings.
+
+    If the profile's ``host`` value matches an SSH Host entry, the
+    SSH config's HostName replaces the profile host, and User/Port/
+    IdentityFile fill in any gaps.
+    """
+    ssh_settings = resolve_ssh_for_profile(profile.name)
+    if not ssh_settings:
+        # Try matching profile host against SSH Host entries
+        ssh_settings = resolve_ssh_for_profile(profile.host)
+    if not ssh_settings:
+        return
+
+    # HostName from SSH config overrides the profile's host
+    if "hostname" in ssh_settings:
+        profile.host = ssh_settings["hostname"]
+    # Only inherit user/port/key if NOT explicitly set in profile
+    if "user" in ssh_settings and profile.user == "deploy":
+        profile.user = ssh_settings["user"]
+    if "port" in ssh_settings and profile.port == 22:
+        profile.port = int(ssh_settings["port"])
+    if "identityfile" in ssh_settings and not profile.key:
+        profile.key = ssh_settings["identityfile"]
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -151,11 +276,17 @@ def parse_config(path: Path) -> SpyroConfig:
         k: v for k, v in raw.items() if k != "profiles"
     }
 
-    return SpyroConfig(
+    config = SpyroConfig(
         profiles=profiles,
         global_settings=global_settings,
         config_path=path,
     )
+
+    # Apply SSH config inheritance to profiles
+    for profile in config.profiles.values():
+        apply_ssh_to_profile(profile)
+
+    return config
 
 
 def load_config(start: Path | None = None) -> SpyroConfig:
@@ -183,11 +314,10 @@ def load_config(start: Path | None = None) -> SpyroConfig:
 def resolve_profile(profile: str | None) -> str:
     """Resolve profile name: use provided, or auto-detect if only one exists.
 
-    Args:
-        profile: Profile name from -p flag (may be None)
-
-    Returns:
-        Profile name to use
+    Priority:
+    1. Explicit ``-p`` argument
+    2. ``[defaults] profile = "..."`` in spyro.toml
+    3. Auto-detect if only one profile exists
 
     Raises:
         SystemExit: If no profile specified and multiple profiles exist
@@ -198,6 +328,13 @@ def resolve_profile(profile: str | None) -> str:
         # Explicit profile provided — validate it exists
         config.get_profile(profile)  # Raises if not found
         return profile
+
+    # Check [defaults] section for a default profile
+    defaults = config.global_settings.get("defaults", {})
+    if isinstance(defaults, dict) and "profile" in defaults:
+        default_profile = defaults["profile"]
+        config.get_profile(default_profile)  # validate exists
+        return default_profile
 
     # No profile specified — check if there's only one
     if len(config.profile_names) == 1:

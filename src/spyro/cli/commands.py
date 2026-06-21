@@ -129,14 +129,24 @@ def cmd_down(profile: str | None) -> None:
 
 @click.command()
 @click.argument("profile", required=False)
-def cmd_status(profile: str | None) -> None:
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def cmd_status(profile: str | None, json_output: bool) -> None:
     """Display health, active tunnels, and port mappings."""
+    import json as json_mod
+
     config = load_config()
     manager = TunnelManager(config)
     statuses = manager.status(profile)
 
     if not statuses:
-        console.print("[yellow]No tunnels configured[/yellow]")
+        if json_output:
+            console.print(json_mod.dumps({"tunnels": [], "status": "no_tunnels"}))
+        else:
+            console.print("[yellow]No tunnels configured[/yellow]")
+        return
+
+    if json_output:
+        console.print(json_mod.dumps({"tunnels": statuses}, indent=2, default=str))
         return
 
     table = Table(title="Spyro Tunnels")
@@ -164,37 +174,6 @@ def cmd_status(profile: str | None) -> None:
         )
 
     console.print(table)
-
-
-# ---------------------------------------------------------------------------
-# spyro logs
-# ---------------------------------------------------------------------------
-
-
-@click.command()
-@click.argument("profile", required=False)
-@click.option("--follow", "-f", is_flag=True, help="Follow log output")
-def cmd_logs(profile: str | None, follow: bool) -> None:
-    """Stream supervisor logs for a profile."""
-    from ..utils.paths import spyro_home
-
-    log_dir = spyro_home() / "logs"
-
-    if profile:
-        log_file = log_dir / f"{profile}.log"
-        if not log_file.exists():
-            console.print(f"[red]No log file for '{profile}'[/red]")
-            return
-        _show_log(log_file, follow)
-    else:
-        if not log_dir.exists():
-            console.print("[yellow]No log files found[/yellow]")
-            return
-
-        for log_file in sorted(log_dir.glob("*.log")):
-            console.print(f"\n[bold cyan]--- {log_file.stem} ---[/bold cyan]")
-            _show_log(log_file, follow)
-
 
 def _show_log(path: Path, follow: bool) -> None:
     """Display a log file, optionally following."""
@@ -293,13 +272,27 @@ def _find_wp_cli(ssh_args: list[str], wp_cli_path: str = "") -> str:
 
 
 @click.command()
-def cmd_doctor() -> None:
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def cmd_doctor(json_output: bool) -> None:
     """Run automated diagnostics."""
-    console.print("[bold cyan]Spyro Doctor[/bold cyan]\n")
+    import json as json_mod
 
-    issues = []
+    issues: list[str] = []
+    results: dict[str, list[dict]] = {}
 
-    console.print("[bold]1. SSH connectivity[/bold]")
+    def _record(section: str, check: str, ok: bool, detail: str = "") -> None:
+        results.setdefault(section, []).append({
+            "check": check,
+            "ok": ok,
+            "detail": detail,
+        })
+
+    if not json_output:
+        console.print("[bold cyan]Spyro Doctor[/bold cyan]\n")
+
+    # 1. SSH connectivity
+    if not json_output:
+        console.print("[bold]1. SSH connectivity[/bold]")
     config = load_config()
     for name, profile in config.profiles.items():
         ssh_args = build_ssh_args(
@@ -317,19 +310,29 @@ def cmd_doctor() -> None:
                 timeout=10,
             )
             if result.returncode == 0 and "spyro-ok" in result.stdout.decode():
-                console.print(f"  [green]✓[/green] {name}: reachable")
+                if not json_output:
+                    console.print(f"  [green]✓[/green] {name}: reachable")
+                _record("ssh_connectivity", name, True)
             else:
-                console.print(f"  [red]✗[/red] {name}: connection failed")
+                if not json_output:
+                    console.print(f"  [red]✗[/red] {name}: connection failed")
                 issues.append(f"SSH to {name} failed")
+                _record("ssh_connectivity", name, False, "connection failed")
         except subprocess.TimeoutExpired:
-            console.print(f"  [yellow]⚠[/yellow] {name}: timeout")
+            if not json_output:
+                console.print(f"  [yellow]⚠[/yellow] {name}: timeout")
             issues.append(f"SSH to {name} timed out")
+            _record("ssh_connectivity", name, False, "timeout")
         except FileNotFoundError:
-            console.print(f"  [red]✗[/red] ssh not found")
+            if not json_output:
+                console.print(f"  [red]✗[/red] ssh not found")
             issues.append("ssh binary not found")
+            _record("ssh_connectivity", "ssh_binary", False, "not found")
             break
 
-    console.print("\n[bold]2. Remote path validity[/bold]")
+    # 2. Remote path validity
+    if not json_output:
+        console.print("\n[bold]2. Remote path validity[/bold]")
     for name, profile in config.profiles.items():
         ssh_args = build_ssh_args(
             host=profile.host,
@@ -346,25 +349,38 @@ def cmd_doctor() -> None:
                 timeout=10,
             )
             if result.returncode == 0:
-                console.print(f"  [green]✓[/green] {name}: {profile.remote_path} exists")
+                if not json_output:
+                    console.print(f"  [green]✓[/green] {name}: {profile.remote_path} exists")
+                _record("remote_path", name, True)
             else:
-                console.print(f"  [yellow]⚠[/yellow] {name}: {profile.remote_path} not found")
+                if not json_output:
+                    console.print(f"  [yellow]⚠[/yellow] {name}: {profile.remote_path} not found")
                 issues.append(f"Remote path missing on {name}")
+                _record("remote_path", name, False, "not found")
         except Exception:
-            console.print(f"  [yellow]⚠[/yellow] {name}: could not verify")
+            if not json_output:
+                console.print(f"  [yellow]⚠[/yellow] {name}: could not verify")
+            _record("remote_path", name, False, "could not verify")
 
-    console.print("\n[bold]3. Local port conflicts[/bold]")
+    # 3. Local port conflicts
+    if not json_output:
+        console.print("\n[bold]3. Local port conflicts[/bold]")
     from ..supervisor.tunnel import _port_available
 
     for name, profile in config.profiles.items():
         for port in profile.forwarded_ports:
-            if _port_available(port):
-                console.print(f"  [green]✓[/green] Port {port}: available")
-            else:
-                console.print(f"  [yellow]⚠[/yellow] Port {port}: in use")
-                issues.append(f"Port {port} conflict for {name}")
+            available = _port_available(port)
+            if not json_output:
+                if available:
+                    console.print(f"  [green]✓[/green] Port {port}: available")
+                else:
+                    console.print(f"  [yellow]⚠[/yellow] Port {port}: in use")
+                    issues.append(f"Port {port} conflict for {name}")
+            _record("port_conflicts", f"{name}:{port}", available)
 
-    console.print("\n[bold]4. Laravel artisan detection[/bold]")
+    # 4. Laravel artisan detection
+    if not json_output:
+        console.print("\n[bold]4. Laravel artisan detection[/bold]")
     for name, profile in config.profiles.items():
         if not profile.artisan:
             continue
@@ -388,17 +404,24 @@ def cmd_doctor() -> None:
                 timeout=10,
             )
             if result.returncode == 0:
-                console.print(f"  [green]✓[/green] {name}: artisan found")
+                if not json_output:
+                    console.print(f"  [green]✓[/green] {name}: artisan found")
+                _record("artisan", name, True)
             else:
-                console.print(f"  [red]✗[/red] {name}: artisan not found")
+                if not json_output:
+                    console.print(f"  [red]✗[/red] {name}: artisan not found")
                 issues.append(f"Artisan not found on {name}")
+                _record("artisan", name, False)
         except Exception:
-            console.print(f"  [yellow]⚠[/yellow] {name}: could not verify")
+            if not json_output:
+                console.print(f"  [yellow]⚠[/yellow] {name}: could not verify")
+            _record("artisan", name, False, "could not verify")
 
-    # WordPress detection
+    # 5. WordPress detection
     wp_profiles = [n for n, p in config.profiles.items() if p.wordpress]
     if wp_profiles:
-        console.print("\n[bold]5. WordPress detection[/bold]")
+        if not json_output:
+            console.print("\n[bold]5. WordPress detection[/bold]")
         for name in wp_profiles:
             profile = config.profiles[name]
             ssh_args = build_ssh_args(
@@ -409,21 +432,26 @@ def cmd_doctor() -> None:
             )
             indicators = _detect_wordpress(ssh_args, profile.remote_path)
 
-            if indicators["wp_config"]:
-                console.print(f"  [green]✓[/green] {name}: WordPress detected")
-                if indicators["wp_cli"]:
-                    console.print(f"    [green]✓[/green] WP-CLI available")
+            wp_ok = indicators["wp_config"]
+            if not json_output:
+                if wp_ok:
+                    console.print(f"  [green]✓[/green] {name}: WordPress detected")
+                    if indicators["wp_cli"]:
+                        console.print(f"    [green]✓[/green] WP-CLI available")
+                    else:
+                        console.print(f"    [yellow]⚠[/yellow] WP-CLI not found")
+                        issues.append(f"WP-CLI not found on {name}")
                 else:
-                    console.print(f"    [yellow]⚠[/yellow] WP-CLI not found")
-                    issues.append(f"WP-CLI not found on {name}")
-            else:
-                console.print(f"  [yellow]⚠[/yellow] {name}: WordPress not detected")
-                issues.append(f"WordPress not detected on {name} (wordpress=true in config)")
+                    console.print(f"  [yellow]⚠[/yellow] {name}: WordPress not detected")
+                    issues.append(f"WordPress not detected on {name} (wordpress=true in config)")
+            _record("wordpress", name, wp_ok, str(indicators) if json_output else "")
 
-    # Remote service detection (with per-profile timeout guard)
-    console.print("\n[bold]6. Remote services[/bold]")
+    # 6. Remote service detection
+    if not json_output:
+        console.print("\n[bold]6. Remote services[/bold]")
     for name, profile in config.profiles.items():
-        console.print(f"\n  [cyan]{name}[/cyan] ({profile.host})")
+        if not json_output:
+            console.print(f"\n  [cyan]{name}[/cyan] ({profile.host})")
         try:
             services = detect_all_services(
                 host=profile.host,
@@ -432,16 +460,28 @@ def cmd_doctor() -> None:
                 key=profile.key,
             )
             for svc in services:
-                line = f"    {svc.icon} {svc.summary}"
-                if svc.path:
-                    line += f" ({svc.path})"
-                console.print(line)
-                if svc.details:
-                    for k, v in svc.details.items():
-                        console.print(f"      {k}: {v}")
+                if not json_output:
+                    line = f"    {svc.icon} {svc.summary}"
+                    if svc.path:
+                        line += f" ({svc.path})"
+                    console.print(line)
+                    if svc.details:
+                        for k, v in svc.details.items():
+                            console.print(f"      {k}: {v}")
+                _record("remote_services", f"{name}/{svc.summary}", True, str(svc.details) if json_output else "")
         except Exception as e:
-            console.print(f"    [yellow]⚠ Service check interrupted: {e}[/yellow]")
+            if not json_output:
+                console.print(f"    [yellow]⚠ Service check interrupted: {e}[/yellow]")
             issues.append(f"Service check failed for {name}: {e}")
+            _record("remote_services", name, False, str(e))
+
+    if json_output:
+        console.print(json_mod.dumps({
+            "sections": results,
+            "issues": issues,
+            "healthy": len(issues) == 0,
+        }, indent=2, default=str))
+        return
 
     console.print(f"\n[bold]Summary:[/bold] {len(issues)} issue(s) found")
     if issues:
@@ -791,11 +831,30 @@ def cmd_unpin(local_path: str, profile: str) -> None:
 
 
 @click.command()
-def cmd_pins() -> None:
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def cmd_pins(json_output: bool) -> None:
     """List all pinned sync directories."""
+    import json as json_mod
+
     pins = load_pins()
     if not pins:
-        console.print("[yellow]No pinned directories. Use 'spyro pin' to add one.[/yellow]")
+        if json_output:
+            console.print(json_mod.dumps({"pins": []}))
+        else:
+            console.print("[yellow]No pinned directories. Use 'spyro pin' to add one.[/yellow]")
+        return
+
+    if json_output:
+        pin_list = [
+            {
+                "local": p.local_path,
+                "remote": p.remote_path,
+                "profile": p.profile,
+                "framework": p.framework or "",
+            }
+            for p in pins
+        ]
+        console.print(json_mod.dumps({"pins": pin_list}, indent=2))
         return
 
     table = Table(title="Pinned Sync Directories")
@@ -2336,3 +2395,297 @@ def cmd_shell(profile: str | None) -> None:
     """Alias for spyro ssh — open an interactive remote shell."""
     profile = resolve_profile(profile)
     _interactive_ssh(profile)
+
+
+# ---------------------------------------------------------------------------
+# spyro config — Configuration management
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def cmd_config() -> None:
+    """Manage spyro configuration."""
+
+
+@cmd_config.command(name="validate")
+def config_validate() -> None:
+    """Validate spyro.toml schema for correctness."""
+    from ..utils.config import parse_config, parse_ssh_config
+
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    try:
+        config = load_config()
+    except SystemExit as e:
+        console.print(f"[red]✗ Could not load config: {e}[/red]")
+        return
+
+    console.print("[bold cyan]Spyro Config Validate[/bold cyan]\n")
+
+    if not config.profiles:
+        console.print("[red]No profiles defined in spyro.toml[/red]")
+        return
+
+    for name, profile in config.profiles.items():
+        console.print(f"[bold]Checking profile:[/bold] {name}")
+
+        # Required fields
+        if not profile.host:
+            issues.append(f"[{name}] host is required")
+
+        if not profile.user:
+            issues.append(f"[{name}] user is required")
+
+        # Port range
+        if not (1 <= profile.port <= 65535):
+            issues.append(f"[{name}] port {profile.port} out of range (1-65535)")
+
+        # SSH key existence
+        if profile.key:
+            key_path = Path(profile.key).expanduser()
+            if not key_path.exists():
+                warnings.append(f"[{name}] SSH key not found: {profile.key}")
+
+        # Remote path
+        if not profile.remote_path:
+            warnings.append(f"[{name}] remote_path is empty")
+
+        # Forwarded ports
+        for fp in profile.forwarded_ports:
+            if not (1 <= fp <= 65535):
+                issues.append(f"[{name}] forwarded_port {fp} out of range (1-65535)")
+
+        # Duplicate forwarded ports across profiles
+        all_ports: dict[int, str] = {}
+        for n, p in config.profiles.items():
+            for fp in p.forwarded_ports:
+                if fp in all_ports and all_ports[fp] != n:
+                    warnings.append(f"Port {fp} forwarded in both '{all_ports[fp]}' and '{n}'")
+                all_ports[fp] = n
+
+        # DB config
+        if profile.db.name and not profile.db.host:
+            warnings.append(f"[{name}] db.host is empty")
+
+    # SSH config integration check
+    ssh_config = parse_ssh_config()
+    if ssh_config:
+        console.print(f"\n  [dim]~/.ssh/config: {len(ssh_config)} Host block(s) parsed[/dim]")
+        for name in config.profile_names:
+            if name in ssh_config:
+                console.print(f"  [green]  ✓[/green] Profile '{name}' matches SSH Host block")
+    else:
+        console.print("\n  [dim]~/.ssh/config: not found or empty[/dim]")
+
+    # Summary
+    console.print(f"\n[bold]Issues:[/bold] {len(issues)}")
+    for issue in issues:
+        console.print(f"  [red]✗ {issue}[/red]")
+
+    console.print(f"[bold]Warnings:[/bold] {len(warnings)}")
+    for warning in warnings:
+        console.print(f"  [yellow]⚠ {warning}[/yellow]")
+
+    if not issues and not warnings:
+        console.print("\n[green]✓ Configuration looks good[/green]")
+    elif not issues:
+        console.print("\n[yellow]Configuration valid with warnings[/yellow]")
+    else:
+        console.print("\n[red]Configuration has errors that must be fixed[/red]")
+
+
+# ---------------------------------------------------------------------------
+# spyro ps — Remote process listing
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
+@click.option("--grep", "-g", default="", help="Filter processes (grep pattern)")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def cmd_ps(profile: str | None, grep: str, json_output: bool) -> None:
+    """List processes on remote server."""
+    profile = resolve_profile(profile)
+    config = load_config()
+    p = config.get_profile(profile)
+
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    ps_cmd = "ps aux --no-headers 2>/dev/null || ps aux 2>/dev/null || ps -ef 2>/dev/null"
+    if grep:
+        import shlex
+        ps_cmd += f" | grep -i {shlex.quote(grep)}"
+    ssh_args.append(ps_cmd)
+
+    try:
+        result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        console.print("[red]Process list timed out[/red]")
+        return
+    except FileNotFoundError:
+        console.print("[red]ssh not found[/red]")
+        return
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr:
+            console.print(f"[red]{stderr}[/red]")
+        return
+
+    output = result.stdout.strip()
+    if not output:
+        console.print("[yellow]No matching processes[/yellow]")
+        return
+
+    if json_output:
+        import json as json_mod
+        lines = output.splitlines()
+        entries = []
+        for line in lines:
+            parts = line.split(None, 10)
+            if len(parts) >= 8:
+                entries.append({
+                    "user": parts[0],
+                    "pid": parts[1],
+                    "cpu": parts[2],
+                    "mem": parts[3],
+                    "vsz": parts[4],
+                    "rss": parts[5],
+                    "tty": parts[6],
+                    "stat": parts[7],
+                    "command": " ".join(parts[8:]),
+                })
+        console.print(json_mod.dumps(entries, indent=2))
+    else:
+        console.print(output)
+
+
+# ---------------------------------------------------------------------------
+# spyro env — Remote environment management
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def cmd_env() -> None:
+    """Manage remote environment files.
+
+    Subcommands:
+      pull    Download .env from remote
+      diff    Compare local and remote .env files
+      push    Upload local .env to remote
+    """
+
+
+@cmd_env.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+def diff(profile: str) -> None:
+    """Compare local .env with remote .env."""
+    import difflib
+    from ..core.pty_engine import _scp_target
+
+    config = load_config()
+    p = config.get_profile(profile)
+
+    # Pull remote .env
+    console.print(f"[cyan]Fetching remote .env from {p.host}...[/cyan]")
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    remote_lines: list[str] = []
+
+    def collect(line: str) -> None:
+        remote_lines.append(line)
+
+    runner = PTYRunner()
+    remote_path = f"{p.remote_path}/.env"
+    cmd = ssh_args + [f"cat {safe_quote(remote_path)}"]
+
+    from ..utils.keychain import prompt_for_credential
+    ssh_pw = prompt_for_credential(profile, p.user)
+    ec = runner.run(cmd, password=ssh_pw, on_output=collect, timeout=15.0)
+
+    if ec != 0:
+        console.print("[red]Failed to pull remote .env[/red]")
+        return
+
+    remote_text = "\n".join(remote_lines)
+
+    # Read local .env
+    local_candidates = [Path.cwd() / ".env", Path(p.remote_path) / ".env"]
+    local_path = None
+    for cand in local_candidates:
+        if cand.exists():
+            local_path = cand
+            break
+
+    if not local_path:
+        console.print("[yellow]No local .env found — showing remote .env only:[/yellow]")
+        console.print(remote_text)
+        return
+
+    local_text = local_path.read_text(encoding="utf-8")
+
+    # Diff
+    local_lines = local_text.splitlines(keepends=True)
+    remote_lines_split = remote_text.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(
+        local_lines, remote_lines_split,
+        fromfile=f"{local_path.name} (local)",
+        tofile=f".env ({p.host} remote)",
+        lineterm="",
+    ))
+
+    if not diff:
+        console.print("[green]✓ Local and remote .env are identical[/green]")
+        return
+
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            console.print(f"[green]{line}[/green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            console.print(f"[red]{line}[/red]")
+        elif line.startswith("@@"):
+            console.print(f"[cyan]{line}[/cyan]")
+        else:
+            console.print(line)
+
+
+@cmd_env.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.argument("source", default=".env", required=False)
+def push(profile: str, source: str) -> None:
+    """Push local .env file to remote server."""
+    from ..core.pty_engine import _scp_target
+
+    src = Path(source).expanduser().resolve()
+    if not src.exists():
+        console.print(f"[red]Local file not found: {source}[/red]")
+        return
+
+    config = load_config()
+    p = config.get_profile(profile)
+
+    remote_dest = f"{p.remote_path}/.env"
+    remote_scp = _scp_target(remote_dest, p.host, p.user)
+
+    scp_args = build_scp_args(
+        src=str(src),
+        dest=remote_scp,
+        host=p.host,
+        user=p.user,
+        port=p.port,
+        key=p.key,
+        recursive=False,
+    )
+
+    from ..utils.keychain import prompt_for_credential
+    ssh_pw = prompt_for_credential(profile, p.user)
+
+    runner = PTYRunner()
+    console.print(f"[cyan]Uploading {source} to {p.host}:{remote_dest}...[/cyan]")
+    ec = runner.run(scp_args, password=ssh_pw, timeout=30.0)
+
+    if ec == 0:
+        console.print(f"[green]✓ .env pushed to {profile}[/green]")
+    else:
+        console.print(f"[red]Push failed (exit code: {ec})[/red]")
+

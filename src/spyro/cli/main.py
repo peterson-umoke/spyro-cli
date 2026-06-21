@@ -3,42 +3,46 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import click
 
 from .. import __version__
 from .commands import (
+    cmd_apache,
+    cmd_artisan,
+    cmd_auth,
+    cmd_caddy,
+    cmd_config,
     cmd_cp,
+    cmd_db,
+    cmd_db_shell,
+    cmd_db_tunnel,
     cmd_doctor,
     cmd_down,
+    cmd_env,
     cmd_init,
     cmd_logs,
+    cmd_nginx,
+    cmd_php,
+    cmd_pin,
+    cmd_pins,
     cmd_proxy_url,
+    cmd_ps,
     cmd_pull_env,
+    cmd_redis,
     cmd_run,
-    cmd_ssh,
     cmd_shell,
+    cmd_ssh,
     cmd_status,
+    cmd_supervisor,
+    cmd_sync,
+    cmd_tinker,
+    cmd_unpin,
     cmd_up,
     cmd_update,
     cmd_watch,
-    cmd_artisan,
     cmd_wp,
-    cmd_pin,
-    cmd_unpin,
-    cmd_pins,
-    cmd_sync,
-    cmd_db_shell,
-    cmd_db_tunnel,
-    cmd_supervisor,
-    cmd_redis,
-    cmd_php,
-    cmd_apache,
-    cmd_nginx,
-    cmd_caddy,
-    cmd_tinker,
-    cmd_db,
-    cmd_auth,
 )
 
 
@@ -46,14 +50,78 @@ from .commands import (
 @click.version_option(version=__version__, prog_name="spyro")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress non-error output")
+@click.option("--install-completion", is_flag=True, help="Install shell completion for your shell")
+@click.option("--show-completion", is_flag=True, help="Show shell completion script")
 @click.pass_context
-def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
+def main(ctx: click.Context, verbose: bool, quiet: bool, install_completion: bool, show_completion: bool) -> None:
     """Spyro — Intelligent SSH tunneling & remote command CLI.
 
     Simplifies and secures connections between your local environment
     and remote servers through declarative configuration.
     """
     ctx.ensure_object(dict)
+
+    # Handle completion flags early
+    if install_completion or show_completion:
+        shell = click.get_current_context().parent  # not needed here
+        import click.shell_completion as shcomp
+
+        # Determine shell
+        shell_name = ""
+        for var in ["SHELL", "ZSH_VERSION", "BASH_VERSION"]:
+            import os
+            val = os.environ.get(var, "")
+            if val:
+                if "zsh" in val.lower() or var == "ZSH_VERSION":
+                    shell_name = "zsh"
+                elif "bash" in val.lower() or var == "BASH_VERSION":
+                    shell_name = "bash"
+                elif "fish" in val.lower():
+                    shell_name = "fish"
+                elif "powershell" in val.lower() or "pwsh" in val.lower():
+                    shell_name = "powershell"
+                break
+
+        if not shell_name:
+            shell_name = os.environ.get("SHELL", "bash").split("/")[-1] or "bash"
+
+        # Click 8.x built-in completion
+        from click.shell_completion import get_completion_class
+
+        comp_cls = get_completion_class(shell_name)
+        if comp_cls is None:
+            click.echo(f"Unsupported shell: {shell_name}", err=True)
+            sys.exit(1)
+
+        comp = comp_cls(ctx.find_root(), {}, "spyro", f"_SPYRO_COMPLETE")
+
+        if install_completion:
+            # Recommend how to install
+            source_cmd = {
+                "bash": f"eval \"$({sys.executable} -m spyro.cli.main --show-completion)\"",
+                "zsh": f"eval \"$({sys.executable} -m spyro.cli.main --show-completion)\"",
+                "fish": f"{sys.executable} -m spyro.cli.main --show-completion | source",
+                "powershell":
+                    f'{sys.executable} -m spyro.cli.main --show-completion | Out-String | Invoke-Expression',
+            }.get(shell_name, "")
+
+            if shell_name == "zsh":
+                click.echo("# Add this to your ~/.zshrc:")
+            elif shell_name == "bash":
+                click.echo("# Add this to your ~/.bashrc:")
+            elif shell_name == "fish":
+                click.echo("# Add this to your ~/.config/fish/config.fish:")
+            elif shell_name == "powershell":
+                click.echo("# Add this to your PowerShell profile:")
+
+            click.echo(source_cmd)
+            click.echo("\n[yellow]Then restart your shell or source the file.[/yellow]")
+        else:
+            # Show completion script
+            script = comp.source()
+            click.echo(script)
+
+        sys.exit(0)
 
     level = logging.DEBUG if verbose else (logging.WARNING if quiet else logging.INFO)
     logging.basicConfig(
@@ -100,6 +168,15 @@ main.add_command(cmd_db, "db")
 main.add_command(cmd_auth, "auth")
 main.add_command(cmd_ssh, "ssh")
 main.add_command(cmd_shell, "shell")
+
+# New commands for 0.7.0
+main.add_command(cmd_config, "config")
+main.add_command(cmd_ps, "ps")
+main.add_command(cmd_env, "env")
+# Alias: spyro cfg → spyro config
+main.add_command(cmd_config, "cfg")
+# Register cmd_pull_env as env pull subcommand
+cmd_env.add_command(cmd_pull_env, "pull")
 
 
 if __name__ == "__main__":
