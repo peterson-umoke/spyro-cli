@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from spyro.cli.commands import build_eval_php
-
+from spyro.cli.commands import build_eval_php, _laravel_alias_php
 
 def test_build_eval_php_basic():
     """Simple expression generates valid PHP with print_r."""
@@ -14,6 +13,32 @@ def test_build_eval_php_basic():
     assert "Illuminate\\Contracts\\Console\\Kernel" in code
     assert "print_r((function() { return User::count(); })(), true)" in code
     assert code.endswith('echo "\\n";\n')
+
+
+def test_build_eval_php_no_aliases():
+    """--no-aliases skips alias registration code."""
+    code = build_eval_php("User::count()", no_aliases=True)
+    assert "config(app.aliases)" not in code
+    assert "class_alias" not in code
+    assert "app/Models" not in code
+
+
+def test_build_eval_php_aliases_included_by_default():
+    """Alias registration is included by default."""
+    code = build_eval_php("User::count()")
+    assert "config(app.aliases)" in code
+    assert "class_alias" in code
+    assert "app/Models" in code
+
+
+def test_laravel_alias_php_returns_valid_php():
+    """_laravel_alias_php() produces valid PHP syntax."""
+    php = _laravel_alias_php()
+    assert "<?php" not in php  # standalone snippet, not full file
+    assert "config(app.aliases)" in php
+    assert "class_alias($fqcn, $alias)" in php
+    assert "App::make('path')" in php or "App::make" in php
+    assert "class_alias($fqcn, $className)" in php
 
 
 def test_build_eval_php_json():

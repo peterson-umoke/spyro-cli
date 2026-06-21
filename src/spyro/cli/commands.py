@@ -1796,18 +1796,32 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
 
     from ..utils.keychain import prompt_for_credential as pfc2
 
-    sudo_pw = pfc2(profile, p.user) if p.sudo and not no_escalate else ""
     ssh_pw = pfc2(profile, p.user)
+    sudo_pw = pfc2(profile, p.user) if p.sudo and not no_escalate else ""
 
     if eval or file:
-        def output_line(line: str) -> None:
-            console.print(line)
-        exit_code = runner.run(
-            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-            on_output=output_line, timeout=120,
-        )
-        if exit_code != 0:
-            console.print(f"  [red]Exit code: {exit_code}[/red]")
+        # Eval/file mode: use subprocess.run() for reliable output capture.
+        # No PTY needed for one-shot commands. Falls back to PTY if SSH
+        # needs interactive auth (exit 255) — SSH ControlMaster multiplexing
+        # means subsequent connections reuse the auth from an earlier PTY call.
+        import subprocess as sbproc
+
+        # Remove -t flags from ssh_args — subprocess doesn't need a PTY
+        ssh_args_run = [a for a in ssh_args if a not in ("-t", "-tt")]
+
+        try:
+            result = sbproc.run(
+                ssh_args_run, capture_output=True, text=True, timeout=120,
+            )
+            output = result.stdout + result.stderr
+            output = output.strip()
+            if output:
+                for line in output.split("\n"):
+                    console.print(line)
+            if result.returncode != 0:
+                console.print(f"  [red]Exit code: {result.returncode}[/red]")
+        except sbproc.TimeoutExpired:
+            console.print("[red]Command timed out[/red]")
     else:
         console.print(f"[cyan]Starting Tinker on {profile}...[/cyan]")
         console.print("[dim]Exit with Ctrl+D or type 'exit'[/dim]")
@@ -1821,7 +1835,45 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
 # ---------------------------------------------------------------------------
 
 
-def build_eval_php(expression: str, json_output: bool = False) -> str:
+def _laravel_alias_php() -> str:
+    """Generate PHP code that registers PsySH-style short aliases.
+
+    Reads ``config('app.aliases')`` and calls ``class_alias()`` for each,
+    so facades like ``DB``, ``Schema``, ``Cache``, ``Route`` etc. resolve
+    without the full namespace. Also scans ``app/Models/`` for Eloquent
+    models and aliases them (e.g. ``User`` -> ``App\\Models\\User``).
+
+    Returns an empty string if the Laravel app doesn't have aliases
+    configured (safe to concatenate unconditionally).
+    """
+    p = '\\Illuminate\\Support\\Facades\\App'
+    return (
+        "// Register PsySH-style short aliases from config(app.aliases)\n"
+        f"$aliases = {p}::make('config')->get('app.aliases', []);\n"
+        "if (is_array($aliases)) {\n"
+        "    foreach ($aliases as $alias => $fqcn) {\n"
+        "        if (is_string($alias) && is_string($fqcn)\n"
+        "            && !class_exists($alias, false)) {\n"
+        "            class_alias($fqcn, $alias);\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "// Auto-import models from app/Models/\n"
+        f"$modelsDir = {p}::make('path') . '/Models';\n"
+        "if (is_dir($modelsDir)) {\n"
+        "    foreach (glob($modelsDir . '/*.php') as $modelFile) {\n"
+        "        $className = basename($modelFile, '.php');\n"
+        "        $fqcn = 'App\\\\Models\\\\' . $className;\n"
+        "        if (!class_exists($className, false)) {\n"
+        "            class_alias($fqcn, $className);\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def build_eval_php(expression: str, json_output: bool = False, no_aliases: bool = False) -> str:
     """Build a PHP script that boots Laravel and evaluates *expression*.
 
     The script boots Laravel via bootstrap/app.php, evaluates the expression
@@ -1831,6 +1883,8 @@ def build_eval_php(expression: str, json_output: bool = False) -> str:
         expression: PHP expression to evaluate (e.g. ``User::count()``).
         json_output: If True, wrap result in ``json_encode()`` instead of
             ``print_r``.
+        no_aliases: If True, skip registering PsySH-style short aliases
+            (``DB``, ``Schema``, model classes, etc.).
 
     Returns:
         Complete PHP source code as a string.
@@ -1843,13 +1897,18 @@ def build_eval_php(expression: str, json_output: bool = False) -> str:
     else:
         output_expr = f"print_r((function() {{ return {expression}; }})(), true)"
 
+    alias_code = "" if no_aliases else _laravel_alias_php()
+
     return (
         "<?php\n"
+        "\n"
         "$base = getcwd();\n"
         "require $base . '/vendor/autoload.php';\n"
         "$app = require_once $base . '/bootstrap/app.php';\n"
         "$kernel = $app->make(Illuminate\\Contracts\\Console\\Kernel::class);\n"
         "$kernel->bootstrap();\n"
+        "\n"
+        + alias_code + "\n"
         "echo " + output_expr + ";\n"
         "echo \"\\n\";\n"
     )
@@ -1858,22 +1917,27 @@ def build_eval_php(expression: str, json_output: bool = False) -> str:
 @click.command()
 @click.argument("expression")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.option("--no-aliases", is_flag=True, help="Skip PsySH-style short aliases (require full namespaces)")
 @click.option("--no-escalate", is_flag=True, help="Don't use sudo")
 @click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_eval(expression: str, json_output: bool, no_escalate: bool, profile: str) -> None:
+def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: bool, profile: str) -> None:
     """Evaluate a PHP expression on the remote Laravel server.
 
     Boots Laravel via bootstrap/app.php and evaluates the expression directly
-    with php -r (no PsySH). Outputs the result reliably. Avoids the quoting
-    and output-capture issues of `spyro tinker -e`.
+    with php CLI (no PsySH). By default, registers PsySH-style short aliases
+    (``DB``, ``Schema``, ``Cache``, model classes, etc.) so you can use short
+    class names. Use ``--no-aliases`` to require full namespaces.
+
+    Outputs the result reliably. Avoids the quoting and output-capture
+    issues of `spyro tinker -e`.
 
     Examples:
 
       spyro eval 'User::count()' -p staging
 
-      spyro eval \"\\App\\Models\\User::first()->toArray()\" -p staging
+      spyro eval 'DB::table("users")->count()' -p staging --json
 
-      spyro eval 'DB::table(\"users\")->count()' -p staging --json
+      spyro eval 'BillExchange::where("enabled", true)->count()' -p staging
     """
     config = load_config()
     p = config.get_profile(profile)
@@ -1886,7 +1950,7 @@ def cmd_eval(expression: str, json_output: bool, no_escalate: bool, profile: str
         console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
         return
 
-    php_code = build_eval_php(expression, json_output)
+    php_code = build_eval_php(expression, json_output, no_aliases)
 
     # Write temp file locally
     import uuid
