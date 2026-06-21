@@ -44,6 +44,7 @@ from .commands import (
     cmd_update,
     cmd_watch,
     cmd_wp,
+    notify_update,
 )
 
 
@@ -133,6 +134,10 @@ def main(ctx: click.Context, verbose: bool, quiet: bool, install_completion: boo
 
     ctx.obj["verbose"] = verbose
     ctx.obj["quiet"] = quiet
+
+    # Post-command: check for updates (unless quiet or running update itself)
+    if not quiet and ctx.invoked_subcommand != "update":
+        notify_update()
 
 
 # Register commands

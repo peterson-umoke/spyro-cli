@@ -2464,6 +2464,135 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
 
 
 # ---------------------------------------------------------------------------
+# Version check (shared between notify and update)
+# ---------------------------------------------------------------------------
+
+
+_CHECK_CACHE = None  # (needs_update, latest_tag) cached per process
+
+
+def _fetch_latest_version() -> str | None:
+    """Fetch the latest semver tag from GitHub.
+
+    Returns the version string (e.g. "0.8.7") or None on failure.
+    """
+    import json
+    import urllib.request
+    import urllib.error
+
+    GITHUB_API = "https://api.github.com/repos/peterson-umoke/spyro-cli"
+
+    try:
+        req = urllib.request.Request(
+            f"{GITHUB_API}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release = json.loads(resp.read().decode())
+        latest_tag = release.get("tag_name", "").lstrip("v")
+        if latest_tag:
+            return latest_tag
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # No releases yet — fall back to listing tags
+            try:
+                tag_req = urllib.request.Request(
+                    f"{GITHUB_API}/tags?per_page=10",
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
+                )
+                with urllib.request.urlopen(tag_req, timeout=15) as resp:
+                    tags = json.loads(resp.read().decode())
+                if not tags:
+                    return None
+                versions = []
+                for t in tags:
+                    raw = t.get("name", "").lstrip("v")
+                    parts = raw.split(".")
+                    if len(parts) == 3 and all(p.isdigit() for p in parts):
+                        versions.append(raw)
+                if versions:
+                    versions.sort(key=lambda v: tuple(int(x) for x in v.split(".")))
+                    return versions[-1]
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+    return None
+
+
+def _compare_versions(current: str, latest: str) -> bool:
+    """Return True if *latest* > *current* (strict semver comparison)."""
+    try:
+        current_parts = tuple(int(x) for x in current.split("."))
+        latest_parts = tuple(int(x) for x in latest.split("."))
+        return current_parts < latest_parts
+    except (ValueError, AttributeError):
+        return False
+
+
+def notify_update() -> None:
+    """Check GitHub and print a yellow notice if an update is available.
+
+    Cache: checks at most once per 24 hours (per ``~/.spyro/version_check``).
+    Silently does nothing on failure (network down, no tags, etc.).
+    """
+    import json
+    import time
+
+    from .. import __version__ as current_version
+    global _CHECK_CACHE
+
+    # Per-process cache
+    if _CHECK_CACHE is not None:
+        needs_update, latest_tag = _CHECK_CACHE
+        if needs_update:
+            console.print(f"[yellow]Update available: v{current_version} → v{latest_tag}[/yellow]")
+            console.print("  Run [bold]spyro update[/bold] to upgrade.")
+        return
+
+    # Disk cache (24 hours)
+    from .paths import spyro_home
+    cache_path = spyro_home() / "version_check"
+    now = time.time()
+
+    try:
+        if cache_path.exists():
+            data = json.loads(cache_path.read_text())
+            if now - data.get("checked_at", 0) < 86400:
+                needs_update = data.get("needs_update", False)
+                latest_tag = data.get("latest_version", "")
+                _CHECK_CACHE = (needs_update, latest_tag)
+                if needs_update:
+                    console.print(f"[yellow]Update available: v{current_version} → v{latest_tag}[/yellow]")
+                    console.print("  Run [bold]spyro update[/bold] to upgrade.")
+                return
+    except Exception:
+        pass
+
+    # Fetch from GitHub
+    latest_tag = _fetch_latest_version()
+    if latest_tag is None:
+        return
+
+    needs_update = _compare_versions(current_version, latest_tag)
+    _CHECK_CACHE = (needs_update, latest_tag)
+
+    try:
+        cache_path.write_text(json.dumps({
+            "checked_at": now,
+            "needs_update": needs_update,
+            "latest_version": latest_tag,
+        }))
+    except Exception:
+        pass
+
+    if needs_update:
+        console.print(f"[yellow]Update available: v{current_version} → v{latest_tag}[/yellow]")
+        console.print("  Run [bold]spyro update[/bold] to upgrade.")
+
+
+# ---------------------------------------------------------------------------
 # spyro update
 # ---------------------------------------------------------------------------
 
@@ -2481,75 +2610,24 @@ def cmd_update(force: bool, check: bool) -> None:
     Works whether spyro was installed with ``uv tool install`` or via pip.
     ``git`` is not required — the update uses the GitHub REST API.
     """
-    import json
-    import urllib.request
-
     from .. import __version__ as current_version
 
     console.print("[bold cyan]Spyro Update[/bold cyan]\n")
     console.print(f"  Installed: v{current_version}\n")
 
-    GITHUB_API = "https://api.github.com/repos/peterson-umoke/spyro-cli"
     GIT_BASE = "git+https://github.com/peterson-umoke/spyro-cli"
 
     # ── Fetch latest tag from GitHub API ──────────────────────────────────
     console.print("[cyan]Checking for updates...[/cyan]")
-    try:
-        req = urllib.request.Request(
-            f"{GITHUB_API}/releases/latest",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            release = json.loads(resp.read().decode())
-        latest_tag = release.get("tag_name", "").lstrip("v")
-        if not latest_tag:
-            console.print("[red]Could not parse latest release tag from GitHub[/red]")
-            return
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            # No releases yet — fall back to listing tags
-            try:
-                tag_req = urllib.request.Request(
-                    f"{GITHUB_API}/tags?per_page=10",
-                    headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
-                )
-                with urllib.request.urlopen(tag_req, timeout=15) as resp:
-                    tags = json.loads(resp.read().decode())
-                if not tags:
-                    console.print("[yellow]No tags found on GitHub repository[/yellow]")
-                    return
-                # Tags come as [{name: "v0.5.0", ...}, ...]; sort semver
-                versions = []
-                for t in tags:
-                    raw = t.get("name", "").lstrip("v")
-                    parts = raw.split(".")
-                    if len(parts) == 3 and all(p.isdigit() for p in parts):
-                        versions.append(raw)
-                if not versions:
-                    console.print("[yellow]No semver tags found on GitHub[/yellow]")
-                    return
-                versions.sort(key=lambda v: tuple(int(x) for x in v.split(".")))
-                latest_tag = versions[-1]
-            except Exception as tag_err:
-                console.print(f"[red]Failed to fetch tags: {tag_err}[/red]")
-                return
-        else:
-            console.print(f"[red]GitHub API error: {e.code} {e.reason}[/red]")
-            return
-    except urllib.error.URLError as e:
-        console.print(f"[red]Network error: {e.reason}[/red]")
-        return
-    except json.JSONDecodeError:
-        console.print("[red]Invalid response from GitHub API[/red]")
+    latest_tag = _fetch_latest_version()
+    if latest_tag is None:
+        console.print("[red]Could not determine latest version from GitHub[/red]")
         return
 
     console.print(f"  Remote latest: v{latest_tag}")
 
     # ── Compare versions ──────────────────────────────────────────────────
-    current_parts = tuple(int(x) for x in current_version.split("."))
-    latest_parts = tuple(int(x) for x in latest_tag.split("."))
-
-    needs_update = current_parts < latest_parts
+    needs_update = _compare_versions(current_version, latest_tag)
 
     if not needs_update:
         console.print(f"\n[green]✓ spyro is already up to date (v{current_version})[/green]")
@@ -2566,7 +2644,6 @@ def cmd_update(force: bool, check: bool) -> None:
     # ── Reinstall via uv tool ─────────────────────────────────────────────
     console.print("\n[cyan]Installing latest version...[/cyan]")
 
-    # Pin to the exact tag so the installed version always matches
     install_url = f"{GIT_BASE}@v{latest_tag}"
 
     uv = shutil.which("uv")
@@ -2589,6 +2666,15 @@ def cmd_update(force: bool, check: bool) -> None:
             console.print(f"[red]Installation failed:[/red]")
             console.print(f"  {install.stderr.strip()}")
             return
+        # Invalidate cache after successful update
+        from .paths import spyro_home
+        cache_path = spyro_home() / "version_check"
+        try:
+            cache_path.unlink()
+        except Exception:
+            pass
+        global _CHECK_CACHE
+        _CHECK_CACHE = None
         console.print(f"[green]✓ spyro updated to v{latest_tag}[/green]")
         console.print(f"  (via {label} — you may need to restart your shell)")
     except subprocess.TimeoutExpired:
