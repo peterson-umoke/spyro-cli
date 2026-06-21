@@ -2177,7 +2177,7 @@ def cmd_update(force: bool, check: bool) -> None:
     console.print(f"  Installed: v{current_version}\n")
 
     GITHUB_API = "https://api.github.com/repos/peterson-umoke/spyro-cli"
-    GIT_URL = "git+https://github.com/peterson-umoke/spyro-cli"
+    GIT_BASE = "git+https://github.com/peterson-umoke/spyro-cli"
 
     # ── Fetch latest tag from GitHub API ──────────────────────────────────
     console.print("[cyan]Checking for updates...[/cyan]")
@@ -2253,13 +2253,16 @@ def cmd_update(force: bool, check: bool) -> None:
     # ── Reinstall via uv tool ─────────────────────────────────────────────
     console.print("\n[cyan]Installing latest version...[/cyan]")
 
+    # Pin to the exact tag so the installed version always matches
+    install_url = f"{GIT_BASE}@v{latest_tag}"
+
     uv = shutil.which("uv")
     if uv:
-        pip_or_uv = [uv, "tool", "install", "--reinstall", GIT_URL]
+        pip_or_uv = [uv, "tool", "install", "--reinstall", install_url]
         label = "uv"
     else:
         pip = shutil.which("pip") or shutil.which("pip3") or "pip3"
-        pip_or_uv = [pip, "install", GIT_URL]
+        pip_or_uv = [pip, "install", install_url]
         label = "pip"
 
     try:
