@@ -21,6 +21,7 @@ from .commands import (
     cmd_doctor,
     cmd_down,
     cmd_env,
+    cmd_eval,
     cmd_init,
     cmd_logs,
     cmd_nginx,
@@ -164,6 +165,7 @@ main.add_command(cmd_apache, "apache")
 main.add_command(cmd_nginx, "nginx")
 main.add_command(cmd_caddy, "caddy")
 main.add_command(cmd_tinker, "tinker")
+main.add_command(cmd_eval, "eval")
 main.add_command(cmd_db, "db")
 main.add_command(cmd_auth, "auth")
 main.add_command(cmd_ssh, "ssh")

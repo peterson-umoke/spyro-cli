@@ -1789,7 +1789,12 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
     if not no_escalate and p.sudo:
         ssh_args.insert(1, "-t")
 
-    if not eval and not file:
+    if eval or file:
+        # Eval/file mode also needs a PTY for proper PsySH output
+        if not no_escalate and not p.sudo:
+            ssh_args.insert(1, "-t")
+    else:
+        # -tt for interactive (forces PTY even when no command is piped)
         ssh_args.insert(1, "-tt")
 
     ssh_args.append(tinker_cmd)
@@ -1814,6 +1819,132 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
             ssh_args, password=ssh_pw, sudo_password=sudo_pw,
             on_output=lambda line: None, timeout=30,
         )
+
+
+# ---------------------------------------------------------------------------
+# spyro eval — Evaluate PHP expression on remote Laravel
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+@click.argument("expression")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
+@click.option("--profile", "-p", required=True, help="Profile name")
+def cmd_eval(expression: str, json_output: bool, no_escalate: bool, profile: str) -> None:
+    """Evaluate a PHP expression on the remote Laravel server.
+
+    Boots Laravel via bootstrap/app.php and evaluates the expression directly
+    with php -r (no PsySH). Outputs the result reliably. Avoids the quoting
+    and output-capture issues of `spyro tinker -e`.
+
+    Examples:
+
+      spyro eval 'User::count()' -p staging
+
+      spyro eval \"\\App\\Models\\User::first()->toArray()\" -p staging
+
+      spyro eval 'DB::table(\"users\")->count()' -p staging --json
+    """
+    config = load_config()
+    p = config.get_profile(profile)
+
+    if not p.artisan:
+        console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
+        return
+
+    if not p.remote_path:
+        console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
+        return
+
+    # Build PHP code that boots Laravel and evaluates the expression
+    # Uses getcwd() instead of __DIR__ so the file can live in /tmp/ while
+    # we cd into the project directory.
+    if json_output:
+        output_expr = (
+            f"json_encode((function() {{ return {expression}; }})(),"
+            " JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)"
+        )
+    else:
+        output_expr = f"print_r((function() {{ return {expression}; }})(), true)"
+
+    php_code = (
+        "<?php\n"
+        "$base = getcwd();\n"
+        "require $base . '/vendor/autoload.php';\n"
+        "$app = require_once $base . '/bootstrap/app.php';\n"
+        "$kernel = $app->make(Illuminate\\Contracts\\Console\\Kernel::class);\n"
+        "$kernel->bootstrap();\n"
+        "echo " + output_expr + ";\n"
+        "echo \"\\n\";\n"
+    )
+
+    # Write temp file locally
+    import uuid
+    import tempfile
+    from pathlib import Path
+
+    tmp_name = f"spyro-eval-{uuid.uuid4().hex[:8]}.php"
+    tmp_local = Path(tempfile.gettempdir()) / tmp_name
+    tmp_local.write_text(php_code)
+
+    runner = PTYRunner()
+
+    try:
+        # Upload to remote /tmp/
+        from ..core.pty_engine import _scp_target
+
+        tmp_remote = f"/tmp/{tmp_name}"
+        scp_args = build_scp_args(
+            src=str(tmp_local),
+            dest=_scp_target(tmp_remote, p.host, p.user),
+            host=p.host, user=p.user, port=p.port, key=p.key,
+        )
+
+        from ..utils.keychain import prompt_for_credential
+
+        ssh_pw = prompt_for_credential(profile, p.user)
+
+        console.print(f"[cyan]Uploading eval to {p.host}:{tmp_remote}...[/cyan]")
+        ec = runner.run(scp_args, password=ssh_pw, timeout=30)
+        if ec != 0:
+            console.print("[red]Failed to upload eval script[/red]")
+            return
+
+        # Run it
+        cd_cmd = _capistrano_cd(p.remote_path)
+        sudo_prefix = "sudo " if not no_escalate and p.sudo else ""
+        run_cmd = f"{cd_cmd} && {sudo_prefix}php {tmp_remote}"
+
+        ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        if not no_escalate and p.sudo:
+            ssh_args.insert(1, "-t")
+        ssh_args.append(run_cmd)
+
+        sudo_pw = prompt_for_credential(profile, p.user) if p.sudo and not no_escalate else ""
+
+        def output_line(line: str) -> None:
+            console.print(line)
+
+        exit_code = runner.run(
+            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+            on_output=output_line, timeout=120,
+        )
+
+        # Cleanup remote
+        clean_cmd = f"rm -f {safe_quote(tmp_remote)}"
+        clean_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        clean_ssh.append(clean_cmd)
+        runner.run(clean_ssh, password=ssh_pw, timeout=10)
+
+        if exit_code != 0:
+            console.print(f"  [red]Exit code: {exit_code}[/red]")
+    finally:
+        # Cleanup local
+        try:
+            tmp_local.unlink()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

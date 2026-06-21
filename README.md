@@ -444,6 +444,18 @@ spyro tinker -p staging -e "User::count()"       # One-shot eval
 spyro tinker -p staging -f script.php            # Run a PHP file
 ```
 
+**Eval (reliable one-shot PHP evaluation):**
+
+```bash
+# Evaluate any PHP expression via Laravel bootstrap (not PsySH)
+# Avoids the quoting and output-capture issues of spyro tinker -e
+spyro eval 'User::count()' -p staging
+spyro eval 'DB::table("users")->count()' -p staging --json
+spyro eval \"\\App\\Models\\User::first()->toArray()\" -p staging
+```
+
+The `eval` command works by generating a temporary PHP script that boots Laravel via `bootstrap/app.php`, evaluates your expression directly with `php` CLI, and echoes the result. No PsySH, no quote-nesting nightmares, no swallowed output.
+
 ### Database
 
 ```bash
