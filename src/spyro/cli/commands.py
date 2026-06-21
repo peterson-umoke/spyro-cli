@@ -1786,16 +1786,11 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
     else:
         tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker"
 
-    if not no_escalate and p.sudo:
+    # Force PTY allocation
+    # - sudo profiles already got -t above
+    # - non-sudo profiles need -t here (used by both interactive and eval/file)
+    if not no_escalate and not p.sudo:
         ssh_args.insert(1, "-t")
-
-    if eval or file:
-        # Eval/file mode also needs a PTY for proper PsySH output
-        if not no_escalate and not p.sudo:
-            ssh_args.insert(1, "-t")
-    else:
-        # -tt for interactive (forces PTY even when no command is piped)
-        ssh_args.insert(1, "-tt")
 
     ssh_args.append(tinker_cmd)
 
@@ -1815,9 +1810,9 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
             console.print(f"  [red]Exit code: {exit_code}[/red]")
     else:
         console.print(f"[cyan]Starting Tinker on {profile}...[/cyan]")
-        exit_code = runner.run(
-            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-            on_output=lambda line: None, timeout=30,
+        console.print("[dim]Exit with Ctrl+D or type 'exit'[/dim]")
+        exit_code = runner.interactive_run(
+            ssh_args, password=ssh_pw, sudo_password=sudo_pw, timeout=3600,
         )
 
 
