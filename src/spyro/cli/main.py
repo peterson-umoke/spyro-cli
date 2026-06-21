@@ -20,6 +20,7 @@ from .commands import (
     cmd_shell,
     cmd_status,
     cmd_up,
+    cmd_update,
     cmd_watch,
     cmd_artisan,
     cmd_wp,
@@ -68,6 +69,7 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 # Register commands
 main.add_command(cmd_init, "init")
 main.add_command(cmd_up, "up")
+main.add_command(cmd_update, "update")
 main.add_command(cmd_down, "down")
 main.add_command(cmd_status, "status")
 main.add_command(cmd_logs, "logs")
@@ -78,6 +80,8 @@ main.add_command(cmd_watch, "watch")
 main.add_command(cmd_proxy_url, "proxy-url")
 main.add_command(cmd_artisan, "artisan")
 main.add_command(cmd_cp, "cp")
+main.add_command(cmd_cp, "deploy")
+main.add_command(cmd_cp, "upload")
 main.add_command(cmd_db_tunnel, "db-tunnel")
 main.add_command(cmd_db_shell, "db-shell")
 main.add_command(cmd_wp, "wp")
