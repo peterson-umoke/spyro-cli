@@ -1001,16 +1001,13 @@ def _is_local_path(path: str) -> bool:
     """Check if a path is local (not a remote scp-style path).
 
     A path starting with ':' is always treated as remote.
-    Everything else that looks like a filesystem path is local.
+    Everything else is treated as local — absolute paths (``/...``),
+    home-relative (``~/...``), explicit relative (``./...``,
+    ``../...``), and bare relative paths (``dir/file.php``).
     """
     if path.startswith(":"):
         return False
-    return (
-        path.startswith("/")
-        or path.startswith("~")
-        or path.startswith("./")
-        or path.startswith("../")
-    )
+    return True
 
 
 @click.command()

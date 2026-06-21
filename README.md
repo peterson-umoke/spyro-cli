@@ -99,8 +99,17 @@ uv tool install . --with watchdog
 ### Update
 
 ```bash
-uv tool install --force git+https://github.com/peterson-umoke/spyro-cli.git
+# Check for updates and install the latest version
+spyro update
+
+# Only check, don't install
+spyro update --check
+
+# Force reinstall even if already up to date
+spyro update --force
 ```
+
+Spyro checks the GitHub releases API for the latest tag and reinstalls itself via ``uv tool install --reinstall`` from the canonical git URL. No git clone needed, works whether installed with `uv` or `pip`.
 
 ### Verify installation
 
@@ -382,6 +391,13 @@ spyro caddy restart -p dev
 
 ## Commands Reference
 
+### Self-Update
+
+```bash
+spyro update                    # Check for updates and install
+spyro update --check            # Only check, don't install
+spyro update --force            # Reinstall even if already up to date
+```
 ### Tunnel Management
 
 ```bash
@@ -554,6 +570,8 @@ spyro ssh
 ```bash
 # Upload local file to remote
 spyro cp ./README.md :/var/www/app/README.md -p staging
+spyro deploy ./README.md :/var/www/app/README.md -p staging   # alias
+spyro upload ./README.md :/var/www/app/README.md -p staging   # alias
 
 # Download remote file to local
 spyro cp :/var/www/app/.env ./.env.remote -p staging
