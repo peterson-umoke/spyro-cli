@@ -2161,71 +2161,74 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
 def cmd_update(force: bool, check: bool) -> None:
     """Self-update spyro to the latest version from GitHub.
 
-    Checks the GitHub repository for the latest release tag and compares it
-    against the currently installed version.  When a newer version is found,
-    the latest source is pulled and spyro is reinstalled.
+    Checks the repository for the latest tag via the GitHub API, compares it
+    against the currently installed version, and reinstalls via ``uv tool
+    install --reinstall`` from the canonical git URL.
+
+    Works whether spyro was installed with ``uv tool install`` or via pip.
+    ``git`` is not required — the update uses the GitHub REST API.
     """
-    import re
-    import subprocess
-    from pathlib import Path
+    import json
+    import urllib.request
 
     from .. import __version__ as current_version
 
     console.print("[bold cyan]Spyro Update[/bold cyan]\n")
+    console.print(f"  Installed: v{current_version}\n")
 
-    # ── Locate the project root via the spyro package path ────────────────
-    try:
-        spyro_init = Path(__file__).resolve()
-        # src/spyro/cli/commands.py → src/spyro/cli/ → src/spyro/ → src/ → project root
-        project_root = spyro_init.parents[3]
-        if not (project_root / ".git").is_dir():
-            console.print("[red]Cannot determine project root — .git directory not found[/red]")
-            console.print(f"  Looked in: {project_root}")
-            return
-    except Exception as e:
-        console.print(f"[red]Failed to locate spyro project: {e}[/red]")
-        return
+    GITHUB_API = "https://api.github.com/repos/peterson-umoke/spyro-cli"
+    GIT_URL = "git+https://github.com/peterson-umoke/spyro-cli"
 
-    console.print(f"  Project root: {project_root}")
-    console.print(f"  Installed:    v{current_version}\n")
-
-    # ── Fetch latest tag from GitHub ──────────────────────────────────────
+    # ── Fetch latest tag from GitHub API ──────────────────────────────────
     console.print("[cyan]Checking for updates...[/cyan]")
     try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--tags", "origin"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=project_root,
+        req = urllib.request.Request(
+            f"{GITHUB_API}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
         )
-    except subprocess.TimeoutExpired:
-        console.print("[red]Timed out while checking for updates[/red]")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release = json.loads(resp.read().decode())
+        latest_tag = release.get("tag_name", "").lstrip("v")
+        if not latest_tag:
+            console.print("[red]Could not parse latest release tag from GitHub[/red]")
+            return
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # No releases yet — fall back to listing tags
+            try:
+                tag_req = urllib.request.Request(
+                    f"{GITHUB_API}/tags?per_page=10",
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
+                )
+                with urllib.request.urlopen(tag_req, timeout=15) as resp:
+                    tags = json.loads(resp.read().decode())
+                if not tags:
+                    console.print("[yellow]No tags found on GitHub repository[/yellow]")
+                    return
+                # Tags come as [{name: "v0.5.0", ...}, ...]; sort semver
+                versions = []
+                for t in tags:
+                    raw = t.get("name", "").lstrip("v")
+                    parts = raw.split(".")
+                    if len(parts) == 3 and all(p.isdigit() for p in parts):
+                        versions.append(raw)
+                if not versions:
+                    console.print("[yellow]No semver tags found on GitHub[/yellow]")
+                    return
+                versions.sort(key=lambda v: tuple(int(x) for x in v.split(".")))
+                latest_tag = versions[-1]
+            except Exception as tag_err:
+                console.print(f"[red]Failed to fetch tags: {tag_err}[/red]")
+                return
+        else:
+            console.print(f"[red]GitHub API error: {e.code} {e.reason}[/red]")
+            return
+    except urllib.error.URLError as e:
+        console.print(f"[red]Network error: {e.reason}[/red]")
         return
-    except FileNotFoundError:
-        console.print("[red]git not found. Is Git installed?[/red]")
+    except json.JSONDecodeError:
+        console.print("[red]Invalid response from GitHub API[/red]")
         return
-
-    tags: list[str] = []
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            ref = parts[1]
-            # Match tags like refs/tags/v0.3.0 or refs/tags/0.3.0
-            m = re.match(r"refs/tags/v?(\d+\.\d+\.\d+)(?:\^\{\})?$", ref)
-            if m:
-                tags.append(m.group(1))
-
-    if not tags:
-        console.print("[yellow]No version tags found on remote[/yellow]")
-        return
-
-    # Sort tags semantically and get the latest
-    def _sort_key(t: str) -> tuple[int, ...]:
-        return tuple(int(x) for x in t.split("."))
-
-    tags.sort(key=_sort_key)
-    latest_tag = tags[-1]
 
     console.print(f"  Remote latest: v{latest_tag}")
 
@@ -2247,67 +2250,31 @@ def cmd_update(force: bool, check: bool) -> None:
             console.print("Run [bold]spyro update[/bold] to upgrade.")
         return
 
-    # ── Pull latest source ────────────────────────────────────────────────
-    console.print("\n[cyan]Pulling latest source...[/cyan]")
+    # ── Reinstall via uv tool ─────────────────────────────────────────────
+    console.print("\n[cyan]Installing latest version...[/cyan]")
+
+    uv = shutil.which("uv")
+    if uv:
+        pip_or_uv = [uv, "tool", "install", "--reinstall", GIT_URL]
+        label = "uv"
+    else:
+        pip = shutil.which("pip") or shutil.which("pip3") or "pip3"
+        pip_or_uv = [pip, "install", GIT_URL]
+        label = "pip"
+
     try:
-        pull = subprocess.run(
-            ["git", "pull", "--ff-only"],
+        install = subprocess.run(
+            pip_or_uv,
             capture_output=True,
             text=True,
-            timeout=30,
-            cwd=project_root,
+            timeout=120,
         )
-        if pull.returncode != 0:
-            console.print(f"[red]Git pull failed:[/red]")
-            console.print(f"  {pull.stderr.strip()}")
-            return
-        for line in pull.stdout.splitlines():
-            if line.strip():
-                console.print(f"  {line}")
-    except subprocess.TimeoutExpired:
-        console.print("[red]Git pull timed out[/red]")
-        return
-
-    # ── Reinstall ─────────────────────────────────────────────────────────
-    console.print("\n[cyan]Reinstalling spyro...[/cyan]")
-
-    # Prefer uv tool reinstall (spyro is typically installed via uv tool),
-    # fall back to pip install -e . for editable installs.
-    uv = shutil.which("uv")
-    is_uv_tool = False
-    if uv:
-        try:
-            tool_check = subprocess.run(
-                [uv, "tool", "list"],
-                capture_output=True, text=True, timeout=10,
-            )
-            is_uv_tool = "spyro-cli" in tool_check.stdout
-        except Exception:
-            pass
-
-    try:
-        if is_uv_tool:
-            install = subprocess.run(
-                [uv, "tool", "install", "--reinstall", "."],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                cwd=project_root,
-            )
-        else:
-            pip = shutil.which("pip") or shutil.which("pip3") or "pip3"
-            install = subprocess.run(
-                [pip, "install", "-e", "."],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                cwd=project_root,
-            )
         if install.returncode != 0:
             console.print(f"[red]Installation failed:[/red]")
             console.print(f"  {install.stderr.strip()}")
             return
         console.print(f"[green]✓ spyro updated to v{latest_tag}[/green]")
+        console.print(f"  (via {label} — you may need to restart your shell)")
     except subprocess.TimeoutExpired:
         console.print("[red]Installation timed out[/red]")
         return
