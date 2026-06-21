@@ -1069,16 +1069,10 @@ def _is_local_path(path: str) -> bool:
     return True
 
 
-@click.command()
-@click.argument("src")
-@click.argument("dest")
-@click.option("--recursive", "-r", is_flag=True, help="Copy directories")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
-    """Securely copy files with auto-sudo escalation."""
+def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str) -> int:
+    """Copy files to/from a single profile. Returns exit code."""
     config = load_config()
-    p = config.get_profile(profile)
-
+    p = config.get_profile(profile_name)
     runner = PTYRunner()
 
     src_is_local = _is_local_path(src)
@@ -1087,9 +1081,9 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
 
     if src_is_local:
         # Local -> remote (dest is on the remote host via profile)
-        src = str(Path(src).expanduser().resolve())
+        resolved_src = str(Path(src).expanduser().resolve())
         scp_args = build_scp_args(
-            src=src,
+            src=resolved_src,
             dest=_scp_target(dest, p.host, p.user),
             host=p.host,
             user=p.user,
@@ -1099,10 +1093,10 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
         )
     else:
         # Remote -> local (dest is a local path)
-        dest = str(Path(dest).expanduser().resolve())
+        resolved_dest = str(Path(dest).expanduser().resolve())
         scp_args = build_scp_args(
             src=_scp_target(src, p.host, p.user),
-            dest=dest,
+            dest=resolved_dest,
             host=p.host,
             user=p.user,
             port=p.port,
@@ -1110,14 +1104,14 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
             recursive=recursive,
         )
 
-    console.print(f"[cyan]Copying {src} -> {dest}...[/cyan]")
+    console.print(f"[cyan][{profile_name}] Copying {src} -> {dest}...[/cyan]")
 
     from ..utils.keychain import prompt_for_credential
 
-    ssh_pw = prompt_for_credential(profile, p.user)
+    ssh_pw = prompt_for_credential(profile_name, p.user)
 
     def output_line(line: str) -> None:
-        console.print(line)
+        console.print(f"  [{profile_name}] {line}")
 
     exit_code = runner.run(
         scp_args,
@@ -1127,9 +1121,65 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: str) -> None:
     )
 
     if exit_code == 0:
-        console.print("[green]Copy complete[/green]")
+        console.print(f"[green]  [{profile_name}] Copy complete[/green]")
     else:
-        console.print(f"[red]Copy failed (exit code: {exit_code})[/red]")
+        console.print(f"[red]  [{profile_name}] Copy failed (exit code: {exit_code})[/red]")
+
+    return exit_code
+
+
+@click.command()
+@click.argument("src")
+@click.argument("dest")
+@click.option("--recursive", "-r", is_flag=True, help="Copy directories")
+@click.option("--profile", "-p", multiple=True, default=None, help="Profile name (can be used multiple times)")
+@click.option("--all", "all_profiles", is_flag=True, help="Copy to all profiles")
+@click.option("--except", "except_profiles", default="", help="Comma-separated profiles to exclude when using --all")
+def cmd_cp(src: str, dest: str, recursive: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str) -> None:
+    """Securely copy files with auto-sudo escalation.
+
+    Supports copying to one or multiple profiles:
+
+    \b
+      spyro cp file.txt /remote/ -p staging
+      spyro cp file.txt /remote/ --all
+      spyro cp file.txt /remote/ --all --except ird-server,production
+      spyro cp file.txt /remote/ -p staging -p dev
+    """
+    config = load_config()
+
+    # Resolve target profiles
+    if all_profiles:
+        targets = config.profile_names
+        if except_profiles:
+            exclusions = {n.strip() for n in except_profiles.split(",") if n.strip()}
+            targets = [n for n in targets if n not in exclusions]
+            if exclusions:
+                console.print(f"  Excluding: {', '.join(sorted(exclusions))}")
+    elif profile:
+        targets = list(profile)
+    else:
+        console.print("[red]Specify at least one --profile/-p or --all[/red]")
+        return
+
+    if not targets:
+        console.print("[red]No profiles matched[/red]")
+        return
+
+    console.print(f"[bold cyan]Copying to {len(targets)} profile(s): {', '.join(targets)}[/bold cyan]\n")
+
+    results: dict[str, int] = {}
+    for name in targets:
+        ec = _copy_to_profile(src, dest, recursive, name)
+        results[name] = ec
+
+    # Summary
+    successes = [n for n, ec in results.items() if ec == 0]
+    failures = [n for n, ec in results.items() if ec != 0]
+    if successes:
+        console.print(f"\n[green]✓ Succeeded: {len(successes)} profile(s)[/green]")
+    if failures:
+        console.print(f"\n[red]✗ Failed: {len(failures)} profile(s) — {', '.join(failures)}[/red]")
 
 
 # ---------------------------------------------------------------------------
