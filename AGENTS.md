@@ -2,6 +2,11 @@
 
 This file provides guidance to WARP (warp.dev) when working with code in this repository.
 
+## Commit Convention
+
+- Never add Co-Authored-By or any other attribution trailers to commit messages.
+- Never add commit message trailers of any kind unless the user explicitly asks for them.
+
 ## Build & Development Commands
 
 - **Install dev dependencies**: `uv sync` (creates venv from `pyproject.toml`)
