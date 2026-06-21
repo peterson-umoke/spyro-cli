@@ -1821,6 +1821,40 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
 # ---------------------------------------------------------------------------
 
 
+def build_eval_php(expression: str, json_output: bool = False) -> str:
+    """Build a PHP script that boots Laravel and evaluates *expression*.
+
+    The script boots Laravel via bootstrap/app.php, evaluates the expression
+    inside a closure, and echoes the result via ``print_r`` or ``json_encode``.
+
+    Args:
+        expression: PHP expression to evaluate (e.g. ``User::count()``).
+        json_output: If True, wrap result in ``json_encode()`` instead of
+            ``print_r``.
+
+    Returns:
+        Complete PHP source code as a string.
+    """
+    if json_output:
+        output_expr = (
+            f"json_encode((function() {{ return {expression}; }})(),"
+            " JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)"
+        )
+    else:
+        output_expr = f"print_r((function() {{ return {expression}; }})(), true)"
+
+    return (
+        "<?php\n"
+        "$base = getcwd();\n"
+        "require $base . '/vendor/autoload.php';\n"
+        "$app = require_once $base . '/bootstrap/app.php';\n"
+        "$kernel = $app->make(Illuminate\\Contracts\\Console\\Kernel::class);\n"
+        "$kernel->bootstrap();\n"
+        "echo " + output_expr + ";\n"
+        "echo \"\\n\";\n"
+    )
+
+
 @click.command()
 @click.argument("expression")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
@@ -1852,27 +1886,7 @@ def cmd_eval(expression: str, json_output: bool, no_escalate: bool, profile: str
         console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
         return
 
-    # Build PHP code that boots Laravel and evaluates the expression
-    # Uses getcwd() instead of __DIR__ so the file can live in /tmp/ while
-    # we cd into the project directory.
-    if json_output:
-        output_expr = (
-            f"json_encode((function() {{ return {expression}; }})(),"
-            " JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)"
-        )
-    else:
-        output_expr = f"print_r((function() {{ return {expression}; }})(), true)"
-
-    php_code = (
-        "<?php\n"
-        "$base = getcwd();\n"
-        "require $base . '/vendor/autoload.php';\n"
-        "$app = require_once $base . '/bootstrap/app.php';\n"
-        "$kernel = $app->make(Illuminate\\Contracts\\Console\\Kernel::class);\n"
-        "$kernel->bootstrap();\n"
-        "echo " + output_expr + ";\n"
-        "echo \"\\n\";\n"
-    )
+    php_code = build_eval_php(expression, json_output)
 
     # Write temp file locally
     import uuid
