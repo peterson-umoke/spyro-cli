@@ -1157,7 +1157,10 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: tuple[str, ...] | None
             if exclusions:
                 console.print(f"  Excluding: {', '.join(sorted(exclusions))}")
     elif profile:
-        targets = list(profile)
+        # Split each -p value on commas so "-p staging,dev" works
+        targets = []
+        for p in profile:
+            targets.extend(n.strip() for n in p.split(",") if n.strip())
     else:
         console.print("[red]Specify at least one --profile/-p or --all[/red]")
         return

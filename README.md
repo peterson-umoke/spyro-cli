@@ -565,12 +565,77 @@ spyro ssh
 
 **How it works:** Uses the same PTY engine as `spyro run` to inject credentials from the OS keychain during auth, then hands over to a raw terminal relay. Handles both password-based and key-based SSH authentication. After auth, credentials are zeroed from memory — the interactive session has no access to them.
 
+### Process Listing
+
+```bash
+# List all processes on remote server
+spyro ps -p staging
+
+# Filter with grep
+spyro ps -p staging --grep php
+spyro ps -p staging -g nginx
+
+# JSON output for scripting
+spyro ps -p staging --json
+```
+
+### Configuration Management
+
+```bash
+# Validate spyro.toml schema
+spyro config validate
+spyro cfg validate          # alias
+
+# Checks:
+#   - Required fields (host, user)
+#   - Port ranges (1-65535)
+#   - SSH key file existence
+#   - Duplicate forwarded ports
+#   - SSH config Host matching
+```
+
+### Default Profile
+
+Set a default profile in `spyro.toml` so you can omit `-p`:
+
+```toml
+[defaults]
+profile = "staging"
+```
+
+Now `spyro ssh`, `spyro artisan migrate`, etc. will use `staging` by default.
+
+### SSH Config Integration
+
+Profiles automatically inherit settings from `~/.ssh/config` Host blocks. If a profile
+name matches an SSH Host entry, HostName/User/Port/IdentityFile are applied.
+
+### Machine-Readable Output
+
+Several commands support `--json` for CI/CD or script consumption:
+
+```bash
+spyro status --json        # Tunnel states as JSON
+spyro doctor --json        # Diagnostic results as JSON
+spyro pins --json          # Pinned sync dirs as JSON
+spyro ps --json            # Process list as JSON (columns parsed)
+```
+
+### Shell Completion
+
+```bash
+# Show completion script for your shell
+spyro --show-completion
+
+# Get install command to add to your ~/.zshrc / ~/.bashrc
+spyro --install-completion
+```
+
 ### File Transfer
 
 ```bash
 # Upload local file to remote
 spyro cp ./README.md :/var/www/app/README.md -p staging
-spyro deploy ./README.md :/var/www/app/README.md -p staging   # alias
 spyro upload ./README.md :/var/www/app/README.md -p staging   # alias
 
 # Download remote file to local
@@ -578,21 +643,41 @@ spyro cp :/var/www/app/.env ./.env.remote -p staging
 
 # Upload entire directory
 spyro cp -r ./public :/var/www/app/public -p staging
+
+# Upload to multiple profiles (comma-separated)
+spyro cp ./config.php :/var/www/config.php -p staging,dev
+
+# Upload to multiple profiles (repeat -p)
+spyro cp ./config.php :/var/www/config.php -p staging -p dev
+
+# Upload to all profiles
+spyro cp ./config.php :/var/www/config.php --all
+
+# Upload to all profiles except specific ones
+spyro cp ./config.php :/var/www/config.php --all --except ird-server,production
 ```
 
 **Path convention:**
 - Local paths: `/path/to/file`
 - Remote paths: `:` prefix → `:/remote/path`
-- Profile flag: `-p staging` always required
+- Profile: `-p name`, multiple `-p`, comma-separated, `--all`, or `--all --except`
 
 ### Environment
 
 ```bash
-# Mirror remote .env to local
-spyro pull-env -p staging
+# Pull remote .env to local file
+spyro env pull -p staging                        # Creates .env.remote
+spyro env pull -p staging --dest .env.staging    # Custom output path
 
-# Creates .env.remote in current directory
-# Useful for comparing environments or debugging config issues
+# Compare local .env with remote
+spyro env diff -p staging                        # Unified diff output
+
+# Push local .env to remote
+spyro env push -p staging                        # Uploads .env
+spyro env push -p staging custom.env             # Upload custom file
+
+# Legacy alias (still works)
+spyro pull-env -p staging
 ```
 
 ### Logs
