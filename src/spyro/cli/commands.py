@@ -553,8 +553,12 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], command: str) -> None:
     elif profile:
         profiles = list(profile)
     else:
-        console.print("[red]Specify --all or --profile[/red]")
-        return
+        env_profile = os.environ.get("SPYRO_PROFILE", "")
+        if env_profile:
+            profiles = [n.strip() for n in env_profile.split(",") if n.strip()]
+        else:
+            console.print("[red]Specify --all, --profile, or set SPYRO_PROFILE[/red]")
+            return
 
     runner = PTYRunner()
 
@@ -1162,8 +1166,12 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: tuple[str, ...] | None
         for p in profile:
             targets.extend(n.strip() for n in p.split(",") if n.strip())
     else:
-        console.print("[red]Specify at least one --profile/-p or --all[/red]")
-        return
+        env_profile = os.environ.get("SPYRO_PROFILE", "")
+        if env_profile:
+            targets = [n.strip() for n in env_profile.split(",") if n.strip()]
+        else:
+            console.print("[red]Specify at least one --profile/-p, --all, or set SPYRO_PROFILE[/red]")
+            return
 
     if not targets:
         console.print("[red]No profiles matched[/red]")
@@ -2020,6 +2028,94 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
             pass
 
 
+
+@click.command()
+@click.argument("file", type=click.Path(exists=True, dir_okay=False, readable=True))
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
+def cmd_script(file: str, profile: str, no_escalate: bool) -> None:
+    """Upload a PHP file and execute it in the remote Laravel context.
+
+    Reads a local .php file, uploads it to the remote server, executes it
+    with ``php`` from the configured ``remote_path``, prints the output,
+    and cleans up the remote temp file. The local file is untouched.
+
+    Examples:
+
+      spyro script fix_stuck_users.php -p staging
+
+      spyro script app/scripts/deploy_hook.php -p production
+    """
+    config = load_config()
+    p = config.get_profile(profile)
+
+    if not p.remote_path:
+        console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
+        return
+
+    file_path = Path(file).expanduser().resolve()
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/red]")
+        return
+
+    import uuid
+    tmp_name = f"spyro-script-{uuid.uuid4().hex[:8]}.php"
+    tmp_remote = f"/tmp/{tmp_name}"
+
+    runner = PTYRunner()
+
+    try:
+        # Upload to remote /tmp/
+        from ..core.pty_engine import _scp_target
+
+        scp_args = build_scp_args(
+            src=str(file_path),
+            dest=_scp_target(tmp_remote, p.host, p.user),
+            host=p.host, user=p.user, port=p.port, key=p.key,
+        )
+
+        from ..utils.keychain import prompt_for_credential
+
+        ssh_pw = prompt_for_credential(profile, p.user)
+
+        console.print(f"[cyan]Uploading {file_path.name} to {p.host}:{tmp_remote}...[/cyan]")
+        ec = runner.run(scp_args, password=ssh_pw, timeout=30)
+        if ec != 0:
+            console.print("[red]Failed to upload script[/red]")
+            return
+
+        # Run it
+        cd_cmd = _capistrano_cd(p.remote_path)
+        sudo_prefix = "sudo " if not no_escalate and p.sudo else ""
+        run_cmd = f"{cd_cmd} && {sudo_prefix}php {tmp_remote}"
+
+        ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        if not no_escalate and p.sudo:
+            ssh_args.insert(1, "-t")
+        ssh_args.append(run_cmd)
+
+        sudo_pw = prompt_for_credential(profile, p.user) if p.sudo and not no_escalate else ""
+
+        def output_line(line: str) -> None:
+            console.print(line)
+
+        exit_code = runner.run(
+            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+            on_output=output_line, timeout=120,
+        )
+
+        # Cleanup remote
+        clean_cmd = f"rm -f {safe_quote(tmp_remote)}"
+        clean_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        clean_ssh.append(clean_cmd)
+        runner.run(clean_ssh, password=ssh_pw, timeout=10)
+
+        if exit_code != 0:
+            console.print(f"  [red]Exit code: {exit_code}[/red]")
+    finally:
+        pass  # Local file is never deleted — it's the user's file
+
+
 # ---------------------------------------------------------------------------
 # spyro db — Database commands (MySQL/MariaDB/PostgreSQL)
 # ---------------------------------------------------------------------------
@@ -2552,7 +2648,7 @@ def notify_update() -> None:
         return
 
     # Disk cache (24 hours)
-    from .paths import spyro_home
+    from ..utils.paths import spyro_home
     cache_path = spyro_home() / "version_check"
     now = time.time()
 
@@ -2652,7 +2748,7 @@ def cmd_update(force: bool, check: bool) -> None:
         label = "uv"
     else:
         pip = shutil.which("pip") or shutil.which("pip3") or "pip3"
-        pip_or_uv = [pip, "install", install_url]
+        pip_or_uv = [pip, "install", "--upgrade", install_url]
         label = "pip"
 
     try:
@@ -2667,7 +2763,7 @@ def cmd_update(force: bool, check: bool) -> None:
             console.print(f"  {install.stderr.strip()}")
             return
         # Invalidate cache after successful update
-        from .paths import spyro_home
+        from ..utils.paths import spyro_home
         cache_path = spyro_home() / "version_check"
         try:
             cache_path.unlink()

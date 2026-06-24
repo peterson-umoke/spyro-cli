@@ -33,6 +33,7 @@ from .commands import (
     cmd_pull_env,
     cmd_redis,
     cmd_run,
+    cmd_script,
     cmd_shell,
     cmd_ssh,
     cmd_status,
@@ -171,6 +172,7 @@ main.add_command(cmd_nginx, "nginx")
 main.add_command(cmd_caddy, "caddy")
 main.add_command(cmd_tinker, "tinker")
 main.add_command(cmd_eval, "eval")
+main.add_command(cmd_script, "script")
 main.add_command(cmd_db, "db")
 main.add_command(cmd_auth, "auth")
 main.add_command(cmd_ssh, "ssh")
