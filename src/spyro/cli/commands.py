@@ -1073,7 +1073,7 @@ def _is_local_path(path: str) -> bool:
     return True
 
 
-def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str) -> int:
+def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str, parents: bool = False) -> int:
     """Copy files to/from a single profile. Returns exit code."""
     config = load_config()
     p = config.get_profile(profile_name)
@@ -1081,14 +1081,27 @@ def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str) ->
 
     src_is_local = _is_local_path(src)
 
+    from ..utils.keychain import prompt_for_credential
+
+    ssh_pw = prompt_for_credential(profile_name, p.user)
+
     from ..core.pty_engine import _scp_target
 
     if src_is_local:
         # Local -> remote (dest is on the remote host via profile)
         resolved_src = str(Path(src).expanduser().resolve())
+        remote_dest = dest
+        if parents:
+            # Preserve source directory structure: app/Foo/Bar.php -> /remote/app/Foo/Bar.php
+            remote_dest = dest.rstrip("/") + "/" + src
+            remote_parent = str(Path(remote_dest).parent)
+            # Create parent dirs on remote before scp
+            mkdir_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+            mkdir_ssh.append(f"mkdir -p {safe_quote(remote_parent)}")
+            runner.run(mkdir_ssh, password=ssh_pw, timeout=10)
         scp_args = build_scp_args(
             src=resolved_src,
-            dest=_scp_target(dest, p.host, p.user),
+            dest=_scp_target(remote_dest, p.host, p.user),
             host=p.host,
             user=p.user,
             port=p.port,
@@ -1108,11 +1121,8 @@ def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str) ->
             recursive=recursive,
         )
 
-    console.print(f"[cyan][{profile_name}] Copying {src} -> {dest}...[/cyan]")
-
-    from ..utils.keychain import prompt_for_credential
-
-    ssh_pw = prompt_for_credential(profile_name, p.user)
+    display_dest = dest.rstrip("/") + "/" + src if parents else dest
+    console.print(f"[cyan][{profile_name}] Copying {src} -> {display_dest}...[/cyan]")
 
     def output_line(line: str) -> None:
         console.print(f"  [{profile_name}] {line}")
@@ -1136,10 +1146,11 @@ def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str) ->
 @click.argument("src")
 @click.argument("dest")
 @click.option("--recursive", "-r", is_flag=True, help="Copy directories")
+@click.option("--parents", is_flag=True, help="Create parent directories on remote")
 @click.option("--profile", "-p", multiple=True, default=None, help="Profile name (can be used multiple times)")
 @click.option("--all", "all_profiles", is_flag=True, help="Copy to all profiles")
 @click.option("--except", "except_profiles", default="", help="Comma-separated profiles to exclude when using --all")
-def cmd_cp(src: str, dest: str, recursive: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str) -> None:
+def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str) -> None:
     """Securely copy files with auto-sudo escalation.
 
     Supports copying to one or multiple profiles:
@@ -1181,7 +1192,7 @@ def cmd_cp(src: str, dest: str, recursive: bool, profile: tuple[str, ...] | None
 
     results: dict[str, int] = {}
     for name in targets:
-        ec = _copy_to_profile(src, dest, recursive, name)
+        ec = _copy_to_profile(src, dest, recursive, name, parents=parents)
         results[name] = ec
 
     # Summary
