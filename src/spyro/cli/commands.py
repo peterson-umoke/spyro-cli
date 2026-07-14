@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -193,7 +194,27 @@ def _show_log(path: Path, follow: bool) -> None:
 
 # ---------------------------------------------------------------------------
 # Capistrano deployment detection
-# ---------------------------------------------------------------------------
+
+
+def _get_timeout(config: "SpyroConfig", cli_timeout: float | None, default: float) -> float:
+    """Resolve timeout: CLI flag -> [defaults] command_timeout -> default.
+
+    Raises click.BadParameter for invalid values.
+    """
+    if cli_timeout is not None:
+        if cli_timeout <= 0:
+            raise click.BadParameter("--timeout must be > 0")
+        return cli_timeout
+    defaults = config.global_settings.get("defaults", {})
+    if isinstance(defaults, dict):
+        ct = defaults.get("command_timeout")
+        if ct is not None:
+            if isinstance(ct, (int, float)) and ct > 0:
+                return float(ct)
+            raise click.BadParameter(
+                f"[defaults] command_timeout must be a positive number, got {ct!r}"
+            )
+    return default
 
 
 def _capistrano_cd(remote_path: str) -> str:
@@ -361,6 +382,30 @@ def cmd_doctor(json_output: bool) -> None:
             if not json_output:
                 console.print(f"  [yellow]⚠[/yellow] {name}: could not verify")
             _record("remote_path", name, False, "could not verify")
+
+    # 2.5 Deployment structure check (Capistrano symlink awareness)
+    artisan_names = [n for n, p in config.profiles.items() if p.artisan]
+    if artisan_names:
+        if not json_output:
+            console.print("\n[bold]   Deployment structure[/bold]")
+        for name in artisan_names:
+            p = config.profiles[name]
+            ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+            # Check if remote_path/current is a symlink
+            check_cmd = f"test -L {safe_quote(p.remote_path)}/current"
+            ssh_args_copy = list(ssh_args) + [check_cmd]
+            try:
+                result = subprocess.run(ssh_args_copy, capture_output=True, timeout=10)
+                if result.returncode == 0:
+                    if not json_output:
+                        console.print(f"  [green]✓[/green] {name}: Capistrano 'current' symlink detected")
+                    _record("deploy_structure", name, True, "capistrano symlink")
+                else:
+                    if not json_output:
+                        console.print(f"  [dim]  ℹ[/dim] {name}: plain docroot (no 'current' symlink)")
+                    _record("deploy_structure", name, False, "plain docroot")
+            except Exception:
+                _record("deploy_structure", name, False, "could not verify")
 
     # 3. Local port conflicts
     if not json_output:
@@ -543,10 +588,13 @@ def cmd_pull_env(dest: str, profile: str) -> None:
 @click.command()
 @click.option("--all", "run_all", is_flag=True, help="Run across all profiles")
 @click.option("--profile", "-p", multiple=True, help="Specific profile(s)")
+@click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 60)")
+@click.option("--chdir", "-C", is_flag=True, help="cd to remote_path before running command")
 @click.argument("command")
-def cmd_run(run_all: bool, profile: tuple[str, ...], command: str) -> None:
+def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdir: bool, command: str) -> None:
     """Execute a command on remote server(s)."""
     config = load_config()
+    resolved_timeout = _get_timeout(config, timeout, 60.0)
 
     if run_all:
         profiles = config.profile_names
@@ -577,7 +625,12 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], command: str) -> None:
         if p.sudo:
             ssh_args.insert(1, "-t")
 
-        ssh_args.append(command)
+        # Optionally wrap command with cd to remote_path
+        remote_cmd = command
+        if chdir:
+            remote_cmd = f"{_capistrano_cd(p.remote_path)} && {command}"
+
+        ssh_args.append(remote_cmd)
 
         def output_line(line: str) -> None:
             console.print(f"  {line}")
@@ -595,7 +648,7 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], command: str) -> None:
             password=ssh_pw,
             sudo_password=sudo_pw,
             on_output=output_line,
-            timeout=60.0,
+            timeout=resolved_timeout,
         )
 
         if exit_code != 0:
@@ -704,11 +757,12 @@ def cmd_proxy_url(profile: str, port: int | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-@click.command()
+@click.command(context_settings={"ignore_unknown_options": True})
 @click.argument("cmd_args", nargs=-1)
 @click.option("--no-escalate", is_flag=True, help="Don't use sudo")
+@click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 60)")
 @click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
-def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str | None) -> None:
+def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | None, profile: str | None) -> None:
     """Run Laravel Artisan commands on the remote host."""
     profile = resolve_profile(profile)
 
@@ -718,7 +772,7 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str | Non
 
     config = load_config()
     p = config.get_profile(profile)
-
+    resolved_timeout = _get_timeout(config, timeout, 60.0)
     if not p.artisan:
         console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
         return
@@ -762,7 +816,7 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, profile: str | Non
         password=ssh_pw,
         sudo_password=sudo_pw,
         on_output=output_line,
-        timeout=60.0,
+        timeout=resolved_timeout,
     )
 
     if exit_code != 0:
@@ -1414,14 +1468,19 @@ def list_credentials() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0) -> int:
+
+def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0, cli_timeout: float | None = None) -> int:
     """Run a command via SSH with PTY auth for a profile.
+
+    timeout     — hardcoded default (used when neither CLI nor config set)
+    cli_timeout — optional override from a Click --timeout option
 
     Returns the exit code.
     """
     config = load_config()
     p = config.get_profile(profile)
     runner = PTYRunner()
+    resolved = _get_timeout(config, cli_timeout, timeout)
 
     # Check if command requires sudo but profile doesn't have sudo access
     if not p.sudo and "sudo" in cmd:
@@ -1443,7 +1502,7 @@ def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0) -> int:
         console.print(f"  {line}")
 
     return runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-                      on_output=output_line, timeout=timeout)
+                      on_output=output_line, timeout=resolved)
 
 
 @click.group()
@@ -1459,13 +1518,13 @@ def status(profile: str) -> None:
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
 
-
 @cmd_supervisor.command()
 @click.argument("process", default="all")
 @click.option("--profile", "-p", required=True, help="Profile name")
-def restart(profile: str, process: str) -> None:
+@click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 60)")
+def restart(profile: str, process: str, timeout: float | None) -> None:
     """Restart Supervisor process(es). Default: all."""
-    ec = _run_svc_cmd(profile, f"sudo supervisorctl restart {process}", timeout=60)
+    ec = _run_svc_cmd(profile, f"sudo supervisorctl restart {process}", timeout=60, cli_timeout=timeout)
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
 
@@ -1604,12 +1663,12 @@ def info(profile: str, option: str) -> None:
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
 
-
 @cmd_php.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-def restart(profile: str) -> None:
+@click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
+def restart(profile: str, timeout: float | None) -> None:
     """Restart PHP-FPM."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart php*-fpm 2>/dev/null || sudo service php*-fpm restart 2>/dev/null || (echo 'Trying sudo kill -USR2...' && sudo kill -USR2 $(pgrep -f 'php-fpm: master' | head -1) 2>/dev/null || echo 'Could not restart PHP-FPM')", timeout=30)
+    ec = _run_svc_cmd(profile, "sudo systemctl restart php*-fpm 2>/dev/null || sudo service php*-fpm restart 2>/dev/null || (echo 'Trying sudo kill -USR2...' && sudo kill -USR2 $(pgrep -f 'php-fpm: master' | head -1) 2>/dev/null || echo 'Could not restart PHP-FPM')", timeout=30, cli_timeout=timeout)
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
 
@@ -1662,17 +1721,16 @@ def sites(profile: str) -> None:
 
 @cmd_apache.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-def restart(profile: str) -> None:
+@click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
+def restart(profile: str, timeout: float | None) -> None:
     """Restart Apache."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart apache2 2>/dev/null || sudo systemctl restart httpd 2>/dev/null || sudo service apache2 restart 2>/dev/null || sudo service httpd restart 2>/dev/null || echo 'Could not restart Apache'", timeout=30)
+    ec = _run_svc_cmd(profile, "sudo systemctl restart apache2 2>/dev/null || sudo systemctl restart httpd 2>/dev/null || sudo service apache2 restart 2>/dev/null || sudo service httpd restart 2>/dev/null || echo 'Could not restart Apache'", timeout=30, cli_timeout=timeout)
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
-
 
 # ---------------------------------------------------------------------------
 # spyro nginx — Nginx web server management
 # ---------------------------------------------------------------------------
-
 
 @click.group()
 def cmd_nginx() -> None:
@@ -1708,9 +1766,10 @@ def sites(profile: str) -> None:
 
 @cmd_nginx.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-def restart(profile: str) -> None:
+@click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
+def restart(profile: str, timeout: float | None) -> None:
     """Restart Nginx."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart nginx 2>/dev/null || sudo service nginx restart 2>/dev/null || sudo nginx -s reload 2>/dev/null || echo 'Could not restart Nginx'", timeout=30)
+    ec = _run_svc_cmd(profile, "sudo systemctl restart nginx 2>/dev/null || sudo service nginx restart 2>/dev/null || sudo nginx -s reload 2>/dev/null || echo 'Could not restart Nginx'", timeout=30, cli_timeout=timeout)
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
 
@@ -1745,9 +1804,10 @@ def status(profile: str) -> None:
 
 @cmd_caddy.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-def restart(profile: str) -> None:
+@click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
+def restart(profile: str, timeout: float | None) -> None:
     """Restart Caddy."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart caddy 2>/dev/null || sudo service caddy restart 2>/dev/null || (sudo kill -USR1 $(pgrep -x caddy | head -1) 2>/dev/null && echo 'Sent reload signal') || echo 'Could not restart Caddy'", timeout=30)
+    ec = _run_svc_cmd(profile, "sudo systemctl restart caddy 2>/dev/null || sudo service caddy restart 2>/dev/null || (sudo kill -USR1 $(pgrep -x caddy | head -1) 2>/dev/null && echo 'Sent reload signal') || echo 'Could not restart Caddy'", timeout=30, cli_timeout=timeout)
     if ec != 0:
         console.print(f"  [red]Exit code: {ec}[/red]")
 
@@ -2855,10 +2915,9 @@ def cmd_shell(profile: str | None) -> None:
 @click.group()
 def cmd_config() -> None:
     """Manage spyro configuration."""
-
-
 @cmd_config.command(name="validate")
-def config_validate() -> None:
+@click.option("--resolve", is_flag=True, help="DNS resolve each host")
+def config_validate(resolve: bool) -> None:
     """Validate spyro.toml schema for correctness."""
     from ..utils.config import parse_config, parse_ssh_config
 
@@ -2890,6 +2949,15 @@ def config_validate() -> None:
         # Port range
         if not (1 <= profile.port <= 65535):
             issues.append(f"[{name}] port {profile.port} out of range (1-65535)")
+
+        # DNS resolution (only when --resolve is passed)
+        if resolve and profile.host:
+            try:
+                socket.getaddrinfo(profile.host, profile.port, type=socket.SOCK_STREAM)
+                console.print(f"  [green]  ✓[/green] {profile.host}:{profile.port} resolves")
+            except socket.gaierror as e:
+                issues.append(f"[{name}] {profile.host}:{profile.port} — {e}")
+                console.print(f"  [red]  ✗[/red] {profile.host}:{profile.port} — {e}")
 
         # SSH key existence
         if profile.key:

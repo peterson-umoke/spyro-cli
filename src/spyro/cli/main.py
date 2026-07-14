@@ -49,20 +49,26 @@ from .commands import (
 )
 
 
-@click.group()
-@click.version_option(version=__version__, prog_name="spyro")
+@click.group(invoke_without_command=True)
+@click.option("--version", is_flag=True, is_eager=False, help="Show version and exit")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress non-error output")
 @click.option("--install-completion", is_flag=True, help="Install shell completion for your shell")
 @click.option("--show-completion", is_flag=True, help="Show shell completion script")
 @click.pass_context
-def main(ctx: click.Context, verbose: bool, quiet: bool, install_completion: bool, show_completion: bool) -> None:
+def main(ctx: click.Context, verbose: bool, quiet: bool, install_completion: bool, show_completion: bool, version: bool = False) -> None:
     """Spyro — Intelligent SSH tunneling & remote command CLI.
 
     Simplifies and secures connections between your local environment
     and remote servers through declarative configuration.
     """
     ctx.ensure_object(dict)
+
+    # Manual version handling (non-eager so subcommands can pass --version through)
+    if version and ctx.invoked_subcommand is None:
+        click.echo(f"spyro, version {__version__}")
+        ctx.exit()
+        return
 
     # Handle completion flags early
     if install_completion or show_completion:

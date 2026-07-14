@@ -276,6 +276,18 @@ def parse_config(path: Path) -> SpyroConfig:
         k: v for k, v in raw.items() if k != "profiles"
     }
 
+    # Coerce command_timeout from [defaults] if present
+    defaults = global_settings.get("defaults", {})
+    if isinstance(defaults, dict):
+        ct = defaults.get("command_timeout")
+        if ct is not None:
+            try:
+                defaults["command_timeout"] = float(ct)
+            except (TypeError, ValueError):
+                import sys
+                print(f"spyro: [defaults] command_timeout must be a number, got {ct!r}", file=sys.stderr)
+                sys.exit(1)
+
     config = SpyroConfig(
         profiles=profiles,
         global_settings=global_settings,
