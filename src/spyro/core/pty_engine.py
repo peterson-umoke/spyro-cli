@@ -33,8 +33,10 @@ _AUTH_PROMPTS = [
 ]
 
 _SUDO_PROMPTS = [
-    re.compile(r"\[sudo\]\s+password\s+for\s+.+:\s*$", re.IGNORECASE),
-    re.compile(r"sudo\s+password\s*:\s*$", re.IGNORECASE),
+    # sudo normally emits "[sudo] password for <user>: ", but the exact
+    # spacing and whether the user name is included can vary by platform.
+    re.compile(r"\[\s*sudo\s*\]\s*password(?:\s+for\s+[^:]+)?\s*:\s*$", re.IGNORECASE),
+    re.compile(r"sudo\s+password(?:\s+for\s+[^:]+)?\s*:\s*$", re.IGNORECASE),
 ]
 
 _HOST_KEY_PROMPTS = [
@@ -86,6 +88,10 @@ class PTYRunner:
         timeout: float = 30.0,
         env: dict[str, str] | None = None,
     ) -> int:
+        # Clear instance buffers (runner may be reused across profiles)
+        self._buffer = b""
+        self._line_buffer = b""
+
         # Wrap credentials in SecureCredential for memory zeroing
         sec_password = SecureCredential(password) if password else None
         sec_sudo = SecureCredential(sudo_password) if sudo_password else None
@@ -160,8 +166,9 @@ class PTYRunner:
         start = time.monotonic()
         eof_count = 0
         sent_password = False
-        sent_sudo = False
-
+        sudo_attempts = 0
+        max_sudo_attempts = 6
+        partial_since: float | None = None
         # Get password bytes once (before potential zeroing)
         pw_bytes = password.value if password and not password.zeroed else b""
         sudo_bytes = sudo_password.value if sudo_password and not sudo_password.zeroed else b""
@@ -196,10 +203,14 @@ class PTYRunner:
                         break
                     continue
                 eof_count = 0
+                if not self._buffer:
+                    partial_since = time.monotonic()
                 self._buffer += data
             except (OSError, BlockingIOError):
+                if not self._buffer:
+                    select.select([master_fd], [], [], 0.1)
+                    continue
                 select.select([master_fd], [], [], 0.1)
-                continue
 
             # Process complete lines
             while b"\n" in self._buffer:
@@ -209,25 +220,30 @@ class PTYRunner:
                 if on_output:
                     on_output(text)
 
-                line_str = strip_ansi(line).rstrip()
+                line_str = text.rstrip()
 
                 # Check for SSH host key prompt
                 if any(p.search(line_str) for p in _HOST_KEY_PROMPTS):
                     os.write(master_fd, b"yes\n")
                     continue
 
-                # Check for password prompts
+                # Sudo BEFORE generic auth: `_AUTH_PROMPTS[1]` matches the
+                # substring "password for user:" inside "[sudo] password for
+                # user: ", so we must intercept sudo prompts first.
+                if any(p.search(line_str) for p in _SUDO_PROMPTS):
+                    if not sudo_bytes:
+                        return self._abort_child(pid, 1)
+                    if sudo_attempts >= max_sudo_attempts:
+                        return self._abort_child(pid, 1)
+                    os.write(master_fd, sudo_bytes + b"\n")
+                    sudo_attempts += 1
+                    continue
+
+                # Check for SSH password prompts
                 if any(p.search(line_str) for p in _AUTH_PROMPTS):
                     if pw_bytes and not sent_password:
                         os.write(master_fd, pw_bytes + b"\n")
                         sent_password = True
-                    continue
-
-                # Check for sudo prompts
-                if any(p.search(line_str) for p in _SUDO_PROMPTS):
-                    if sudo_bytes and not sent_sudo:
-                        os.write(master_fd, sudo_bytes + b"\n")
-                        sent_sudo = True
                     continue
 
                 # Check for private key passphrase
@@ -237,27 +253,62 @@ class PTYRunner:
                         sent_password = True
                     continue
 
-            # Process any remaining buffer data (prompts without trailing newline)
+
+            if not self._buffer:
+                partial_since = None
+
+            # Process remaining data.  Prompt text is commonly emitted
+            # without a newline, so retain partial chunks long enough for a
+            # split prompt to arrive.  If it is still unmatched after a
+            # short idle period, emit it instead of hiding it indefinitely.
             if self._buffer:
                 buf_str = strip_ansi(self._buffer).rstrip()
+                if any(p.search(buf_str) for p in _HOST_KEY_PROMPTS):
+                    os.write(master_fd, b"yes\n")
+                    self._buffer = b""
+                    partial_since = None
+                    continue
+                # Sudo must be checked before generic auth (see note above).
+                if any(p.search(buf_str) for p in _SUDO_PROMPTS):
+                    if not sudo_bytes:
+                        if on_output:
+                            on_output(strip_ansi(self._buffer))
+                        return self._abort_child(pid, 1)
+                    if sudo_attempts >= max_sudo_attempts:
+                        if on_output:
+                            on_output(strip_ansi(self._buffer))
+                        return self._abort_child(pid, 1)
+                    os.write(master_fd, sudo_bytes + b"\n")
+                    sudo_attempts += 1
+                    self._buffer = b""
+                    partial_since = None
+                    continue
                 if any(p.search(buf_str) for p in _AUTH_PROMPTS):
                     if pw_bytes and not sent_password:
                         os.write(master_fd, pw_bytes + b"\n")
                         sent_password = True
                         self._buffer = b""
-                    continue
-                if any(p.search(buf_str) for p in _SUDO_PROMPTS):
-                    if sudo_bytes and not sent_sudo:
-                        os.write(master_fd, sudo_bytes + b"\n")
-                        sent_sudo = True
-                        self._buffer = b""
-                    continue
-                if any(p.search(buf_str) for p in _HOST_KEY_PROMPTS):
-                    os.write(master_fd, b"yes\n")
+                        partial_since = None
+                        continue
+                if (
+                    partial_since is not None
+                    and time.monotonic() - partial_since >= 0.5
+                ):
+                    if on_output:
+                        on_output(strip_ansi(self._buffer))
                     self._buffer = b""
-                    continue
+                    partial_since = None
 
         return 0
+
+    @staticmethod
+    def _abort_child(pid: int, exit_code: int) -> int:
+        """Terminate a child after an unrecoverable prompt interaction."""
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return exit_code
 
     def interactive_run(
         self,
@@ -274,6 +325,9 @@ class PTYRunner:
         enters raw relay mode connecting the remote PTY to the user's terminal.
         Terminal is restored on exit even if interrupted.
         """
+        self._buffer = b""
+        self._line_buffer = b""
+
         sec_password = SecureCredential(password) if password else None
         sec_sudo = SecureCredential(sudo_password) if sudo_password else None
 
@@ -414,15 +468,18 @@ class PTYRunner:
                             if any(p.search(line_str) for p in _HOST_KEY_PROMPTS):
                                 os.write(master_fd, b"yes\n")
                                 continue
-                            if any(p.search(line_str) for p in _AUTH_PROMPTS):
-                                if pw_bytes and not sent_password:
-                                    os.write(master_fd, pw_bytes + b"\n")
-                                    sent_password = True
-                                continue
+                            # Sudo before generic auth: _AUTH_PROMPTS[1]
+                            # matches "password for user:" inside "[sudo]
+                            # password for user:" — intercept sudo first.
                             if any(p.search(line_str) for p in _SUDO_PROMPTS):
                                 if sudo_bytes and not sent_sudo:
                                     os.write(master_fd, sudo_bytes + b"\n")
                                     sent_sudo = True
+                                continue
+                            if any(p.search(line_str) for p in _AUTH_PROMPTS):
+                                if pw_bytes and not sent_password:
+                                    os.write(master_fd, pw_bytes + b"\n")
+                                    sent_password = True
                                 continue
                             if any(p.search(line_str) for p in _PRIVATE_KEY_PROMPTS):
                                 if pw_bytes and not sent_password:
@@ -438,16 +495,16 @@ class PTYRunner:
                         # Check remaining buffer for prompt fragments
                         if self._buffer:
                             buf_str = strip_ansi(self._buffer).rstrip()
-                            if any(p.search(buf_str) for p in _AUTH_PROMPTS):
-                                if pw_bytes and not sent_password:
-                                    os.write(master_fd, pw_bytes + b"\n")
-                                    sent_password = True
-                                    self._buffer = b""
-                                    continue
                             if any(p.search(buf_str) for p in _SUDO_PROMPTS):
                                 if sudo_bytes and not sent_sudo:
                                     os.write(master_fd, sudo_bytes + b"\n")
                                     sent_sudo = True
+                                    self._buffer = b""
+                                    continue
+                            if any(p.search(buf_str) for p in _AUTH_PROMPTS):
+                                if pw_bytes and not sent_password:
+                                    os.write(master_fd, pw_bytes + b"\n")
+                                    sent_password = True
                                     self._buffer = b""
                                     continue
                             if any(p.search(buf_str) for p in _HOST_KEY_PROMPTS):
