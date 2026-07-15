@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spyro-cli"
-version = "0.8.12"
+version = "0.8.13"
 description = "Intelligent SSH tunneling & remote command CLI"
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1",
-    "rich>=13.0",
+    "rich>=15.0",
     "psutil>=5.9",
     "keyring>=24.0",
 ]
