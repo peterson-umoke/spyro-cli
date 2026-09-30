@@ -12,9 +12,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 
-def safe_quote(arg: str) -> str:
-    """Shell-escape *arg* via shlex.quote(). Prevents injection."""
-    return shlex.quote(arg)
+safe_quote = shlex.quote
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +23,7 @@ def safe_quote(arg: str) -> str:
 def ensure_private(path: Path, mode: int = 0o600) -> None:
     """Set file permissions to *mode* (default 0600). Creates if missing."""
     path.touch(exist_ok=True)
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    path.chmod(mode)
 
 
 # ---------------------------------------------------------------------------

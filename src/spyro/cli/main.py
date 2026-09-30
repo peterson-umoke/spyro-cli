@@ -72,66 +72,27 @@ def main(ctx: click.Context, verbose: bool, quiet: bool, install_completion: boo
 
     # Handle completion flags early
     if install_completion or show_completion:
-        shell = click.get_current_context().parent  # not needed here
-        import click.shell_completion as shcomp
-
-        # Determine shell
-        shell_name = ""
-        for var in ["SHELL", "ZSH_VERSION", "BASH_VERSION"]:
-            import os
-            val = os.environ.get(var, "")
-            if val:
-                if "zsh" in val.lower() or var == "ZSH_VERSION":
-                    shell_name = "zsh"
-                elif "bash" in val.lower() or var == "BASH_VERSION":
-                    shell_name = "bash"
-                elif "fish" in val.lower():
-                    shell_name = "fish"
-                elif "powershell" in val.lower() or "pwsh" in val.lower():
-                    shell_name = "powershell"
-                break
-
-        if not shell_name:
-            shell_name = os.environ.get("SHELL", "bash").split("/")[-1] or "bash"
-
-        # Click 8.x built-in completion
         from click.shell_completion import get_completion_class
+        import os
 
-        comp_cls = get_completion_class(shell_name)
-        if comp_cls is None:
-            click.echo(f"Unsupported shell: {shell_name}", err=True)
+        shell = os.environ.get("SHELL", "bash").split("/")[-1]
+        for name in ["zsh", "bash", "fish"]:
+            if name in shell or f"{name.upper()}_VERSION" in os.environ:
+                shell = name
+                break
+        comp_cls = get_completion_class(shell)
+        if not comp_cls:
+            click.echo(f"Unsupported shell: {shell}", err=True)
             sys.exit(1)
-
-        comp = comp_cls(ctx.find_root(), {}, "spyro", f"_SPYRO_COMPLETE")
-
-        if install_completion:
-            # Recommend how to install
-            source_cmd = {
-                "bash": f"eval \"$({sys.executable} -m spyro.cli.main --show-completion)\"",
-                "zsh": f"eval \"$({sys.executable} -m spyro.cli.main --show-completion)\"",
-                "fish": f"{sys.executable} -m spyro.cli.main --show-completion | source",
-                "powershell":
-                    f'{sys.executable} -m spyro.cli.main --show-completion | Out-String | Invoke-Expression',
-            }.get(shell_name, "")
-
-            if shell_name == "zsh":
-                click.echo("# Add this to your ~/.zshrc:")
-            elif shell_name == "bash":
-                click.echo("# Add this to your ~/.bashrc:")
-            elif shell_name == "fish":
-                click.echo("# Add this to your ~/.config/fish/config.fish:")
-            elif shell_name == "powershell":
-                click.echo("# Add this to your PowerShell profile:")
-
-            click.echo(source_cmd)
-            click.echo("\n[yellow]Then restart your shell or source the file.[/yellow]")
+        comp = comp_cls(ctx.find_root(), {}, "spyro", "_SPYRO_COMPLETE")
+        if show_completion:
+            click.echo(comp.source())
         else:
-            # Show completion script
-            script = comp.source()
-            click.echo(script)
-
+            configs = {"zsh": "~/.zshrc", "bash": "~/.bashrc", "fish": "~/.config/fish/config.fish"}
+            target = configs.get(shell, f"~/.{shell}rc")
+            click.echo(f"# Add to {target}:")
+            click.echo(f'eval "$({sys.executable} -m spyro.cli.main --show-completion)"')
         sys.exit(0)
-
     level = logging.DEBUG if verbose else (logging.WARNING if quiet else logging.INFO)
     logging.basicConfig(
         level=level,

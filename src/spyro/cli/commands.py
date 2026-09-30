@@ -33,7 +33,7 @@ from ..supervisor.state import (
     all_tunnels,
     get_tunnel,
 )
-from ..supervisor.tunnel import TunnelManager, TunnelSupervisor
+from ..supervisor.tunnel import TunnelManager
 from ..utils.paths import safe_quote
 
 console = Console()
@@ -666,62 +666,12 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
 @click.option("--profile", "-p", required=True, help="Profile name")
 def cmd_watch(src: str, dest: str, profile: str) -> None:
     """Sync local file changes to remote server in real-time."""
-    import time
-
-    try:
-        from watchdog.events import FileSystemEventHandler
-        from watchdog.observers import Observer
-    except ImportError:
-        console.print("[red]watchdog not installed. Run: pip install watchdog[/red]")
-        return
-
-    config = load_config()
-    p = config.get_profile(profile)
-
     src_path = Path(src).resolve()
     if not src_path.exists():
         console.print(f"[red]Source path does not exist: {src}[/red]")
         return
-
-    console.print(f"[cyan]Watching {src} -> {p.host}:{dest}[/cyan] (Ctrl+C to stop)")
-
-    class SyncHandler(FileSystemEventHandler):
-        def on_any_event(self, event: object) -> None:
-            time.sleep(0.1)
-
-            src_file = Path(event.src_path)  # type: ignore[attr-defined]
-            if src_file.is_dir():
-                return
-            rel = src_file.relative_to(src_path)
-            remote_dest = f"{p.host}:{dest}/{rel}"
-
-            scp_args = build_scp_args(
-                src=str(src_file),
-                dest=remote_dest,
-                host=p.host,
-                user=p.user,
-                port=p.port,
-                key=p.key,
-                recursive=False,
-            )
-
-            try:
-                subprocess.run(scp_args, capture_output=True, timeout=10)
-                console.print(f"  [green]Synced: {rel}[/green]")
-            except Exception as e:
-                console.print(f"  [red]Sync failed: {rel}: {e}[/red]")
-
-    observer = Observer()
-    observer.schedule(SyncHandler(), str(src_path), recursive=True)
-    observer.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
-
+    pin = SyncPin(local_path=str(src_path), remote_path=dest, profile=profile)
+    _run_sync_watch(profile, [pin], dry_run=False)
 
 # ---------------------------------------------------------------------------
 # spyro proxy-url
@@ -932,13 +882,9 @@ def cmd_pins(json_output: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-@click.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
-@click.option("--dry-run", is_flag=True, help="Show what would be synced without uploading")
-def cmd_sync(profile: str, dry_run: bool) -> None:
-    """Watch pinned directories and auto-sync to remote server."""
+def _run_sync_watch(profile: str, pins: list[SyncPin], dry_run: bool = False) -> None:
+    """Internal helper to watch directory pins using watchdog."""
     import time
-
     try:
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
@@ -949,9 +895,6 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
     config = load_config()
     p = config.get_profile(profile)
 
-    all_pins = load_pins()
-    pins = [pin for pin in all_pins if pin.profile == profile]
-
     if not pins:
         console.print(f"[yellow]No pinned directories for profile '{profile}'[/yellow]")
         console.print("Use 'spyro pin <local> <remote> -p <profile>' to add one.")
@@ -959,7 +902,7 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
 
     console.print(f"[cyan]Syncing {len(pins)} pinned director(y/ies) for {profile}[/cyan]")
     for pin in pins:
-        exclude_files, exclude_dirs = pin.get_all_excludes()
+        exclude_files, _ = pin.get_all_excludes()
         console.print(f"  {pin.local_path} -> {pin.remote_path} ({len(exclude_files)} exclude patterns)")
 
     if dry_run:
@@ -972,9 +915,7 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
         def on_any_event(self, event: object) -> None:
             if event.is_directory:  # type: ignore[attr-defined]
                 return
-
             src = Path(event.src_path)  # type: ignore[attr-defined]
-
             matched_pin = None
             for pin in pins:
                 local = Path(pin.local_path)
@@ -984,7 +925,6 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
                     break
                 except ValueError:
                     continue
-
             if not matched_pin:
                 return
 
@@ -996,7 +936,6 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
 
             local_base = Path(matched_pin.local_path)
             exclude_files, exclude_dirs = matched_pin.get_all_excludes()
-
             if should_exclude(src, local_base, exclude_files, exclude_dirs, matched_pin.include_patterns):
                 if dry_run:
                     console.print(f"  [dim]Skipped (excluded): {src.relative_to(local_base)}[/dim]")
@@ -1004,13 +943,11 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
 
             rel = src.relative_to(local_base)
             remote_dest = f"{p.host}:{matched_pin.remote_path}/{rel}"
-
             if dry_run:
                 console.print(f"  [green]Would sync: {rel}[/green]")
                 return
 
             scp_args = build_scp_args(src=str(src), dest=remote_dest, host=p.host, user=p.user, port=p.port, key=p.key, recursive=False)
-
             try:
                 proc = subprocess.run(scp_args, capture_output=True, timeout=15)
                 if proc.returncode == 0:
@@ -1029,7 +966,6 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
 
     observer.start()
     console.print("\n[cyan]Syncing... (Ctrl+C to stop)[/cyan]\n")
-
     try:
         while True:
             time.sleep(1)
@@ -1037,6 +973,15 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
         observer.stop()
     observer.join()
 
+
+@click.command()
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--dry-run", is_flag=True, help="Show what would be synced without uploading")
+def cmd_sync(profile: str, dry_run: bool) -> None:
+    """Watch pinned directories and auto-sync to remote server."""
+    all_pins = load_pins()
+    pins = [pin for pin in all_pins if pin.profile == profile]
+    _run_sync_watch(profile, pins, dry_run=dry_run)
 
 # ---------------------------------------------------------------------------
 # spyro wp
@@ -1469,23 +1414,16 @@ def list_credentials() -> None:
 
 
 
-def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0, cli_timeout: float | None = None) -> int:
-    """Run a command via SSH with PTY auth for a profile.
-
-    timeout     — hardcoded default (used when neither CLI nor config set)
-    cli_timeout — optional override from a Click --timeout option
-
-    Returns the exit code.
-    """
+def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0, cli_timeout: float | None = None, show_exit_code: bool = True) -> int:
+    """Run a command via SSH with PTY auth for a profile."""
     config = load_config()
     p = config.get_profile(profile)
     runner = PTYRunner()
     resolved = _get_timeout(config, cli_timeout, timeout)
 
-    # Check if command requires sudo but profile doesn't have sudo access
     if not p.sudo and "sudo" in cmd:
         console.print(f"[red]  ✗ User '{p.user}' does not have sudo access on {profile}[/red]")
-        console.print(f"[yellow]  Set sudo = true in your spyro.toml for this profile[/yellow]")
+        console.print("[yellow]  Set sudo = true in your spyro.toml for this profile[/yellow]")
         return 1
 
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
@@ -1501,9 +1439,11 @@ def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0, cli_timeout: flo
     def output_line(line: str) -> None:
         console.print(f"  {line}")
 
-    return runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-                      on_output=output_line, timeout=resolved)
-
+    ec = runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+                    on_output=output_line, timeout=resolved)
+    if ec != 0 and show_exit_code:
+        console.print(f"  [red]Exit code: {ec}[/red]")
+    return ec
 
 @click.group()
 def cmd_supervisor() -> None:
@@ -1514,9 +1454,8 @@ def cmd_supervisor() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def status(profile: str) -> None:
     """Show Supervisor process status."""
-    ec = _run_svc_cmd(profile, "sudo supervisorctl status")
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "sudo supervisorctl status")
+
 
 @cmd_supervisor.command()
 @click.argument("process", default="all")
@@ -1524,9 +1463,7 @@ def status(profile: str) -> None:
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 60)")
 def restart(profile: str, process: str, timeout: float | None) -> None:
     """Restart Supervisor process(es). Default: all."""
-    ec = _run_svc_cmd(profile, f"sudo supervisorctl restart {process}", timeout=60, cli_timeout=timeout)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"sudo supervisorctl restart {process}", timeout=60, cli_timeout=timeout)
 
 
 @cmd_supervisor.command()
@@ -1534,9 +1471,7 @@ def restart(profile: str, process: str, timeout: float | None) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def start(profile: str, process: str) -> None:
     """Start a Supervisor process."""
-    ec = _run_svc_cmd(profile, f"sudo supervisorctl start {process}")
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"sudo supervisorctl start {process}")
 
 
 @cmd_supervisor.command()
@@ -1544,9 +1479,7 @@ def start(profile: str, process: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def stop(profile: str, process: str) -> None:
     """Stop a Supervisor process."""
-    ec = _run_svc_cmd(profile, f"sudo supervisorctl stop {process}")
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"sudo supervisorctl stop {process}")
 
 
 @cmd_supervisor.command()
@@ -1555,10 +1488,7 @@ def stop(profile: str, process: str) -> None:
 @click.option("--lines", "-n", default=50, help="Number of lines to tail")
 def tail(profile: str, process: str, lines: int) -> None:
     """Tail Supervisor process stderr log."""
-    ec = _run_svc_cmd(profile, f"sudo supervisorctl tail -{lines} {process} 2>/dev/null || sudo supervisorctl tail {process}")
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
-
+    _run_svc_cmd(profile, f"sudo supervisorctl tail -{lines} {process} 2>/dev/null || sudo supervisorctl tail {process}")
 
 # ---------------------------------------------------------------------------
 # spyro redis — Redis CLI wrapper
@@ -1574,9 +1504,7 @@ def cmd_redis() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def ping(profile: str) -> None:
     """Ping Redis server."""
-    ec = _run_svc_cmd(profile, "redis-cli ping", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "redis-cli ping", timeout=10)
 
 
 @cmd_redis.command()
@@ -1584,10 +1512,7 @@ def ping(profile: str) -> None:
 @click.option("--section", "-s", default="", help="Info section (server, stats, keyspace, etc.)")
 def info(profile: str, section: str) -> None:
     """Show Redis server info."""
-    cmd = f"redis-cli info {section}".strip()
-    ec = _run_svc_cmd(profile, cmd, timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"redis-cli info {section}".strip(), timeout=10)
 
 
 @cmd_redis.command()
@@ -1595,20 +1520,14 @@ def info(profile: str, section: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def cli(profile: str, command: tuple[str, ...]) -> None:
     """Run an arbitrary redis-cli command."""
-    cmd_str = " ".join(safe_quote(a) for a in command)
-    ec = _run_svc_cmd(profile, f"redis-cli {cmd_str}", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"redis-cli {' '.join(safe_quote(a) for a in command)}", timeout=10)
 
 
 @cmd_redis.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def stats(profile: str) -> None:
     """Show Redis key metrics (connections, commands, keyspace)."""
-    ec = _run_svc_cmd(profile, 'redis-cli info stats | grep -E "^(total_connections|total_commands|keyspace_|instantaneous)"', timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
-
+    _run_svc_cmd(profile, 'redis-cli info stats | grep -E "^(total_connections|total_commands|keyspace_|instantaneous)"', timeout=10)
 
 # ---------------------------------------------------------------------------
 # spyro php — PHP CLI and FPM management
@@ -1624,18 +1543,16 @@ def cmd_php() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def version(profile: str) -> None:
     """Show PHP version."""
-    ec = _run_svc_cmd(profile, "php -v 2>/dev/null | head -3", timeout=10)
-    if ec != 0:
-        ec = _run_svc_cmd(profile, "php --version 2>/dev/null | head -3", timeout=10)
+    if _run_svc_cmd(profile, "php -v 2>/dev/null | head -3", timeout=10, show_exit_code=False) != 0:
+        _run_svc_cmd(profile, "php --version 2>/dev/null | head -3", timeout=10)
 
 
 @cmd_php.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def fpm_status(profile: str) -> None:
     """Show PHP-FPM status (pools, processes)."""
-    ec = _run_svc_cmd(profile, 'php-fpm -tt 2>/dev/null || (echo "PHP-FPM config test:" && pgrep -af "php-fpm" 2>/dev/null || echo "not running")', timeout=10)
-    if ec != 0:
-        ec = _run_svc_cmd(profile, "pgrep -af 'php-fpm' 2>/dev/null || echo 'PHP-FPM not running'", timeout=10)
+    if _run_svc_cmd(profile, 'php-fpm -tt 2>/dev/null || (echo "PHP-FPM config test:" && pgrep -af "php-fpm" 2>/dev/null || echo "not running")', timeout=10, show_exit_code=False) != 0:
+        _run_svc_cmd(profile, "pgrep -af 'php-fpm' 2>/dev/null || echo 'PHP-FPM not running'", timeout=10)
 
 
 @cmd_php.command()
@@ -1646,9 +1563,8 @@ def extensions(profile: str, filter: str) -> None:
     cmd = "php -m 2>/dev/null | tail -n +2"
     if filter:
         cmd += f" | grep -i {safe_quote(filter)}"
-    ec = _run_svc_cmd(profile, cmd, timeout=10)
-    if ec != 0:
-        ec = _run_svc_cmd(profile, "php -m 2>/dev/null || echo 'PHP not available'", timeout=10)
+    if _run_svc_cmd(profile, cmd, timeout=10, show_exit_code=False) != 0:
+        _run_svc_cmd(profile, "php -m 2>/dev/null || echo 'PHP not available'", timeout=10)
 
 
 @cmd_php.command()
@@ -1659,19 +1575,15 @@ def info(profile: str, option: str) -> None:
     cmd = "php -i 2>/dev/null"
     if option:
         cmd += f" | grep -i {safe_quote(option)}"
-    ec = _run_svc_cmd(profile, cmd, timeout=15)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, cmd, timeout=15)
+
 
 @cmd_php.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart PHP-FPM."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart php*-fpm 2>/dev/null || sudo service php*-fpm restart 2>/dev/null || (echo 'Trying sudo kill -USR2...' && sudo kill -USR2 $(pgrep -f 'php-fpm: master' | head -1) 2>/dev/null || echo 'Could not restart PHP-FPM')", timeout=30, cli_timeout=timeout)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
-
+    _run_svc_cmd(profile, "sudo systemctl restart php*-fpm 2>/dev/null || sudo service php*-fpm restart 2>/dev/null || (echo 'Trying sudo kill -USR2...' && sudo kill -USR2 $(pgrep -f 'php-fpm: master' | head -1) 2>/dev/null || echo 'Could not restart PHP-FPM')", timeout=30, cli_timeout=timeout)
 
 # ---------------------------------------------------------------------------
 # spyro apache — Apache web server management
@@ -1687,36 +1599,28 @@ def cmd_apache() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def version(profile: str) -> None:
     """Show Apache version."""
-    ec = _run_svc_cmd(profile, "apache2 -v 2>/dev/null || httpd -v 2>/dev/null || echo 'Apache not found'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "apache2 -v 2>/dev/null || httpd -v 2>/dev/null || echo 'Apache not found'", timeout=10)
 
 
 @cmd_apache.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def modules(profile: str) -> None:
     """List loaded Apache modules."""
-    ec = _run_svc_cmd(profile, "apache2 -M 2>/dev/null || httpd -M 2>/dev/null || echo 'Apache not found'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "apache2 -M 2>/dev/null || httpd -M 2>/dev/null || echo 'Apache not found'", timeout=10)
 
 
 @cmd_apache.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def status(profile: str) -> None:
     """Show Apache server status."""
-    ec = _run_svc_cmd(profile, "apache2ctl status 2>/dev/null || apachectl status 2>/dev/null || (pgrep -x apache2 >/dev/null && echo 'Apache running' || echo 'Apache not running')", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "apache2ctl status 2>/dev/null || apachectl status 2>/dev/null || (pgrep -x apache2 >/dev/null && echo 'Apache running' || echo 'Apache not running')", timeout=10)
 
 
 @cmd_apache.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def sites(profile: str) -> None:
     """List enabled Apache virtual hosts."""
-    ec = _run_svc_cmd(profile, "ls -1 /etc/apache2/sites-enabled/ 2>/dev/null || ls -1 /etc/httpd/sites-enabled/ 2>/dev/null || echo 'No sites-enabled found'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "ls -1 /etc/apache2/sites-enabled/ 2>/dev/null || ls -1 /etc/httpd/sites-enabled/ 2>/dev/null || echo 'No sites-enabled found'", timeout=10)
 
 
 @cmd_apache.command()
@@ -1724,10 +1628,7 @@ def sites(profile: str) -> None:
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart Apache."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart apache2 2>/dev/null || sudo systemctl restart httpd 2>/dev/null || sudo service apache2 restart 2>/dev/null || sudo service httpd restart 2>/dev/null || echo 'Could not restart Apache'", timeout=30, cli_timeout=timeout)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
-
+    _run_svc_cmd(profile, "sudo systemctl restart apache2 2>/dev/null || sudo systemctl restart httpd 2>/dev/null || sudo service apache2 restart 2>/dev/null || sudo service httpd restart 2>/dev/null || echo 'Could not restart Apache'", timeout=30, cli_timeout=timeout)
 # ---------------------------------------------------------------------------
 # spyro nginx — Nginx web server management
 # ---------------------------------------------------------------------------
@@ -1741,27 +1642,21 @@ def cmd_nginx() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def version(profile: str) -> None:
     """Show Nginx version."""
-    ec = _run_svc_cmd(profile, "nginx -v 2>&1 || echo 'Nginx not found'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "nginx -v 2>&1 || echo 'Nginx not found'", timeout=10)
 
 
 @cmd_nginx.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def status(profile: str) -> None:
     """Show Nginx server status."""
-    ec = _run_svc_cmd(profile, "nginx -t 2>&1 && (pgrep -x nginx >/dev/null && echo 'Nginx running' || echo 'Nginx not running')", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "nginx -t 2>&1 && (pgrep -x nginx >/dev/null && echo 'Nginx running' || echo 'Nginx not running')", timeout=10)
 
 
 @cmd_nginx.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def sites(profile: str) -> None:
     """List enabled Nginx site configs."""
-    ec = _run_svc_cmd(profile, "ls -1 /etc/nginx/sites-enabled/ 2>/dev/null || ls -1 /etc/nginx/conf.d/ 2>/dev/null || echo 'No site configs found'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "ls -1 /etc/nginx/sites-enabled/ 2>/dev/null || ls -1 /etc/nginx/conf.d/ 2>/dev/null || echo 'No site configs found'", timeout=10)
 
 
 @cmd_nginx.command()
@@ -1769,10 +1664,7 @@ def sites(profile: str) -> None:
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart Nginx."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart nginx 2>/dev/null || sudo service nginx restart 2>/dev/null || sudo nginx -s reload 2>/dev/null || echo 'Could not restart Nginx'", timeout=30, cli_timeout=timeout)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
-
+    _run_svc_cmd(profile, "sudo systemctl restart nginx 2>/dev/null || sudo service nginx restart 2>/dev/null || sudo nginx -s reload 2>/dev/null || echo 'Could not restart Nginx'", timeout=30, cli_timeout=timeout)
 
 # ---------------------------------------------------------------------------
 # spyro caddy — Caddy web server management
@@ -1788,18 +1680,14 @@ def cmd_caddy() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def version(profile: str) -> None:
     """Show Caddy version."""
-    ec = _run_svc_cmd(profile, "caddy version 2>&1 || echo 'Caddy not found'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "caddy version 2>&1 || echo 'Caddy not found'", timeout=10)
 
 
 @cmd_caddy.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
 def status(profile: str) -> None:
     """Show Caddy server status."""
-    ec = _run_svc_cmd(profile, "(pgrep -x caddy >/dev/null || pgrep -f 'caddy run' >/dev/null) && (caddy version 2>/dev/null || echo 'running') || echo 'Caddy not running'", timeout=10)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, "(pgrep -x caddy >/dev/null || pgrep -f 'caddy run' >/dev/null) && (caddy version 2>/dev/null || echo 'running') || echo 'Caddy not running'", timeout=10)
 
 
 @cmd_caddy.command()
@@ -1807,10 +1695,7 @@ def status(profile: str) -> None:
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart Caddy."""
-    ec = _run_svc_cmd(profile, "sudo systemctl restart caddy 2>/dev/null || sudo service caddy restart 2>/dev/null || (sudo kill -USR1 $(pgrep -x caddy | head -1) 2>/dev/null && echo 'Sent reload signal') || echo 'Could not restart Caddy'", timeout=30, cli_timeout=timeout)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
-
+    _run_svc_cmd(profile, "sudo systemctl restart caddy 2>/dev/null || sudo service caddy restart 2>/dev/null || (sudo kill -USR1 $(pgrep -x caddy | head -1) 2>/dev/null && echo 'Sent reload signal') || echo 'Could not restart Caddy'", timeout=30, cli_timeout=timeout)
 
 # ---------------------------------------------------------------------------
 # spyro tinker — Laravel Tinker REPL

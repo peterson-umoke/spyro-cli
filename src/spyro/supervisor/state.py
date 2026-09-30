@@ -113,7 +113,7 @@ def mark_running(profile: str) -> None:
     state = get_tunnel(profile)
     if state:
         state.status = "running"
-        state.last_keepalive = _now()
+        state.last_keepalive = datetime.now(timezone.utc).isoformat()
         set_tunnel(state)
 
 
@@ -125,23 +125,20 @@ def mark_stopped(profile: str) -> None:
         set_tunnel(state)
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Process cleanup
-# ---------------------------------------------------------------------------
-
-
-def _pgid_exists(pgid: int) -> bool:
-    """Check if a process group still exists."""
+def _pgid_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
         return True
     except (OSError, ProcessLookupError):
         return False
-
 
 def kill_tunnels(profiles: list[str] | None = None) -> int:
     """Kill tunnel processes for given profiles (or all).
@@ -154,7 +151,7 @@ def kill_tunnels(profiles: list[str] | None = None) -> int:
     for name, state in tunnels.items():
         if profiles and name not in profiles:
             continue
-        if state.pgid and _pgid_exists(state.pgid):
+        if state.pgid and _pgid_alive(state.pgid):
             try:
                 os.killpg(state.pgid, signal.SIGTERM)
                 killed += 1
@@ -181,7 +178,7 @@ def cleanup_stale() -> list[str]:
     for name, state in tunnels.items():
         alive = False
         if state.pgid:
-            alive = _pgid_exists(state.pgid)
+            alive = _pgid_alive(state.pgid)
         if not alive and state.pid:
             alive = _pid_alive(state.pid)
 
@@ -192,10 +189,3 @@ def cleanup_stale() -> list[str]:
 
     return cleaned
 
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False

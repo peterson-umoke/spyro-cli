@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
-from spyro.security.memory import SecureCredential, SecureString
+from spyro.security.memory import SecureCredential
 
 
 def test_basic_zeroing():
@@ -122,32 +122,6 @@ def test_del_zeros():
     print("  [PASS] __del__ triggers zero")
     return True
 
-
-def test_secure_string():
-    """Test SecureString variant."""
-    print("\n" + "=" * 60)
-    print("TEST: SecureString")
-    print("=" * 60)
-
-    ss = SecureString("string-secret")
-    assert not ss.zeroed
-    assert ss.value == "string-secret"
-    assert ss.bytes_value == b"string-secret"
-    print(f"  Created: {ss}")
-
-    ss.zero()
-    assert ss.zeroed
-    print(f"  After zero: {ss}")
-
-    try:
-        _ = ss.value
-        print("  [FAIL] Expected RuntimeError")
-        return False
-    except RuntimeError:
-        print("  [PASS] SecureString works correctly")
-        return True
-
-
 def test_no_lingering_refs():
     """Test that zeroing doesn't leave string references."""
     print("\n" + "=" * 60)
@@ -185,7 +159,6 @@ def main():
     results.append(("Multiple zero calls", test_multiple_zero_calls()))
     results.append(("Empty credential", test_empty_credential()))
     results.append(("__del__ trigger", test_del_zeros()))
-    results.append(("SecureString", test_secure_string()))
     results.append(("No lingering refs", test_no_lingering_refs()))
 
     print("\n" + "=" * 60)

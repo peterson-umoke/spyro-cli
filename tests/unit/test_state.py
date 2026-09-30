@@ -140,3 +140,17 @@ def _state_file_path() -> str:
     """Helper to get the current state file path."""
     from spyro.supervisor.state import _state_path
     return str(_state_path())
+
+
+class TestProcessHelpers:
+    def test_pid_and_pgid_alive(self):
+        import os
+        from spyro.supervisor.state import _pid_alive, _pgid_alive
+
+        # Current process and process group are alive
+        assert _pid_alive(os.getpid()) is True
+        assert _pgid_alive(os.getpgrp()) is True
+
+        # Nonexistent PID/PGID
+        assert _pid_alive(999999) is False
+        assert _pgid_alive(999999) is False

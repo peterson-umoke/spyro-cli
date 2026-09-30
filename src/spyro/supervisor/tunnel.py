@@ -17,16 +17,12 @@ import subprocess
 import time
 from pathlib import Path
 
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-
 from ..utils.config import ProfileConfig, SpyroConfig
 from ..utils.paths import spyro_home
 from .state import (
     TunnelState,
+    _pgid_alive,
+    _pid_alive,
     get_tunnel,
     mark_running,
     mark_stopped,
@@ -68,79 +64,6 @@ def _resolve_port(preferred: int) -> int:
 
     raise RuntimeError(f"No available port found starting from {preferred}")
 
-
-# ---------------------------------------------------------------------------
-# Process helpers (psutil-enhanced)
-# ---------------------------------------------------------------------------
-
-
-def _pid_alive_psutil(pid: int) -> bool:
-    """Check if PID is alive using psutil (preferred)."""
-    if HAS_PSUTIL:
-        try:
-            proc = psutil.Process(pid)
-            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return False
-    return _pid_alive(pid)
-
-
-def _pgid_alive_psutil(pgid: int) -> bool:
-    """Check if process group is alive using psutil."""
-    if HAS_PSUTIL:
-        try:
-            # Find all processes in the group
-            for proc in psutil.process_iter(["pid", "ppid"]):
-                try:
-                    if proc.ppid() == pgid or proc.pid == pgid:
-                        return True
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            return False
-        except Exception:
-            pass
-    return _pgid_alive(pgid)
-
-
-def _kill_process_tree(pid: int, sig: int = signal.SIGTERM) -> bool:
-    """Kill a process and all its children using psutil."""
-    if HAS_PSUTIL:
-        try:
-            parent = psutil.Process(pid)
-            children = parent.children(recursive=True)
-            for child in children:
-                try:
-                    child.send_signal(sig)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            parent.send_signal(sig)
-            return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return False
-    # Fallback to os.kill
-    try:
-        os.kill(pid, sig)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-def _pgid_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Tunnel lifecycle
 # ---------------------------------------------------------------------------
@@ -161,7 +84,7 @@ class TunnelManager:
         # Check if already running
         existing = get_tunnel(profile_name)
         if existing and existing.status == "running":
-            if _pid_alive_psutil(existing.pid):
+            if _pid_alive(existing.pid):
                 log.info(f"Tunnel for '{profile_name}' already running (PID {existing.pid})")
                 return existing
 
@@ -277,9 +200,7 @@ class TunnelManager:
         stopped = False
 
         # Use psutil to kill process tree if available
-        if state.pgid and HAS_PSUTIL:
-            stopped = _kill_process_tree(state.pgid, signal.SIGTERM)
-        elif state.pgid and _pgid_alive(state.pgid):
+        if state.pgid and _pgid_alive(state.pgid):
             try:
                 os.killpg(state.pgid, signal.SIGTERM)
                 stopped = True
@@ -332,7 +253,7 @@ class TunnelManager:
             if profile_name and name != profile_name:
                 continue
 
-            alive = _pid_alive_psutil(state.pid) if state.pid else False
+            alive = _pid_alive(state.pid) if state.pid else False
 
             if alive and state.status == "running":
                 state.status = "running"
@@ -349,102 +270,3 @@ class TunnelManager:
 
         return result
 
-
-# ---------------------------------------------------------------------------
-# STS: Spyro Tunnel Supervisor (self-healing)
-# ---------------------------------------------------------------------------
-
-
-class TunnelSupervisor:
-    """Self-healing tunnel supervisor.
-
-    Monitors tunnel health and restarts failed tunnels with exponential
-    backoff. Handles network roaming, DNS refresh, and sleep-wake cycles.
-    """
-
-    def __init__(self, config: SpyroConfig, check_interval: int = 30) -> None:
-        self.config = config
-        self.manager = TunnelManager(config)
-        self.check_interval = check_interval
-        self._backoff: dict[str, float] = {}
-        self._max_backoff = 300.0  # 5 minutes
-        self._running = False
-
-    def run(self) -> None:
-        """Run the supervisor loop. Blocks until interrupted."""
-        self._running = True
-        log.info("Spyro Tunnel Supervisor started")
-
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-
-        while self._running:
-            try:
-                self._check_and_heal()
-            except Exception as e:
-                log.error(f"Supervisor check failed: {e}")
-
-            time.sleep(self.check_interval)
-
-        log.info("Spyro Tunnel Supervisor stopped")
-
-    def _check_and_heal(self) -> None:
-        """Check tunnel health and restart any that are down."""
-        from .state import all_tunnels
-
-        tunnels = all_tunnels()
-
-        for name, state in tunnels.items():
-            if state.status != "running":
-                continue
-
-            alive = _pid_alive_psutil(state.pid) if state.pid else False
-
-            if not alive:
-                log.warning(f"Tunnel '{name}' is dead, restarting...")
-                self._restart_tunnel(name)
-                continue
-
-            # Check port connectivity
-            if state.local_port and not _port_available(state.local_port):
-                if not _check_port_connectivity(state.local_port):
-                    log.warning(
-                        f"Tunnel '{name}' port {state.local_port} "
-                        "unresponsive, restarting..."
-                    )
-                    self._restart_tunnel(name)
-
-    def _restart_tunnel(self, name: str) -> None:
-        """Restart a failed tunnel with exponential backoff."""
-        backoff = self._backoff.get(name, 1.0)
-
-        log.info(f"Restarting tunnel '{name}' (backoff: {backoff:.0f}s)")
-        time.sleep(backoff)
-
-        try:
-            self.manager.stop(name)
-            self.manager.start(name)
-            self._backoff[name] = 1.0  # Reset on success
-            log.info(f"Tunnel '{name}' restarted successfully")
-        except Exception as e:
-            log.error(f"Failed to restart tunnel '{name}': {e}")
-            self._backoff[name] = min(backoff * 2, self._max_backoff)
-
-    def _handle_signal(self, signum: int, frame: object) -> None:
-        log.info(f"Received signal {signum}, shutting down...")
-        self._running = False
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _check_port_connectivity(port: int) -> bool:
-    """Quick check if something is listening on *port*."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
-            return s.connect_ex(("127.0.0.1", port)) == 0
-    except Exception:
-        return False

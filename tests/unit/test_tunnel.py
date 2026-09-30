@@ -44,3 +44,11 @@ class TestResolvePort:
             port = _resolve_port(taken)
             assert port != taken
             assert port > 0
+
+
+class TestTunnelArchitecture:
+    def test_supervisor_yagni_removed(self):
+        import spyro.supervisor.tunnel as tun
+        assert not hasattr(tun, "HAS_PSUTIL")
+        assert not hasattr(tun, "_pid_alive_psutil")
+        assert not hasattr(tun, "TunnelSupervisor")

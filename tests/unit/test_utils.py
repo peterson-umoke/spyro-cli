@@ -108,3 +108,22 @@ class TestSpyroHome:
         home = spyro_home()
         assert home.exists()
         assert home == Path.home() / ".spyro"
+
+
+class TestSecureCredential:
+    def test_handles_str_and_bytes(self):
+        from spyro.security.memory import SecureCredential
+        import spyro.security.memory as mem
+
+        cred_str = SecureCredential("secret_str")
+        assert cred_str.value == b"secret_str"
+        cred_str.zero()
+        assert cred_str.zeroed
+
+        cred_bytes = SecureCredential(b"secret_bytes")
+        assert cred_bytes.value == b"secret_bytes"
+        cred_bytes.zero()
+        assert cred_bytes.zeroed
+
+        # SecureString should be deleted (YAGNI/redundant)
+        assert not hasattr(mem, "SecureString")
