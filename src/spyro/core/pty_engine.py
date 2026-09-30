@@ -33,7 +33,7 @@ from ..utils.paths import sockets_dir
 # Anchored to the start of the line so that a *remote program's* prompt
 # ("Enter password:", "mysql> password:") never receives the SSH password.
 _AUTH_PROMPTS = [
-    re.compile(r"^[^\s@]+@\S+'s password\s*:\s*$", re.IGNORECASE),  # user@host's password:
+    re.compile(r"[^\s@]+@\S+'s password\s*:\s*$", re.IGNORECASE),  # user@host's password: (may follow banner text)
     re.compile(r"^(?:\([^)]*\)\s*)?password\s*:\s*$", re.IGNORECASE),  # Password: / (u@h) Password:
     re.compile(r"^password\s+for\s+\S+\s*:\s*$", re.IGNORECASE),  # Password for u@h:
 ]
@@ -270,6 +270,12 @@ class PTYRunner:
                 sudo_attempts += 1
                 return True
             if _matches(_AUTH_PROMPTS, text) or _matches(_PRIVATE_KEY_PROMPTS, text):
+                if sent_password and sudo_bytes and sudo_attempts < 2:
+                    # A second plain "Password:" after a successful login is how
+                    # BSD/macOS sudo prompts; the profile has one password for both.
+                    os.write(master_fd, sudo_bytes + b"\n")
+                    sudo_attempts += 1
+                    return True
                 if not pw_bytes or sent_password:
                     # Nothing (more) to send: fail now instead of idling
                     # until the timeout.
@@ -445,6 +451,7 @@ class PTYRunner:
         # for a password prompt that's never coming.
         _received_output = False
         got_data = False
+        stdin_open = True
 
         pw_bytes = password.value if password and not password.zeroed else b""
         sudo_bytes = sudo_password.value if sudo_password and not sudo_password.zeroed else b""
@@ -540,17 +547,16 @@ class PTYRunner:
 
                 # Detect auth phase complete.
                 if not auth_done and got_data:
-                    # If the remote already sent shell output (MOTD, prompt,
-                    # etc.) without us ever seeing a password prompt, key-based
-                    # SSH auth succeeded — don't wait for a prompt that's
-                    # never coming.
-                    auto_auth = _received_output and not sent_password and not sent_sudo
-                    # A sudo prompt, if there is one, follows the login
-                    # immediately. A remote that has gone quiet is just a
-                    # shell (plain `spyro ssh`): stop waiting for sudo.
+                    # "Quiet" = the remote showed us something (MOTD, a shell
+                    # prompt) and then went silent. A password or sudo prompt
+                    # follows the connection within milliseconds, so this means
+                    # no more prompts are coming: key auth worked, or it is
+                    # just a shell waiting for input.
                     quiet = time.monotonic() - last_data > 1.0 and (_received_output or bool(self._buffer))
-                    ssh_done = not has_auth or sent_password or auto_auth
-                    if ssh_done and (not has_sudo or sent_sudo or auto_auth or quiet):
+                    # Answering a sudo prompt proves the login already succeeded.
+                    logged_in = not has_auth or sent_password or sent_sudo or quiet
+                    sudo_done = not has_sudo or sent_sudo or quiet
+                    if logged_in and sudo_done:
                         auth_done = True
                         # Flush buffered output
                         remaining = strip_ansi(self._buffer)
@@ -561,13 +567,19 @@ class PTYRunner:
                 # Forward user stdin → PTY (after auth)
                 if auth_done:
                     try:
-                        rlist, _, _ = select.select([fd_stdin, master_fd], [], [], 0.05)
-                        if fd_stdin in rlist:
+                        watch = [master_fd] + ([fd_stdin] if stdin_open else [])
+                        rlist, _, _ = select.select(watch, [], [], 0.05)
+                        if stdin_open and fd_stdin in rlist:
                             input_data = os.read(fd_stdin, 4096)
                             if not input_data:
-                                # EOF from user
-                                break
-                            _write_all(master_fd, input_data)
+                                # EOF from the user (piped input ran out): send
+                                # Ctrl+D like a terminal would, but keep relaying
+                                # until the remote finishes, so its output for
+                                # what we just sent is not thrown away.
+                                _write_all(master_fd, b"\x04")
+                                stdin_open = False
+                            else:
+                                _write_all(master_fd, input_data)
                     except (OSError, BlockingIOError, ValueError):
                         pass
                 else:

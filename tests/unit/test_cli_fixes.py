@@ -360,14 +360,20 @@ class TestDump:
         rec = json.loads(fake.read_text())
         assert rec["stdin_pw"] == "s3cret"
         assert "s3cret" not in " ".join(rec["args"])
-        assert "BatchMode=yes" in rec["args"] and "read -r MYSQL_PWD" in rec["args"][-1]
+        assert "BatchMode=yes" in rec["args"]
+        assert rec["args"][-1].startswith("sh -c ") and "read -r MYSQL_PWD" in rec["args"][-1]
 
     def test_where_and_table_names_are_shell_quoted(self, fake):
         invoke("db", "dump", "-p", "a", "-o", "out.sql", "-t", "users;touch /tmp/pwned", "-w", "id > 100")
-        cmd = json.loads(fake.read_text())["args"][-1]
-        assert "--where 'id > 100'" in cmd
-        assert "'users;touch /tmp/pwned'" in cmd
-        assert "-P3306" in cmd
+        import shlex
+
+        outer = json.loads(fake.read_text())["args"][-1]
+        assert outer.startswith("sh -c ")
+        cmd = shlex.split(outer)[2]                       # what sh will actually parse
+        argv = shlex.split(cmd.split("&& ")[-1])
+        assert argv[argv.index("--where") + 1] == "id > 100"
+        assert "users;touch /tmp/pwned" in argv           # one literal argument, not a command
+        assert "-P3306" in argv
 
     def test_gzip_output_is_a_valid_gzip_of_the_raw_stream(self, fake):
         import gzip
@@ -461,3 +467,64 @@ def test_watch_uploads_as_the_profile_user_creates_dirs_and_skips_secrets(projec
     assert any(c[-1] == "mkdir -p /var/www/site/sub" for c in cmds)
     scp = [c for c in cmds if c[0] == "scp"]
     assert [c[-1] for c in scp] == ["u@h.example.com:/var/www/site/sub/page.php"]   # user@ present; no .env, no session
+
+
+# ---------------------------------------------------------------------------
+# review follow-ups
+# ---------------------------------------------------------------------------
+
+
+def test_sudo_user_can_read_the_uploaded_file(project, tmp_path):
+    script = tmp_path / "s.php"
+    script.write_text("<?php")
+    runner_cls = MagicMock()
+    runner_cls.return_value.run.return_value = 0
+    with patch.object(commands, "PTYRunner", runner_cls):
+        invoke("script", str(script), "-p", "a")
+    cmds = [c.args[0][-1] for c in runner_cls.return_value.run.call_args_list]
+    chmod = [c for c in cmds if c.startswith("chmod 644 /tmp/spyro-script-")]
+    assert len(chmod) == 1
+    assert cmds.index(chmod[0]) < next(i for i, c in enumerate(cmds) if "sudo -u www-data php" in c)
+
+
+def test_no_chmod_when_running_as_root_or_login_user(project, tmp_path):
+    script = tmp_path / "s.php"
+    script.write_text("<?php")
+    runner_cls = MagicMock()
+    runner_cls.return_value.run.return_value = 0
+    with patch.object(commands, "PTYRunner", runner_cls):
+        invoke("script", str(script), "-p", "plain")
+    assert not any(c.args[0][-1].startswith("chmod") for c in runner_cls.return_value.run.call_args_list)
+
+
+def test_watch_uploads_the_final_write_not_the_first(project, tmp_path):
+    """Format-on-save: a second write 100ms after the first must not be dropped."""
+    pytest.importorskip("watchdog")
+    src = tmp_path / "site"
+    src.mkdir()
+    pin = commands.SyncPin(local_path=str(src), remote_path="/r", profile="a", framework="laravel")
+    uploaded: list[str] = []
+
+    def fake_run(argv, **kw):
+        if argv[0] == "scp":
+            uploaded.append(Path(argv[-2]).read_text())   # what is on disk at upload time
+        return 0
+
+    runner_cls = MagicMock()
+    runner_cls.return_value.run.side_effect = fake_run
+    stop = threading.Event()
+    with patch.object(commands, "PTYRunner", runner_cls):
+        t = threading.Thread(target=commands._run_sync_watch, args=("a", [pin]), kwargs={"stop": stop})
+        t.start()
+        time.sleep(1.0)
+        f = src / "a.php"
+        f.write_text("first")
+        time.sleep(0.1)
+        f.write_text("first-second")
+        deadline = time.time() + 10
+        while time.time() < deadline and "first-second" not in uploaded:
+            time.sleep(0.1)
+        stop.set()
+        t.join(10)
+    assert uploaded and uploaded[-1] == "first-second"
+    assert len(uploaded) == 1                              # coalesced into one upload

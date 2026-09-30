@@ -144,7 +144,7 @@ class TestKeychainHeadless:
 
         monkeypatch.delenv("SPYRO_PASSWORD", raising=False)
         monkeypatch.setattr(keychain, "get_credential", lambda *a: None)
-        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        monkeypatch.setattr(keychain, "_can_prompt", lambda: False)
         monkeypatch.setattr(getpass, "getpass", lambda *a: (_ for _ in ()).throw(AssertionError("prompted")))
         assert keychain.prompt_for_credential("p", "u") == ""
 
@@ -185,3 +185,24 @@ class TestSocketsDir:
                     d.rmdir()
                 except OSError:
                     pass
+
+
+class TestCanPrompt:
+    def test_piped_stdin_with_a_controlling_tty_can_still_prompt(self, monkeypatch):
+        """getpass falls back to /dev/tty, so `echo x | spyro ...` from a terminal must prompt."""
+        from spyro.utils import keychain
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        monkeypatch.setattr(keychain.os, "open", lambda *a, **k: 99)
+        monkeypatch.setattr(keychain.os, "close", lambda fd: None)
+        assert keychain._can_prompt() is True
+
+    def test_no_stdin_tty_and_no_dev_tty_means_no_prompt(self, monkeypatch):
+        from spyro.utils import keychain
+
+        def no_tty(*a, **k):
+            raise OSError("no controlling terminal")
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        monkeypatch.setattr(keychain.os, "open", no_tty)
+        assert keychain._can_prompt() is False

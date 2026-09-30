@@ -287,3 +287,11 @@ class TestConfigErrors:
         cfg = parse_config(generate_config(tmp_path / "spyro.toml"))
         for p in cfg.profiles.values():
             assert p.db.port in p.forwarded_ports
+
+
+def test_string_forwarded_ports_is_an_error_not_digits(tmp_path):
+    f = tmp_path / "spyro.toml"
+    f.write_text('[profiles.a]\nhost = "h"\nforwarded_ports = "3306"\n')
+    with pytest.raises(SystemExit) as e:
+        parse_config(f)
+    assert "forwarded_ports must be a list" in str(e.value)

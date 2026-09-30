@@ -936,9 +936,6 @@ def _run_sync_watch(
         scp read of a file (an "opened" event on Linux) trigger another upload.
         """
 
-        def __init__(self) -> None:
-            self._debounce: dict[str, float] = {}
-
         def _queue(self, path: str, is_directory: bool) -> None:
             if is_directory:
                 return
@@ -948,10 +945,7 @@ def _run_sync_watch(
                     src.relative_to(pin.local_path)
                 except ValueError:
                     continue
-                now = time.monotonic()
-                if now - self._debounce.get(path, 0.0) >= 0.3:
-                    self._debounce[path] = now
-                    changed.put((src, pin))
+                changed.put((src, pin))
                 return
 
         def on_created(self, event: object) -> None:
@@ -1013,13 +1007,22 @@ def _run_sync_watch(
 
     observer.start()
     console.print("\n[cyan]Syncing... (Ctrl+C to stop)[/cyan]\n")
+    # Trailing-edge debounce: a file is uploaded once it has been quiet for
+    # SETTLE seconds, so a formatter rewriting it right after a save is picked
+    # up (a leading-edge debounce would upload the first write and drop the last).
+    settle = 0.3
+    pending: dict[Path, tuple[SyncPin, float]] = {}
     try:
         while not (stop and stop.is_set()):
             try:
-                src, pin = changed.get(timeout=0.5)
-            except queue.Empty:
+                src, pin = changed.get(timeout=0.1)
+                pending[src] = (pin, time.monotonic())
                 continue
-            upload(src, pin)
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            for src in [p_ for p_, (_, t) in pending.items() if now - t >= settle]:
+                upload(src, pending.pop(src)[0])
     except KeyboardInterrupt:
         pass
     finally:
@@ -1694,6 +1697,14 @@ def _upload_and_run(
         return 1
 
     try:
+        if p.sudo and p.sudo_user and not no_escalate:
+            # scp keeps the local mode (eval's temp file is 0600) and sudo_user
+            # is a different account than the one that owns the upload.
+            runner.run(
+                build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+                + [f"chmod 644 {safe_quote(tmp_remote)}"],
+                password=ssh_pw, timeout=10,
+            )
         command = f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}{build_cmd(safe_quote(tmp_remote))}"
         return _run_svc_cmd(
             profile, command, timeout=timeout,
@@ -2190,6 +2201,9 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
     remote_cmd = " ".join(safe_quote(a) for a in parts)
     if db.password:
         remote_cmd = "IFS= read -r MYSQL_PWD && export MYSQL_PWD && " + remote_cmd
+    # Whatever the account's login shell is (csh and fish reject `IFS=` and
+    # `&&` chains), run it under POSIX sh.
+    remote_cmd = f"sh -c {safe_quote(remote_cmd)}"
 
     if output:
         output_path = Path(output).expanduser().resolve()

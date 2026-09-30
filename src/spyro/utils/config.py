@@ -239,6 +239,9 @@ def _parse_db(raw: dict[str, Any] | None) -> DatabaseConfig:
 
 
 def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
+    for key in ("forwarded_ports", "env_files"):
+        if not isinstance(raw.get(key, []), list):  # "3306" would iterate as 3, 3, 0, 6
+            raise TypeError(f"{key} must be a list, e.g. {key} = [...]")
     return ProfileConfig(
         name=name,
         host=raw["host"],

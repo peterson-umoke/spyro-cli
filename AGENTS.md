@@ -34,7 +34,7 @@ Spyro is a Python CLI tool for SSH tunneling, remote command execution, and data
 - **`supervisor/tunnel.py`** — TunnelManager: `ssh -f -N -L` through the PTY engine (ControlMaster per tunnel), verified before success is reported; `stop()` uses the control socket and only signals a PID that is still ssh/spyro. No restart loop: a dead tunnel shows as `stale`
 - **`supervisor/state.py`** — TunnelState dataclass, JSON persistence via `~/.spyro/tunnels.json` (flock + atomic write), `tunnel_alive()` PID identity check
 - **`security/memory.py`** — `SecureCredential`: mutable `bytearray` wrapper with triple-pass zeroing (zero → random → zero), context manager support, destructor-based cleanup
-- **`security/ansi.py`** — `strip_ansi()` (`sanitize_output` is an alias): strips every escape sequence, C1 controls, CR, NUL, BEL; defends against terminal injection from remote output
+- **`security/ansi.py`** — `strip_ansi()` (`sanitize_output` is an alias): strips every escape sequence, C1 controls, NUL, BEL and resolves CR; defends against terminal injection from remote output
 - **`utils/config.py`** — `SpyroConfig`/`ProfileConfig`/`DatabaseConfig` dataclasses, `spyro.toml` parsing via `tomllib`, SSH config (`~/.ssh/config`) inheritance
 - **`utils/keychain.py`** — OS keychain wrapper via `keyring` library (`spyro-cli` service), with `prompt_for_credential()` fallback chain: `SPYRO_PASSWORD[_<PROFILE>]` env → keychain → getpass prompt (only on a tty) → store
 - **`utils/paths.py`** — `discover_config()` (walks up from cwd for `spyro.toml`), `spyro_home()` (`~/.spyro/`), `safe_quote()` for shell argument escaping

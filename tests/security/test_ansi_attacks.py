@@ -138,7 +138,7 @@ ATTACKS = [
     (
         "Carriage-return line spoofing",
         b"Permission denied\rLogin OK",
-        "Permission deniedLogin OK",
+        "Login OK",
     ),
     (
         "8-bit C1 CSI introducer",
@@ -178,6 +178,9 @@ def test_attack_payload_is_neutralised(name, payload, expected):
         ("", ""),
         ("\x1b[31m\x1b[0m", ""),
         ("CRLF line\r\n", "CRLF line\n"),
+        ("big.bin 10%\rbig.bin 50%\rbig.bin 100%\n", "big.bin 100%\n"),
+        ("ends with cr\r", "ends with cr"),
+        ("[prof] ok\r[prof] SPOOF", "[prof] SPOOF"),
     ],
 )
 def test_strip_ansi_preserves_content(text, expected):

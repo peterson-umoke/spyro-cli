@@ -161,19 +161,19 @@ def tunnel_alive(state: TunnelState) -> bool:
     """True if the tunnel's process exists *and is still ours*.
 
     PIDs are recycled (after a reboot ``tunnels.json`` still holds old ones),
-    so existence alone is not enough: the process must still be an ssh (daemon
-    tunnel) or spyro (foreground tunnel) command.
+    so existence alone is not enough: the process must still be the ssh master
+    we started, recognised by its ``.../tun-<hash>`` ControlPath argument.
     """
     if not state.pid or not _pid_alive(state.pid):
         return False
     try:
         cmd = subprocess.run(
-            ["ps", "-p", str(state.pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(state.pid), "-o", "command="],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return True  # cannot tell; do not declare a working tunnel dead
-    return "ssh" in cmd or "spyro" in cmd
+    return "ssh" in cmd and "/tun-" in cmd
 
 
 def cleanup_stale() -> list[str]:

@@ -199,20 +199,36 @@ class TunnelManager:
         password: str,
         on_ready: Callable[[TunnelState], None] | None,
     ) -> TunnelState:
-        """Run the tunnel attached to this terminal until ssh exits (Ctrl+C)."""
-        args = ssh_args + ["-o", "ControlMaster=no", "-o", "ControlPath=none", target]
-        # The recorded PID is ours: `spyro down` from another terminal
-        # terminates this process, which closes the PTY and ends ssh.
-        state = self._new_state(profile, local_ports, os.getpid())
-        set_tunnel(state)
+        """Start the tunnel, then hold this terminal until Ctrl+C (or `spyro down`).
+
+        Authentication goes through the same PTY path as a daemon tunnel; an
+        interactive PTY session would treat a silent `ssh -N` as "still logging
+        in" and kill it at the auth timeout.
+        """
+        state = self._start_daemon(profile, ssh_args, target, local_ports, password)
         if on_ready:
             on_ready(state)
+
+        # Ctrl+C, `kill` and a closed terminal (SIGHUP) all end the tunnel:
+        # a foreground tunnel must not outlive its terminal as an orphaned ssh.
+        def _interrupt(*_: object) -> None:
+            raise KeyboardInterrupt
+
+        previous = {}
         try:
-            exit_code = PTYRunner().interactive_run(args, password=password, timeout=30.0)
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                previous[sig] = signal.signal(sig, _interrupt)
+        except ValueError:  # not the main thread (tests); default handling applies
+            pass
+        try:
+            while tunnel_alive(state):
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
         finally:
-            mark_stopped(profile.name)
-        if exit_code not in (0, 130, 255):
-            raise RuntimeError(f"ssh exited with code {exit_code}")
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+            self.stop(profile.name)
         return state
 
     def _start_daemon(
@@ -227,6 +243,7 @@ class TunnelManager:
         log_dir = spyro_home() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         ctl = _control_path(profile.name)
+        self._clear_stale_master(ctl, target)
 
         args = ssh_args + ["-f", "-o", "ControlMaster=yes", "-o", f"ControlPath={ctl}", target]
         output: list[str] = []
@@ -251,6 +268,24 @@ class TunnelManager:
         set_tunnel(state)
         log.info(f"Daemon started: PID={pid}")
         return state
+
+    @classmethod
+    def _clear_stale_master(cls, ctl: str, target: str) -> None:
+        """Remove what a previous tunnel left at *ctl*.
+
+        A leftover socket (kill -9, reboot) makes ssh say "ControlSocket already
+        exists, disabling multiplexing": it then runs a master nobody can find
+        or stop. A *live* master that state does not track (an interrupted
+        `up`) would be mistaken for the new one, so it is shut down first.
+        """
+        if not os.path.exists(ctl):
+            return
+        if cls._master_pid(ctl, target):
+            cls._exit_master(ctl, target)
+        try:
+            os.unlink(ctl)
+        except FileNotFoundError:
+            pass
 
     @staticmethod
     def _master_pid(ctl: str, target: str) -> int:

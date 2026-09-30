@@ -320,3 +320,38 @@ class TestExitStatusIsNeverLost:
 
     def test_interactive_returns_the_real_exit_code(self):
         assert PTYRunner().interactive_run(["sh", "-c", "exit 9"], timeout=5.0) == 9
+
+
+class TestInteractiveInput:
+    def test_output_for_piped_input_is_not_lost_when_stdin_ends(self, tmp_path):
+        """stdin hitting EOF right after the last command must not cut the session
+        before the remote has answered (used to return with no output)."""
+        import io
+        import os
+        import sys
+        from unittest.mock import patch
+
+        code = (
+            "import sys,time;"
+            "sys.stdout.write('ready\\n');sys.stdout.flush();"
+            "line=sys.stdin.readline().strip();time.sleep(0.4);"
+            "sys.stdout.write('ANSWER:'+line+'\\n');sys.stdout.flush();"
+            "sys.stdin.read()"
+        )
+        r, w = os.pipe()
+        os.write(w, b"hello\n")
+        os.close(w)
+        out_r, out_w = os.pipe()
+
+        class Fake:
+            def __init__(self, fd): self._fd = fd
+            def fileno(self): return self._fd
+
+        with patch.object(sys, "stdin", Fake(r)), patch.object(sys, "stdout", Fake(out_w)):
+            ec = PTYRunner().interactive_run([sys.executable, "-c", code], timeout=10.0)
+        os.close(out_w)
+        data = b""
+        while chunk := os.read(out_r, 4096):
+            data += chunk
+        assert ec == 0
+        assert b"ANSWER:hello" in data

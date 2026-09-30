@@ -417,7 +417,7 @@ spyro status staging             # Show staging tunnel details
 
 **Tunnel behavior:**
 - Runs as a background `ssh` (survives terminal close); `spyro up` authenticates with your keychain password and only reports success once the forwarded ports accept connections, otherwise it prints ssh's own error and exits 1
-- `--no-daemon` keeps it in the foreground (Ctrl+C stops it)
+- `--no-daemon` keeps it in the foreground (Ctrl+C, `kill` or closing the terminal stops it)
 - Not self-healing: if the connection drops, `spyro status` shows it as `stale` and `spyro up` (or any `db` command) starts a fresh one
 - State in `~/.spyro/tunnels.json`; `spyro down` stops a tunnel through its ssh control socket and only ever signals a PID that is still an ssh/spyro process
 
@@ -941,7 +941,7 @@ The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default
 | Concern | Mitigation |
 |---------|------------|
 | Credential exposure | `SecureCredential` wraps passwords in `bytearray`, zeros with triple-pass (zero → random → zero) after use (best effort in Python) |
-| Terminal injection | `strip_ansi()` strips all CSI/OSC/DCS/ESC sequences, C1 controls, CR, NUL, BEL and BS from remote output before it is printed; remote text is also never parsed as Rich markup |
+| Terminal injection | `strip_ansi()` strips all CSI/OSC/DCS/ESC sequences, C1 controls, NUL, BEL and BS from remote output and resolves carriage returns before it is printed; remote text is also never parsed as Rich markup |
 | Shell injection | All user input passed through `shlex.quote()` |
 | Config file permissions | Enforces `0600` on `spyro.toml` if it contains passwords |
 | Keychain storage | Uses `keyring` library for native OS secure stores (macOS Keychain, Linux Secret Service) |

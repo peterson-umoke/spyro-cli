@@ -31,6 +31,18 @@ def _env_credential(profile: str) -> Optional[str]:
     return os.environ.get(name) or os.environ.get("SPYRO_PASSWORD") or None
 
 
+def _can_prompt() -> bool:
+    """True if a person can be asked: stdin is a terminal, or there is a /dev/tty
+    (getpass reads from it even when stdin is piped). False in CI and cron."""
+    if sys.stdin.isatty():
+        return True
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR))
+        return True
+    except OSError:
+        return False
+
+
 def _keyring_available() -> bool:
     """Check if keyring is usable."""
     try:
@@ -158,9 +170,9 @@ def prompt_for_credential(
     if cached:
         return cached
 
-    # Nobody to ask (CI, cron, pipes): don't hang or crash on getpass.
-    if not sys.stdin.isatty():
-        log.debug("No stored credential for %s@%s and stdin is not a tty", username, profile)
+    # Nobody to ask (CI, cron): don't hang or crash on getpass.
+    if not _can_prompt():
+        log.debug("No stored credential for %s@%s and no terminal to ask on", username, profile)
         return ""
 
     # Prompt user

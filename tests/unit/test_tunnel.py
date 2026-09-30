@@ -235,13 +235,63 @@ class TestTunnelLifecycle:
         with pytest.raises(RuntimeError, match="no forwarded_ports"):
             mgr.start("a")
 
-    def test_foreground_reports_ready_then_marks_stopped(self, fake_ssh):
+    def test_foreground_holds_until_the_tunnel_is_stopped(self, fake_ssh):
+        import threading
+        import time
         from spyro.supervisor.state import get_tunnel
 
-        seen = []
-        _manager(_free_port()).start("a", foreground=True, on_ready=seen.append)
-        assert len(seen) == 1 and seen[0].status == "running"
-        assert get_tunnel("a").status == "stopped"
+        port = _free_port()
+        mgr = _manager(port)
+        ready = threading.Event()
+        done = threading.Event()
+
+        def run():
+            mgr.start("a", foreground=True, on_ready=lambda st: ready.set())
+            done.set()
+
+        t = threading.Thread(target=run)
+        t.start()
+        assert ready.wait(10) and _listening(port)
+        time.sleep(1.5)
+        assert not done.is_set()                      # still holding the terminal
+        _manager(port).stop("a")                      # e.g. `spyro down` from another terminal
+        assert done.wait(10)
+        t.join(5)
+        assert not _listening(port) and get_tunnel("a").status == "stopped"
+
+    def test_stale_control_socket_does_not_leak_an_untracked_ssh(self, fake_ssh):
+        """kill -9 / reboot leaves the socket behind; the next `up` must still work
+        and leave exactly one recorded tunnel."""
+        import os
+        import signal
+        import time
+
+        port = _free_port()
+        mgr = _manager(port)
+        first = mgr.start("a")
+        os.kill(first.pid, signal.SIGKILL)            # socket file stays on disk
+        time.sleep(0.3)
+        assert os.path.exists(first.control_path)
+
+        second = mgr.start("a")
+        assert second.pid != first.pid and _listening(port)
+        assert mgr.stop("a") is True and not _listening(port)
+
+    def test_untracked_live_master_is_replaced_not_adopted(self, fake_ssh):
+        import os
+        import time
+        from spyro.supervisor.state import remove_tunnel
+
+        port = _free_port()
+        mgr = _manager(port)
+        first = mgr.start("a")
+        remove_tunnel("a")                            # e.g. Ctrl+C left state without an entry
+        second = mgr.start("a")
+        assert second.pid != first.pid
+        time.sleep(0.3)
+        with pytest.raises(OSError):
+            os.kill(first.pid, 0)                     # the old master was shut down
+        mgr.stop("a")
 
 
 class TestDbLocalPort:

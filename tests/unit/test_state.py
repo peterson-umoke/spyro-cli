@@ -159,9 +159,11 @@ class TestProcessHelpers:
 
         tun = TunnelState(profile="a", local_port=1, pid=os.getpid(), status="running")
         for command, expected in [
-            ("ssh -f -N -L 3306:127.0.0.1:3306 d@h", True),
-            ("/usr/bin/python /x/bin/spyro up --no-daemon", True),
+            ("ssh -f -N -L 3306:127.0.0.1:3306 -o ControlPath=/h/.spyro/sockets/tun-0123456789abcdef d@h", True),
             ("/usr/sbin/cron -f", False),
+            ("/usr/bin/ssh-agent -l", False),
+            ("vim /home/me/.ssh/config", False),
+            ("/usr/bin/python /x/bin/spyro up --no-daemon", False),  # spyro itself is not the tunnel
         ]:
             monkeypatch.setattr(
                 st.subprocess, "run", lambda *a, _c=command, **k: SimpleNamespace(stdout=_c + "\n")
