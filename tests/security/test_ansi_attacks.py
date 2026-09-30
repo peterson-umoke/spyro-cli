@@ -125,6 +125,26 @@ ATTACKS = [
         b"\x07\x07\x07output",
         "output",
     ),
+    (
+        "Terminal reset (ESC c)",
+        b"before\x1bcafter",
+        "beforeafter",
+    ),
+    (
+        "Save/restore cursor + keypad mode",
+        b"a\x1b7b\x1b8c\x1b=d\x1b>e",
+        "abcde",
+    ),
+    (
+        "Carriage-return line spoofing",
+        b"Permission denied\rLogin OK",
+        "Permission deniedLogin OK",
+    ),
+    (
+        "8-bit C1 CSI introducer",
+        "red\u009b31mtext".encode("utf-8"),
+        "red31mtext",
+    ),
 ]
 
 
@@ -132,116 +152,47 @@ ATTACKS = [
 # Tests
 # ---------------------------------------------------------------------------
 
-
-def test_all_attacks():
-    """Run all attack payloads through sanitization."""
-    print("=" * 60)
-    print("Malicious ANSI Escape Sequence Tests")
-    print("=" * 60)
-
-    passed = 0
-    failed = 0
-
-    for name, payload, expected in ATTACKS:
-        result = sanitize_output(payload)
-
-        # Normalize: strip ANSI, check no ESC bytes remain
-        has_esc = "\x1b" in result
-        has_bell = "\x07" in result
-
-        # Check expected content is preserved
-        content_ok = expected in result if expected else True
-
-        # Check no escape sequences remain
-        clean = not has_esc and not has_bell
-
-        if clean and content_ok:
-            print(f"  [PASS] {name}")
-            passed += 1
-        else:
-            print(f"  [FAIL] {name}")
-            if has_esc:
-                print(f"         ESC bytes remain: {result!r}")
-            if has_bell:
-                print(f"         BEL bytes remain: {result!r}")
-            if not content_ok:
-                print(f"         Expected: {expected!r}")
-                print(f"         Got:      {result!r}")
-            failed += 1
-
-    print(f"\n  Total: {passed} passed, {failed} failed")
-    return failed == 0
+import pytest
 
 
-def test_strip_ansi_preserves_content():
-    """Verify strip_ansi preserves all non-escape content."""
-    print("\n" + "=" * 60)
-    print("Content Preservation Tests")
-    print("=" * 60)
+@pytest.mark.parametrize("name,payload,expected", ATTACKS, ids=[a[0] for a in ATTACKS])
+def test_attack_payload_is_neutralised(name, payload, expected):
+    """Every payload loses all escape/control bytes but keeps its content."""
+    for fn in (sanitize_output, strip_ansi):
+        result = fn(payload)
+        assert "\x1b" not in result, f"ESC remains: {result!r}"
+        assert "\x07" not in result, f"BEL remains: {result!r}"
+        assert "\r" not in result, f"CR remains: {result!r}"
+        assert not any("\x80" <= c <= "\x9f" for c in result), f"C1 remains: {result!r}"
+        assert expected in result, f"expected {expected!r}, got {result!r}"
 
-    cases = [
-        ("plain text", "hello world", "hello world"),
-        ("with newlines", "line1\nline2\nline3", "line1\nline2\nline3"),
-        ("with unicode", "café résumé", "café résumé"),
-        ("with numbers", "port 3306", "port 3306"),
-        ("empty string", "", ""),
-        ("only escapes", "\x1b[31m\x1b[0m", ""),
-    ]
 
-    passed = 0
-    for name, input_text, expected in cases:
-        result = strip_ansi(input_text)
-        if result == expected:
-            print(f"  [PASS] {name}")
-            passed += 1
-        else:
-            print(f"  [FAIL] {name}: expected {expected!r}, got {result!r}")
-
-    print(f"\n  Total: {passed}/{len(cases)} passed")
-    return passed == len(cases)
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("hello world", "hello world"),
+        ("line1\nline2\nline3", "line1\nline2\nline3"),
+        ("col1\tcol2", "col1\tcol2"),
+        ("café résumé", "café résumé"),
+        ("port 3306", "port 3306"),
+        ("", ""),
+        ("\x1b[31m\x1b[0m", ""),
+        ("CRLF line\r\n", "CRLF line\n"),
+    ],
+)
+def test_strip_ansi_preserves_content(text, expected):
+    assert strip_ansi(text) == expected
 
 
 def test_bytes_input():
-    """Test with bytes input (raw PTY output)."""
-    print("\n" + "=" * 60)
-    print("Bytes Input Tests")
-    print("=" * 60)
-
-    payload = b"\x1b[31mERROR\x1b[0m: connection refused\n"
-    result = sanitize_output(payload)
-
-    if "\x1b" not in result and "ERROR" in result and "connection refused" in result:
-        print("  [PASS] Bytes input sanitized correctly")
-        return True
-    else:
-        print(f"  [FAIL] Bytes input: {result!r}")
-        return False
+    """Raw PTY bytes are decoded and sanitized."""
+    result = sanitize_output(b"\x1b[31mERROR\x1b[0m: connection refused\n")
+    assert result == "ERROR: connection refused\n"
 
 
 def main():
-    """Run all security tests."""
-    print("\nSpyro Security Tests — ANSI Escape Sanitization")
-    print("=" * 60)
-
-    results = []
-    results.append(("Attack payloads", test_all_attacks()))
-    results.append(("Content preservation", test_strip_ansi_preserves_content()))
-    results.append(("Bytes input", test_bytes_input()))
-
-    print("\n" + "=" * 60)
-    print("SUMMARY:")
-    all_pass = True
-    for name, passed in results:
-        status = "PASS" if passed else "FAIL"
-        print(f"  [{status}] {name}")
-        if not passed:
-            all_pass = False
-
-    if all_pass:
-        print("\nAll security tests passed.")
-    else:
-        print("\nSome security tests FAILED!")
-        sys.exit(1)
+    """Script mode: python tests/security/test_ansi_attacks.py"""
+    sys.exit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))
 
 
 if __name__ == "__main__":

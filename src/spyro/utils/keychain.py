@@ -6,18 +6,29 @@ This module wraps the `keyring` library to provide:
 - Storing one password per profile:user in the OS keychain
 - Retrieving them when needed
 - Graceful fallback to getpass prompts when keychain is unavailable
+- ``SPYRO_PASSWORD_<PROFILE>`` / ``SPYRO_PASSWORD`` environment variables for
+  headless hosts and CI, where no OS keychain exists
 """
 
 from __future__ import annotations
 
 import getpass
 import logging
+import os
+import re
+import sys
 from typing import Optional
 
 log = logging.getLogger("spyro.keychain")
 
 # Keyring service name
 SERVICE_NAME = "spyro-cli"
+
+
+def _env_credential(profile: str) -> Optional[str]:
+    """Password from ``SPYRO_PASSWORD_<PROFILE>`` (non-word chars -> ``_``) or ``SPYRO_PASSWORD``."""
+    name = "SPYRO_PASSWORD_" + re.sub(r"\W", "_", profile).upper()
+    return os.environ.get(name) or os.environ.get("SPYRO_PASSWORD") or None
 
 
 def _keyring_available() -> bool:
@@ -79,6 +90,10 @@ def get_credential(
     Returns:
         The password if found, None otherwise.
     """
+    env_pw = _env_credential(profile)
+    if env_pw:
+        return env_pw
+
     if not _keyring_available():
         return None
 
@@ -142,6 +157,11 @@ def prompt_for_credential(
     cached = get_credential(profile, username)
     if cached:
         return cached
+
+    # Nobody to ask (CI, cron, pipes): don't hang or crash on getpass.
+    if not sys.stdin.isatty():
+        log.debug("No stored credential for %s@%s and stdin is not a tty", username, profile)
+        return ""
 
     # Prompt user
     password = getpass.getpass(f"  password for {username}@{profile}: ")

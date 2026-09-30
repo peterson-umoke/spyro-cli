@@ -143,14 +143,57 @@ def _state_file_path() -> str:
 
 
 class TestProcessHelpers:
-    def test_pid_and_pgid_alive(self):
+    def test_pid_alive(self):
         import os
-        from spyro.supervisor.state import _pid_alive, _pgid_alive
+        from spyro.supervisor.state import _pid_alive
 
-        # Current process and process group are alive
         assert _pid_alive(os.getpid()) is True
-        assert _pgid_alive(os.getpgrp()) is True
-
-        # Nonexistent PID/PGID
         assert _pid_alive(999999) is False
-        assert _pgid_alive(999999) is False
+
+    def test_tunnel_alive_requires_our_process(self, monkeypatch):
+        """A recycled PID that now belongs to some other program is not our tunnel."""
+        import os
+        import subprocess
+        from types import SimpleNamespace
+        from spyro.supervisor import state as st
+
+        tun = TunnelState(profile="a", local_port=1, pid=os.getpid(), status="running")
+        for command, expected in [
+            ("ssh -f -N -L 3306:127.0.0.1:3306 d@h", True),
+            ("/usr/bin/python /x/bin/spyro up --no-daemon", True),
+            ("/usr/sbin/cron -f", False),
+        ]:
+            monkeypatch.setattr(
+                st.subprocess, "run", lambda *a, _c=command, **k: SimpleNamespace(stdout=_c + "\n")
+            )
+            assert st.tunnel_alive(tun) is expected, command
+
+        assert st.tunnel_alive(TunnelState(profile="a", local_port=1, pid=999999)) is False
+
+    def test_cleanup_stale_marks_dead_and_recycled(self, monkeypatch):
+        from spyro.supervisor import state as st
+
+        set_tunnel(TunnelState(profile="dead", local_port=1, pid=999999, status="running"))
+        assert st.cleanup_stale() == ["dead"]
+        assert get_tunnel("dead").status == "stale"
+
+
+class TestStateFileSafety:
+    def test_corrupt_file_is_moved_aside_not_overwritten(self, tmp_path):
+        from spyro.supervisor import state as st
+
+        st._state_path().write_text("{not json")
+        assert all_tunnels() == {}
+        assert st._state_path().with_name("tunnels.json.corrupt").read_text() == "{not json"
+
+    def test_concurrent_writers_do_not_lose_updates(self):
+        import threading
+
+        def writer(n):
+            for i in range(10):
+                set_tunnel(TunnelState(profile=f"p{n}-{i}", local_port=n))
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert len(all_tunnels()) == 40

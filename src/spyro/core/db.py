@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
+import os
 import re
-from typing import Optional
 
 from ..utils.config import DatabaseConfig, ProfileConfig
 from ..core.pty_engine import PTYRunner, build_ssh_args
@@ -20,17 +20,26 @@ from ..utils.paths import safe_quote
 
 _ENV_VAR_RE = re.compile(
     r"""
-    ^(?:export\s+)?        # optional export keyword
-    ([A-Z_][A-Z0-9_]*)     # variable name
-    \s*=\s*                 # equals sign
+    ^[ \t]*(?:export[ \t]+)?     # optional export keyword
+    ([A-Za-z_][A-Za-z0-9_]*)      # variable name
+    [ \t]*=[ \t]*
     (?:
-        "([^"]*)"           # double-quoted value
-      | '([^']*)'           # single-quoted value
-      | ([^\s#]*)           # unquoted value (until space or comment)
+        "((?:[^"\\]|\\.)*)"[ \t]*(?:\#.*)?$   # double-quoted, \" and \\ escapes
+      | '([^']*)'[ \t]*(?:\#.*)?$                # single-quoted
+      | ([^\r\n]*?)(?:[ \t]+\#.*)?[ \t]*$        # unquoted: a '#' only starts a comment after whitespace
     )
     """,
     re.MULTILINE | re.VERBOSE,
 )
+
+_DRIVERS = {
+    "mysql": "mysql",
+    "mariadb": "mysql",
+    "pgsql": "postgres",
+    "postgres": "postgres",
+    "postgresql": "postgres",
+    "sqlite": "sqlite",
+}
 
 # Laravel .env DB_* patterns
 _LARAVEL_DB_MAP = {
@@ -46,9 +55,13 @@ _LARAVEL_DB_MAP = {
 def _parse_env_file(content: str) -> dict[str, str]:
     """Parse a .env file content into a dict."""
     result = {}
-    for match in _ENV_VAR_RE.finditer(content):
+    for match in _ENV_VAR_RE.finditer(content.replace("\r\n", "\n").replace("\r", "\n")):
         var_name = match.group(1)
-        value = match.group(2) or match.group(3) or match.group(4)
+        double, single, bare = match.group(2), match.group(3), match.group(4)
+        if double is not None:
+            value = re.sub(r'\\(["\\$])', r"\1", double)
+        else:
+            value = single if single is not None else (bare or "")
         result[var_name] = value
     return result
 
@@ -66,7 +79,7 @@ def _env_to_db_config(env_vars: dict[str, str]) -> DatabaseConfig:
                 except ValueError:
                     pass
             elif db_field == "driver":
-                db.driver = value
+                db.driver = _DRIVERS.get(value.lower(), value)
             else:
                 setattr(db, db_field, value)
 
@@ -105,6 +118,29 @@ def resolve_db_credentials(
     return _detect_remote_credentials(profile, runner=runner, password=password)
 
 
+def fetch_remote_file(
+    profile: ProfileConfig,
+    path: str,
+    *,
+    runner: PTYRunner | None = None,
+    password: str = "",
+    timeout: float = 15.0,
+) -> str | None:
+    """``cat`` a file on the profile's server. Returns its text, or None on failure."""
+    runner = runner or PTYRunner()
+    ssh_args = build_ssh_args(host=profile.host, user=profile.user, port=profile.port, key=profile.key)
+    lines: list[str] = []
+    exit_code = runner.run(
+        ssh_args + [f"cat -- {safe_quote(path)}"],
+        password=password,
+        on_output=lines.append,
+        timeout=timeout,
+    )
+    if exit_code != 0:
+        return None
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
 def _detect_remote_credentials(
     profile: ProfileConfig,
     *,
@@ -112,42 +148,44 @@ def _detect_remote_credentials(
     password: str = "",
 ) -> DatabaseConfig:
     """Detect database credentials from remote config files."""
-    if not runner:
-        runner = PTYRunner()
-
-    ssh_args = build_ssh_args(
-        host=profile.host,
-        user=profile.user,
-        port=profile.port,
-        key=profile.key,
-    )
+    runner = runner or PTYRunner()
 
     for env_file in profile.env_files:
-        remote_path = f"{profile.remote_path}/{env_file}"
-        cmd = ssh_args + [f"cat {safe_quote(remote_path)} 2>/dev/null"]
-
-        output_lines: list[str] = []
-
-        def collect(line: str) -> None:
-            output_lines.append(line)
-
-        exit_code = runner.run(
-            cmd,
-            password=password,
-            on_output=collect,
-            timeout=15.0,
+        content = fetch_remote_file(
+            profile, f"{profile.remote_path}/{env_file}", runner=runner, password=password
         )
-
-        if exit_code == 0 and output_lines:
-            content = "\n".join(output_lines)
-            env_vars = _parse_env_file(content)
-
-            if env_vars:
-                db = _env_to_db_config(env_vars)
-                if db.name:
-                    return db
+        if content:
+            db = _env_to_db_config(_parse_env_file(content))
+            if db.name:
+                return db
 
     return profile.db
+
+
+# ---------------------------------------------------------------------------
+# Local database clients (through the tunnel)
+# ---------------------------------------------------------------------------
+
+
+def client_env(db: DatabaseConfig, port: int) -> dict[str, str]:
+    """Environment for a local DB client. The password travels in the
+    environment (MYSQL_PWD / PGPASSWORD), never on the command line where any
+    local user could read it with ``ps``."""
+    env = os.environ.copy()
+    if db.password:
+        env["MYSQL_PWD"] = db.password
+        env["PGPASSWORD"] = db.password
+    env.update({"PGHOST": "127.0.0.1", "PGPORT": str(port), "PGUSER": db.user,
+                "PGDATABASE": db.name or "postgres"})
+    return env
+
+
+def client_argv(client: str, db: DatabaseConfig, port: int, query: str | None = None) -> list[str]:
+    """Argument list for mysql/mariadb/psql against ``127.0.0.1:port``."""
+    if client == "psql":
+        return ["psql"] + (["-c", query] if query else [])
+    argv = [client, "-h127.0.0.1", f"-P{port}", f"-u{db.user}", "--skip-ssl", db.name]
+    return argv + (["-e", query] if query else [])
 
 
 def generate_connection_url(db: DatabaseConfig, port_override: int | None = None) -> str:

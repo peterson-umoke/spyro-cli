@@ -278,3 +278,56 @@ class TestPinPersistence:
         add_pin(pin)
         remaining = remove_pin("/tmp/a", "staging")
         assert len(remaining) == 0
+
+
+class TestSyncRegressions:
+    @staticmethod
+    def _excluded(framework, rel):
+        pin = SyncPin("/p", "/r", "x", framework=framework)
+        files, dirs = pin.get_all_excludes()
+        return should_exclude(Path("/p") / rel, Path("/p"), files, dirs)
+
+    def test_multi_segment_dir_patterns_work(self):
+        for rel in (
+            "storage/framework/sessions/abc123",
+            "storage/framework/views/compiled.php",
+            "storage/logs/deep/laravel.txt",
+            "bootstrap/cache/services.php",
+        ):
+            assert self._excluded("laravel", rel), rel
+        assert self._excluded("wordpress", "wp-content/cache/page.html")
+        assert self._excluded("wordpress", "wp-content/debug.log")
+
+    def test_dir_patterns_do_not_overmatch(self):
+        assert not self._excluded("laravel", "app/storage_helpers/logs.php")
+        assert not self._excluded("laravel", "resources/views/home.blade.php")
+
+    def test_unknown_framework_keeps_deployable_assets(self):
+        for fw in ("", "auto"):
+            assert not self._excluded(fw, "public/build/manifest.json"), fw
+            assert not self._excluded(fw, "public/.htaccess"), fw
+            assert self._excluded(fw, "wp-config.php"), fw          # secrets stay protected
+            assert self._excluded(fw, "config/.env.production"), fw
+
+    def test_detected_framework_still_applies_its_own_rules(self):
+        assert self._excluded("node", "dist/app.js")
+        assert self._excluded("wordpress", ".htaccess")
+
+    def test_unknown_key_or_bad_entry_does_not_wipe_other_pins(self, tmp_path, monkeypatch):
+        import json
+
+        path = tmp_path / "pins.json"
+        monkeypatch.setattr("spyro.core.sync._pins_path", lambda: path)
+        path.write_text(json.dumps([
+            {"local_path": "/a", "remote_path": "/r", "profile": "p", "future_field": 1},
+            "garbage",
+            {"local_path": "/b", "remote_path": "/r", "profile": "p"},
+        ]))
+        assert [p.local_path for p in load_pins()] == ["/a", "/b"]
+
+    def test_corrupt_pins_file_is_kept(self, tmp_path, monkeypatch):
+        path = tmp_path / "pins.json"
+        monkeypatch.setattr("spyro.core.sync._pins_path", lambda: path)
+        path.write_text("{oops")
+        assert load_pins() == []
+        assert (tmp_path / "pins.json.corrupt").read_text() == "{oops"

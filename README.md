@@ -2,13 +2,13 @@
 
 Intelligent SSH tunneling and remote command CLI for developers.
 
-Spyro automates SSH port-forwarding, remote command execution, database credential resolution, and file synchronization through a declarative `spyro.toml` configuration. It replaces manual `ssh -L` coordination, `scp` routines, and `autossh` daemons with a single, self-healing tool.
+Spyro automates SSH port-forwarding, remote command execution, database credential resolution, and file synchronization through a declarative `spyro.toml` configuration. It replaces manual `ssh -L` coordination, `scp` routines, and `autossh` daemons with a single tool.
 
 ## Why Spyro
 
 Developers working with remote servers spend significant time on repetitive SSH boilerplate: setting up port forwards, copying `.env` files, running artisan commands, syncing code. Spyro eliminates this by:
 
-- **Automating tunnels** with a self-healing supervisor that survives network drops, sleep/wake cycles, and process crashes
+- **Automating tunnels**: one command brings up every forwarded port (authenticating with your keychain password, like every other command), and `spyro status` tells you when one has died
 - **Resolving credentials** from either local TOML config or remote `.env`/Rails config files
 - **Running remote commands** through a PTY engine that handles sudo escalation without leaking passwords
 - **Syncing files** in real-time using native OS filesystem watchers
@@ -62,7 +62,7 @@ spyro cp .env :/var/www/app/.env -p staging
 spyro down
 ```
 
-One config file. One CLI. Zero terminal tabs. Tunnels that heal themselves. Passwords stored in your OS keychain, never in config files.
+One config file. One CLI. Zero terminal tabs. Passwords stored in your OS keychain, never in config files.
 
 ## Installation
 
@@ -109,7 +109,7 @@ spyro update --check
 spyro update --force
 ```
 
-Spyro checks the GitHub releases API for the latest tag and reinstalls itself via ``uv tool install --reinstall`` from the canonical git URL. No git clone needed, works whether installed with `uv` or `pip`.
+Spyro checks the GitHub releases API for the latest tag and reinstalls itself via ``uv tool install --reinstall`` from the canonical git URL (works whether installed with `uv` or `pip`; `git` must be on your PATH). After a command, an interactive terminal is told on stderr when a newer release exists; the check is cached for 24h and never touches `--json` output.
 
 ### Verify installation
 
@@ -196,7 +196,8 @@ remote_path = "/var/www/app"     # Working directory on server (required)
 artisan = true                   # Enable Laravel artisan commands
 wordpress = false                # Enable WordPress/WP-CLI commands
 sudo = true                      # Allow sudo when needed
-forwarded_ports = [3306, 6379]   # Ports to tunnel locally
+sudo_user = "www-data"           # Run artisan/tinker/wp as this user (default: root)
+forwarded_ports = [3306, 6379]   # Remote ports to tunnel to localhost
 env_files = [".env"]             # Remote env files to scan for DB credentials
 ```
 
@@ -209,10 +210,11 @@ env_files = [".env"]             # Remote env files to scan for DB credentials
 | `port` | int | `22` | SSH port |
 | `key` | string | `""` | Path to SSH private key (uses system default if empty) |
 | `remote_path` | string | `/var/www` | Working directory on remote server |
-| `forwarded_ports` | list[int] | `[]` | Remote ports to tunnel to localhost |
+| `forwarded_ports` | list[int] | `[]` | Remote ports to tunnel to localhost. The local port is the same unless it is taken, then the next free one is used |
 | `artisan` | bool | `false` | Enable `spyro artisan` commands |
 | `wordpress` | bool | `false` | Enable `spyro wp` commands |
 | `sudo` | bool | `false` | Enable sudo escalation for commands |
+| `sudo_user` | string | `""` | Run app commands (`artisan`, `tinker`, `eval`, `script`, `wp`) as this user via `sudo -u`. Default is root, which leaves root-owned files in `storage/` that the web server can no longer write |
 | `env_files` | list[str] | `[".env"]` | Remote env files to scan for DB credentials |
 
 ### Database configuration
@@ -220,7 +222,7 @@ env_files = [".env"]             # Remote env files to scan for DB credentials
 ```toml
 [profiles.staging.db]
 host = "127.0.0.1"    # Always localhost (traffic goes through tunnel)
-port = 3306           # Must match a port in forwarded_ports
+port = 3306           # The remote DB port; must be one of forwarded_ports
 name = "myapp_staging"
 user = "forge"
 password = ""         # Leave empty = auto-detect from remote .env
@@ -230,7 +232,7 @@ driver = "mysql"      # mysql, postgres, or sqlite
 **Credential resolution** (dual-strategy):
 
 1. **Explicit** — If `password` is set in `spyro.toml`, use it
-2. **Auto-detect** — If empty, scan remote `.env` / config files for `DB_*` variables
+2. **Auto-detect** — If empty, read the remote `.env` / config files for `DB_*` variables (Laravel `pgsql` is mapped to `postgres`)
 
 ### Multiple users, same server
 
@@ -296,7 +298,7 @@ forwarded_ports = [3306]
 ```bash
 spyro artisan migrate -p staging     # staging only
 spyro artisan migrate -p production  # production only
-spyro artisan migrate --all          # both at once
+spyro run "uptime" --all             # read-only commands can fan out to every profile
 ```
 
 ### WordPress profile
@@ -347,7 +349,9 @@ spyro artisan migrate -p staging    # Still works — walks up to find spyro.tom
 
 Spyro stores **one password per profile** in your OS keychain (macOS Keychain / Linux Secret Service). This single password is used for both SSH login and sudo — because in practice, they're the same.
 
-If no keychain entry exists, Spyro prompts you interactively and stores it for next time.
+If no keychain entry exists, Spyro prompts you interactively and stores it for next time. On hosts with no OS keychain (headless Linux, CI) set `SPYRO_PASSWORD_<PROFILE>` (profile name upper-cased, non-word characters as `_`) or `SPYRO_PASSWORD`; with no stored password and no terminal, Spyro does not prompt.
+
+If SSH rejects the stored password, Spyro stops immediately and tells you to run `spyro auth set -p <profile> -f`.
 
 ### Authentication commands
 
@@ -385,9 +389,10 @@ spyro caddy restart -p dev
 
 - Passwords never leave your OS keychain
 - Never stored in `spyro.toml` or any config file
-- Wrapped in `SecureCredential` (bytearray) during use, zeroed with triple-pass after
+- Wrapped in `SecureCredential` (bytearray) during use and zeroed after (best effort: Python cannot wipe every copy of a string)
 - All output sanitized against terminal injection attacks
 - Shell arguments passed through `shlex.quote()` to prevent injection
+- Database passwords go to local clients via `MYSQL_PWD`/`PGPASSWORD` and to `mysqldump` over stdin, never on a command line
 
 ## Commands Reference
 
@@ -411,10 +416,10 @@ spyro status staging             # Show staging tunnel details
 ```
 
 **Tunnel behavior:**
-- Runs as daemon by default (survives terminal close)
-- Self-healing: restarts on crash, network drop, or sleep/wake
-- Exponential backoff: 1s → 2s → 4s → ... → 5min max
-- Process tracking via `~/.spyro/tunnels.json` (orphan cleanup on reboot)
+- Runs as a background `ssh` (survives terminal close); `spyro up` authenticates with your keychain password and only reports success once the forwarded ports accept connections, otherwise it prints ssh's own error and exits 1
+- `--no-daemon` keeps it in the foreground (Ctrl+C stops it)
+- Not self-healing: if the connection drops, `spyro status` shows it as `stale` and `spyro up` (or any `db` command) starts a fresh one
+- State in `~/.spyro/tunnels.json`; `spyro down` stops a tunnel through its ssh control socket and only ever signals a PID that is still an ssh/spyro process
 
 ### Laravel Artisan
 
@@ -431,9 +436,6 @@ spyro artisan view:cache -p staging
 spyro artisan optimize:clear -p staging
 spyro artisan about -p staging
 spyro artisan schedule:list -p staging
-
-# Run across all environments
-spyro artisan queue:status --all
 ```
 
 **Tinker (interactive REPL):**
@@ -461,7 +463,7 @@ The `eval` command works by generating a temporary PHP script that boots Laravel
 ```bash
 # Tunnel + connection
 spyro db tunnel -p staging              # Start tunnel, print connection URL
-spyro db shell -p staging               # Open MySQL/MariaDB/psql prompt
+spyro db shell -p staging               # Open MySQL/MariaDB/psql prompt (password via environment)
 spyro db ping -p staging                # Test connectivity
 
 # Querying
@@ -474,6 +476,7 @@ spyro db dump -p staging -t users,posts            # Specific tables
 spyro db dump -p staging -t users -w "id > 100"   # With WHERE filter
 spyro db dump -p staging -z                        # Gzip compressed
 spyro db dump -p staging -d                        # Schema only (no data)
+spyro db dump -p staging -o backup.sql             # Streams raw bytes; written atomically, owner-only (0600)
 
 # Listing
 spyro db list-databases -p staging                 # List all databases
@@ -556,6 +559,10 @@ spyro run "du -sh /var/www/app/storage" -p staging
 # Run across all environments
 spyro run "uptime" --all
 spyro run "free -m" --all
+
+# Commands time out after 60s by default (a timeout is reported, and the remote
+# command may keep running). Raise it per command or globally:
+spyro artisan migrate -p staging --timeout 600      # or [defaults] command_timeout = 600
 ```
 
 ### Interactive Shell
@@ -669,6 +676,8 @@ spyro cp ./config.php :/var/www/config.php --all
 spyro cp ./config.php :/var/www/config.php --all --except ird-server,production
 ```
 
+`--timeout N` sets the per-profile transfer limit (default 120s). `--parents` works with the `:/remote/path` form.
+
 **Path convention:**
 - Local paths: `/path/to/file`
 - Remote paths: `:` prefix → `:/remote/path`
@@ -696,12 +705,12 @@ spyro pull-env -p staging
 
 ```bash
 spyro logs laravel -p staging -n 100       # Last 100 lines
-spyro logs laravel -p staging -f           # Follow (tail -f)
+spyro logs laravel -p staging -f           # Follow until Ctrl+C (no timeout)
 spyro logs nginx -p staging                # Nginx access log
 spyro logs nginx-error -p staging          # Nginx error log
 spyro logs apache -p staging               # Apache access log
 spyro logs php -p staging                  # PHP-FPM error log
-spyro logs supervisor -p staging           # Spyro's own supervisor log
+spyro logs supervisor staging              # Spyro's own tunnel log for a profile
 ```
 
 ### Diagnostics
@@ -771,7 +780,6 @@ spyro artisan about -p staging         # App boots correctly?
 ### Run across all environments
 
 ```bash
-spyro artisan queue:status --all
 spyro run "uptime" --all
 spyro run "df -h" --all
 ```
@@ -779,12 +787,14 @@ spyro run "df -h" --all
 ### Non-interactive auth (CI/CD)
 
 ```bash
-# Store password without prompts
-spyro auth set -p staging -w "$STAGING_PASSWORD" -f
+# Headless hosts have no OS keychain: pass the password through the environment
+export SPYRO_PASSWORD_STAGING="$STAGING_PASSWORD"     # or SPYRO_PASSWORD for every profile
 
 # Use in GitHub Actions
-- name: Setup credentials
-  run: spyro auth set -p staging -w "${{ secrets.STAGING_SSH_PASSWORD }}" -f
+- name: Deploy check
+  env:
+    SPYRO_PASSWORD_STAGING: ${{ secrets.STAGING_SSH_PASSWORD }}
+  run: spyro run "uptime" -p staging
 ```
 
 ### Shell aliases
@@ -804,7 +814,7 @@ alias sdoc='spyro doctor'
 
 ```bash
 spyro status                    # What's running?
-spyro logs -p staging           # Supervisor logs
+spyro logs supervisor staging    # Tunnel log
 spyro doctor                    # Full audit
 ssh deploy@staging.example.com  # Raw SSH fallback
 ```
@@ -871,35 +881,28 @@ PTY Engine              ← SSH with pseudo-terminal (handles sudo prompts)
     ↓
 Keychain (keyring)      ← Passwords in OS keychain (macOS/Linux native)
     ↓
-Tunnel Supervisor       ← Self-healing SSH tunnels
-                          Process liveness + port health checks
-                          Exponential backoff restart
-                          Survives network drops, sleep/wake
-                          PID tracking for orphan cleanup
+Tunnels                 ← ssh -f -N -L via the PTY engine (password hosts work)
+                          Verified before success is reported
+                          State, PIDs and control socket in ~/.spyro/tunnels.json
 ```
 
 ### PTY Engine
 
-The PTY engine (`src/core/pty_engine.py`) spawns native `ssh` in a pseudo-terminal using `pty.openpty()` and `os.fork()`. It:
+The PTY engine (`src/spyro/core/pty_engine.py`) spawns native `ssh`/`scp` in a pseudo-terminal using `pty.openpty()` and `os.fork()`. It:
 
 - Reads stdout/stderr byte-by-byte
 - Handles both **password-based** and **key-based** SSH auth automatically
-  - Password auth: matches prompts via regex (`password:`, `[sudo] password`, etc.), injects credentials directly into the PTY buffer
+  - Password auth: matches the SSH prompt (`user@host's password:`, `Password:`) and injects the stored password into the PTY; prompts from programs on the server are never answered with it
+  - A missing or rejected password fails immediately with a message instead of idling until the timeout
   - Key auth: detects shell output (MOTD, prompt) and skips directly to raw relay mode
 - Wraps credentials in `SecureCredential` for memory zeroing
-- Sanitizes all output through ANSI filter before printing
-- Handles SSH host key verification prompts automatically
-- Uses `~/.spyro/sockets/` for connection sharing (avoids macOS Unix socket path length limits)
+- Strips every terminal escape/control sequence from output before it is printed
+- Sets the PTY window size and follows terminal resizes in interactive sessions
+- Uses `~/.spyro/sockets/` (`ControlPath=.../%C`, a fixed-length hash) for connection sharing, which avoids macOS Unix socket path length limits
 
-### Tunnel Supervisor (STS)
+### Tunnels
 
-The STS (`src/supervisor/tunnel.py`) replaces `autossh` with a Python-native supervisor that:
-
-- Monitors tunnel health via process liveness and port connectivity
-- Restarts failed tunnels with exponential backoff (1s → 2s → 4s → ... → 5min)
-- Handles network roaming and sleep/wake cycles
-- Uses `psutil` for cross-platform process tree management
-- Tracks PIDs/PGIDs in `~/.spyro/tunnels.json` for orphan cleanup
+`src/spyro/supervisor/tunnel.py` runs `ssh -f -N -L ...` through the PTY engine, so password hosts work, and lets ssh become its own ControlMaster. `ssh -f` only backgrounds once authentication and the forwards have succeeded. `src/spyro/supervisor/state.py` records the PID, local ports and control socket in `~/.spyro/tunnels.json` (locked and written atomically). There is no restart loop: a tunnel that dies shows as `stale`.
 
 ### Service Detection
 
@@ -937,8 +940,8 @@ The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default
 
 | Concern | Mitigation |
 |---------|------------|
-| Credential exposure | `SecureCredential` wraps passwords in `bytearray`, zeros with triple-pass (zero → random → zero) after use |
-| Terminal injection | `sanitize_output()` strips all ANSI/OSC/DCS/C0 sequences, null bytes, BEL, and BS before printing |
+| Credential exposure | `SecureCredential` wraps passwords in `bytearray`, zeros with triple-pass (zero → random → zero) after use (best effort in Python) |
+| Terminal injection | `strip_ansi()` strips all CSI/OSC/DCS/ESC sequences, C1 controls, CR, NUL, BEL and BS from remote output before it is printed; remote text is also never parsed as Rich markup |
 | Shell injection | All user input passed through `shlex.quote()` |
 | Config file permissions | Enforces `0600` on `spyro.toml` if it contains passwords |
 | Keychain storage | Uses `keyring` library for native OS secure stores (macOS Keychain, Linux Secret Service) |
@@ -947,20 +950,10 @@ The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default
 ## Testing
 
 ```bash
-# Unit tests
-python3 -m pytest tests/unit/ -v
-
-# Security tests — ANSI attack vectors (20 vectors)
-python3 tests/security/test_ansi_attacks.py
-
-# Security tests — Memory zeroing (8 tests)
-python3 tests/security/test_memory_zeroing.py
-
-# Phase 1 PoC — PTY engine validation
-python3 tests/poc/test_pty_engine.py
-
-# All tests including integration
-python3 -m pytest tests/ -v
+uv sync --all-extras                    # pytest, pip-audit and watchdog are extras
+uv run python -m pytest                 # everything (no network or SSH needed)
+uv run python -m pytest tests/unit/test_config.py -k profile
+uv run python tests/security/test_ansi_attacks.py     # security suites also run as scripts
 ```
 
 ## Platform Support
@@ -1041,7 +1034,7 @@ health_check = "/health"    # HTTP endpoint to check
 health_timeout = 30         # Seconds to wait
 ```
 
-**Status:** Planned — implementation in progress.
+**Status:** Planned — implementation in progress. (Today `spyro deploy` is an alias for `spyro cp`.)
 
 ---
 

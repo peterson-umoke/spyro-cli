@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import stat
 from pathlib import Path
@@ -60,3 +61,29 @@ def spyro_home() -> Path:
     home = Path.home() / ".spyro"
     home.mkdir(parents=True, exist_ok=True)
     return home
+
+
+# ssh appends ".<16 random chars>" to a ControlPath while binding it, and a
+# Unix socket path is limited to 104 bytes on macOS (108 on Linux). The longest
+# file name we put in the directory is "<40 hex>" (ssh's %C token), so the
+# directory must stay under 104 - 1 - 40 - 17 - 1 (NUL) = 45 bytes.
+_MAX_SOCKET_DIR = 45
+
+
+def sockets_dir() -> Path:
+    """Directory for ssh ControlMaster sockets (created, owner-only).
+
+    ``~/.spyro/sockets`` when that path is short enough; otherwise
+    ``/tmp/spyro-<uid>`` (a long home directory would make every ssh command
+    fail with "too long for Unix domain socket").
+    """
+    preferred = spyro_home() / "sockets"
+    if len(str(preferred)) <= _MAX_SOCKET_DIR:
+        path = preferred
+    else:
+        path = Path(f"/tmp/spyro-{os.getuid()}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.stat().st_uid != os.getuid():  # someone pre-created it in shared /tmp
+        raise RuntimeError(f"{path} is owned by another user; refusing to put ssh sockets there")
+    path.chmod(0o700)
+    return path

@@ -7,8 +7,8 @@ Spyro is a developer tool — patches that make it faster, more reliable, or eas
 ```bash
 git clone https://github.com/peterson-umoke/spyro-cli.git
 cd spyro-cli
-uv sync
-uv run pytest
+uv sync --all-extras    # pytest, pip-audit, watchdog are extras
+uv run python -m pytest
 ```
 
 ## Before You Code
@@ -26,7 +26,7 @@ Open an issue first for anything beyond a small bug fix. Saves you writing code 
 
 1. Branch from `main`
 2. Keep PRs focused — one feature or fix per PR
-3. Run `pytest` and `pip-audit` before opening
+3. Run `uv run python -m pytest` and `pip-audit` before opening (CI runs the tests on every PR)
 4. Write a changelog entry in the PR description
 
 ## Security

@@ -184,3 +184,139 @@ class TestRunSudoPrompt:
             f"Second prompt: {output_lines}"
         )
 
+
+
+class TestPromptHandling:
+    """Regression tests for prompt matching and fail-fast authentication."""
+
+    @staticmethod
+    def _prompt_child(prompt: str) -> list[str]:
+        import sys
+
+        code = (
+            "import sys;"
+            f"sys.stdout.write({prompt!r});"
+            "sys.stdout.flush();"
+            "pw = sys.stdin.readline().strip();"
+            "sys.stdout.write('RECV:' + pw + '\\n')"
+        )
+        return [sys.executable, "-c", code]
+
+    def test_ssh_password_prompt_is_answered(self):
+        out: list[str] = []
+        ec = PTYRunner().run(
+            self._prompt_child("deploy@host's password: "),
+            password="ssh-secret", on_output=out.append, timeout=5.0,
+        )
+        assert ec == 0
+        assert any("RECV:ssh-secret" in line for line in out), out
+
+    def test_remote_program_prompt_never_gets_ssh_password(self):
+        """'Enter password:' comes from a program on the server, not from ssh."""
+        out: list[str] = []
+        PTYRunner().run(
+            self._prompt_child("Enter password: "),
+            password="ssh-secret", on_output=out.append, timeout=1.5,
+        )
+        assert not any("ssh-secret" in line for line in out), out
+
+    def test_missing_password_fails_fast(self):
+        import time
+
+        out: list[str] = []
+        start = time.time()
+        ec = PTYRunner().run(
+            self._prompt_child("deploy@host's password: "),
+            password="", on_output=out.append, timeout=10.0,
+        )
+        assert ec == 255
+        assert time.time() - start < 3.0
+        assert any("spyro auth set" in line for line in out), out
+
+    def test_rejected_password_fails_fast(self):
+        import sys
+        import time
+
+        code = (
+            "import sys;"
+            "sys.stdout.write(\"deploy@host's password: \");sys.stdout.flush();"
+            "sys.stdin.readline();"
+            "sys.stdout.write('Permission denied, please try again.\\n');"
+            "sys.stdout.write(\"deploy@host's password: \");sys.stdout.flush();"
+            "sys.stdin.readline()"
+        )
+        out: list[str] = []
+        start = time.time()
+        ec = PTYRunner().run(
+            [sys.executable, "-c", code],
+            password="wrong", on_output=out.append, timeout=10.0,
+        )
+        assert ec == 255
+        assert time.time() - start < 3.0
+        assert any("rejected" in line for line in out), out
+
+
+class TestRunEdgeCases:
+    def test_output_lines_have_no_carriage_returns(self):
+        """The PTY turns \\n into \\r\\n; captured text must not keep the \\r."""
+        out: list[str] = []
+        PTYRunner().run(["sh", "-c", "printf 'A=1\\nB=2\\n'"], on_output=out.append, timeout=5.0)
+        assert [line for line in out if line] == ["A=1", "B=2"]
+
+    def test_missing_binary_returns_127_without_running_caller_code(self):
+        import os
+
+        marker = os.getpid()
+        out: list[str] = []
+        ec = PTYRunner().run(["definitely-not-a-binary-xyz"], on_output=out.append, timeout=5.0)
+        assert ec == 127
+        assert os.getpid() == marker  # still the parent; the child exited
+        assert any("cannot run" in line for line in out), out
+
+    def test_timeout_none_waits_for_the_child(self):
+        ec = PTYRunner().run(["sh", "-c", "sleep 0.3; exit 7"], timeout=None)
+        assert ec == 7
+
+    def test_pty_gets_a_window_size(self):
+        out: list[str] = []
+        PTYRunner().run(["sh", "-c", "stty size"], on_output=out.append, timeout=5.0)
+        rows, cols = [int(x) for x in out[0].split()]
+        assert rows > 0 and cols > 0
+
+
+class TestInteractiveAuth:
+    def test_sudo_profile_with_password_auth_does_not_wait_for_a_sudo_prompt(self):
+        """A plain interactive shell never shows a sudo prompt; the session must
+        leave the auth phase instead of being killed by the auth timeout."""
+        import sys
+        import time
+
+        code = (
+            "import sys;"
+            "sys.stdout.write(\"user@host's password: \");sys.stdout.flush();"
+            "sys.stdin.readline();"
+            "sys.stdout.write('\\nWelcome\\n$ ');sys.stdout.flush();"
+            "sys.stdin.read()"
+        )
+        start = time.time()
+        ec = PTYRunner().interactive_run(
+            [sys.executable, "-c", code],
+            password="pw", sudo_password="pw", timeout=6.0,
+        )
+        # stdin is /dev/null under pytest: once auth ends the relay sees EOF.
+        assert ec == 0, f"auth phase was killed (exit {ec})"
+        assert time.time() - start < 5.0
+
+
+class TestExitStatusIsNeverLost:
+    def test_fast_failing_commands_keep_their_exit_code(self):
+        """The PTY hits EOF a moment before the child is reapable; that must not
+        be reported as success (this used to return 0 intermittently)."""
+        codes = [
+            PTYRunner().run(["sh", "-c", "echo oops; exit 3"], timeout=5.0)
+            for _ in range(40)
+        ]
+        assert codes == [3] * 40
+
+    def test_interactive_returns_the_real_exit_code(self):
+        assert PTYRunner().interactive_run(["sh", "-c", "exit 9"], timeout=5.0) == 9

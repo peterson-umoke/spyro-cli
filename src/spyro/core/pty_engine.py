@@ -14,22 +14,28 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
+import struct
 import termios
+import time
 from typing import Callable
 
 from ..security.ansi import strip_ansi
 from ..security.memory import SecureCredential
+from ..utils.paths import sockets_dir
 
 
 # ---------------------------------------------------------------------------
 # Prompt patterns
 # ---------------------------------------------------------------------------
 
+# Anchored to the start of the line so that a *remote program's* prompt
+# ("Enter password:", "mysql> password:") never receives the SSH password.
 _AUTH_PROMPTS = [
-    re.compile(r"password\s*:\s*$", re.IGNORECASE),
-    re.compile(r"password\s*for\s+.+:\s*$", re.IGNORECASE),
-    re.compile(r"\'?s password:\s*$", re.IGNORECASE),
+    re.compile(r"^[^\s@]+@\S+'s password\s*:\s*$", re.IGNORECASE),  # user@host's password:
+    re.compile(r"^(?:\([^)]*\)\s*)?password\s*:\s*$", re.IGNORECASE),  # Password: / (u@h) Password:
+    re.compile(r"^password\s+for\s+\S+\s*:\s*$", re.IGNORECASE),  # Password for u@h:
 ]
 
 _SUDO_PROMPTS = [
@@ -47,12 +53,116 @@ _PRIVATE_KEY_PROMPTS = [
     re.compile(r"Enter passphrase for key", re.IGNORECASE),
 ]
 
+_NO_PASSWORD_MSG = (
+    "spyro: SSH is asking for a password but none is stored. "
+    "Run: spyro auth set -p <profile>"
+)
+_REJECTED_MSG = (
+    "spyro: SSH rejected the stored password. "
+    "Update it with: spyro auth set -p <profile> -f"
+)
+
+
+def _matches(patterns: list[re.Pattern[str]], text: str) -> bool:
+    return any(p.search(text) for p in patterns)
+
 
 # ---------------------------------------------------------------------------
 # Output callback type
 # ---------------------------------------------------------------------------
 
 OutputCallback = Callable[[str], None]  # receives sanitised text
+
+
+# ---------------------------------------------------------------------------
+# PTY helpers
+# ---------------------------------------------------------------------------
+
+
+def _set_winsize(fd: int) -> None:
+    """Give the PTY the local terminal's size (80x24 when there is none)."""
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", size.lines, size.columns, 0, 0))
+    except OSError:
+        pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _spawn(argv: list[str], env: dict[str, str] | None) -> tuple[int, int]:
+    """Fork *argv* onto a fresh PTY. Returns ``(master_fd, pid)``."""
+    master_fd, slave_fd = pty.openpty()
+    try:
+        _set_winsize(slave_fd)
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        pid = os.fork()
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+
+    if pid == 0:
+        # Child. It must never return into the caller's code: if exec fails
+        # it would keep running the CLI (and its finally blocks) as a clone.
+        try:
+            os.close(master_fd)
+            os.setsid()
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            for fd in (0, 1, 2):
+                os.dup2(slave_fd, fd)
+            if slave_fd > 2:
+                os.close(slave_fd)
+            exec_env = os.environ.copy()
+            if env:
+                exec_env.update(env)
+            os.execvpe(argv[0], argv, exec_env)
+        except BaseException as e:
+            try:
+                os.write(2, f"spyro: cannot run {argv[0]}: {getattr(e, 'strerror', None) or e}\n".encode())
+            except OSError:
+                pass
+        finally:
+            os._exit(127)
+
+    os.close(slave_fd)
+    return master_fd, pid
+
+
+def _exit_status(pid: int, wait: float = 2.0) -> int | None:
+    """Exit code of *pid*, waiting up to *wait* seconds for it to finish.
+
+    After the PTY reports EOF the child may not be reapable for a few
+    milliseconds; returning 0 there would report a failed command as success.
+    """
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if wpid != 0:
+            return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
+
+
+def _reap(master_fd: int, pid: int) -> None:
+    try:
+        if master_fd >= 0:
+            os.close(master_fd)
+    except OSError:
+        pass
+    if pid > 0:
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +195,14 @@ class PTYRunner:
         password: str = "",
         sudo_password: str = "",
         on_output: OutputCallback | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = 30.0,
         env: dict[str, str] | None = None,
     ) -> int:
+        """Run *argv*, answering prompts. ``timeout=None`` waits indefinitely.
+
+        Returns the exit code; 124 on timeout, 255 when SSH asks for a password
+        that is missing or was rejected, 127 when the program cannot be run.
+        """
         # Clear instance buffers (runner may be reused across profiles)
         self._buffer = b""
         self._line_buffer = b""
@@ -100,35 +215,7 @@ class PTYRunner:
         pid = -1
 
         try:
-            master_fd, slave_fd = pty.openpty()
-
-            # Set non-blocking on master
-            flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-            fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-            pid = os.fork()
-            if pid == 0:
-                # Child
-                os.close(master_fd)
-                os.setsid()
-
-                # Attach slave as stdin/stdout/stderr
-                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-                os.dup2(slave_fd, 0)
-                os.dup2(slave_fd, 1)
-                os.dup2(slave_fd, 2)
-                if slave_fd > 2:
-                    os.close(slave_fd)
-
-                exec_env = os.environ.copy()
-                if env:
-                    exec_env.update(env)
-
-                os.execvpe(argv[0], argv, exec_env)
-
-            # Parent
-            os.close(slave_fd)
-
+            master_fd, pid = _spawn(argv, env)
             return self._drive(
                 master_fd, pid,
                 sec_password, sec_sudo,
@@ -140,16 +227,7 @@ class PTYRunner:
                 sec_password.zero()
             if sec_sudo:
                 sec_sudo.zero()
-            try:
-                if master_fd >= 0:
-                    os.close(master_fd)
-            except Exception:
-                pass
-            if pid > 0:
-                try:
-                    os.waitpid(pid, 0)
-                except ChildProcessError:
-                    pass
+            _reap(master_fd, pid)
 
     def _drive(
         self,
@@ -158,11 +236,9 @@ class PTYRunner:
         password: SecureCredential | None,
         sudo_password: SecureCredential | None,
         on_output: OutputCallback | None,
-        timeout: float,
+        timeout: float | None,
     ) -> int:
         """Drive the PTY interaction loop."""
-        import time
-
         start = time.monotonic()
         eof_count = 0
         sent_password = False
@@ -172,6 +248,37 @@ class PTYRunner:
         # Get password bytes once (before potential zeroing)
         pw_bytes = password.value if password and not password.zeroed else b""
         sudo_bytes = sudo_password.value if sudo_password and not sudo_password.zeroed else b""
+
+        notes: list[str] = []
+
+        def answer(text: str) -> bool | int:
+            """React to a prompt in *text*.
+
+            Returns False when *text* is not a prompt, True when it was
+            answered, or an exit code when the child had to be aborted.
+            """
+            nonlocal sent_password, sudo_attempts
+            if _matches(_HOST_KEY_PROMPTS, text):
+                os.write(master_fd, b"yes\n")
+                return True
+            # Sudo BEFORE generic auth: a looser "password for user:" pattern
+            # would also match inside "[sudo] password for user: ".
+            if _matches(_SUDO_PROMPTS, text):
+                if not sudo_bytes or sudo_attempts >= max_sudo_attempts:
+                    return self._abort_child(pid, 1)
+                os.write(master_fd, sudo_bytes + b"\n")
+                sudo_attempts += 1
+                return True
+            if _matches(_AUTH_PROMPTS, text) or _matches(_PRIVATE_KEY_PROMPTS, text):
+                if not pw_bytes or sent_password:
+                    # Nothing (more) to send: fail now instead of idling
+                    # until the timeout.
+                    notes.append(_REJECTED_MSG if sent_password else _NO_PASSWORD_MSG)
+                    return self._abort_child(pid, 255)
+                os.write(master_fd, pw_bytes + b"\n")
+                sent_password = True
+                return True
+            return False
 
         while True:
             # Check if child is still alive
@@ -187,7 +294,7 @@ class PTYRunner:
                 return 1
 
             # Timeout check
-            if time.monotonic() - start > timeout:
+            if timeout is not None and time.monotonic() - start > timeout:
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
@@ -198,19 +305,21 @@ class PTYRunner:
             try:
                 data = os.read(master_fd, 4096)
                 if not data:
+                    # EOF: the child closed its side. Its exit status is
+                    # picked up by the waitpid at the top of the loop.
                     eof_count += 1
-                    if eof_count > 3:
+                    if eof_count > 300:  # ~3s: output closed but the child lives on
                         break
+                    time.sleep(0.01)
                     continue
                 eof_count = 0
                 if not self._buffer:
                     partial_since = time.monotonic()
                 self._buffer += data
             except (OSError, BlockingIOError):
-                if not self._buffer:
-                    select.select([master_fd], [], [], 0.1)
-                    continue
                 select.select([master_fd], [], [], 0.1)
+                if not self._buffer:
+                    continue
 
             # Process complete lines
             while b"\n" in self._buffer:
@@ -219,85 +328,37 @@ class PTYRunner:
                 text = strip_ansi(line)
                 if on_output:
                     on_output(text)
-
-                line_str = text.rstrip()
-
-                # Check for SSH host key prompt
-                if any(p.search(line_str) for p in _HOST_KEY_PROMPTS):
-                    os.write(master_fd, b"yes\n")
-                    continue
-
-                # Sudo BEFORE generic auth: `_AUTH_PROMPTS[1]` matches the
-                # substring "password for user:" inside "[sudo] password for
-                # user: ", so we must intercept sudo prompts first.
-                if any(p.search(line_str) for p in _SUDO_PROMPTS):
-                    if not sudo_bytes:
-                        return self._abort_child(pid, 1)
-                    if sudo_attempts >= max_sudo_attempts:
-                        return self._abort_child(pid, 1)
-                    os.write(master_fd, sudo_bytes + b"\n")
-                    sudo_attempts += 1
-                    continue
-
-                # Check for SSH password prompts
-                if any(p.search(line_str) for p in _AUTH_PROMPTS):
-                    if pw_bytes and not sent_password:
-                        os.write(master_fd, pw_bytes + b"\n")
-                        sent_password = True
-                    continue
-
-                # Check for private key passphrase
-                if any(p.search(line_str) for p in _PRIVATE_KEY_PROMPTS):
-                    if pw_bytes and not sent_password:
-                        os.write(master_fd, pw_bytes + b"\n")
-                        sent_password = True
-                    continue
-
+                result = answer(text.rstrip())
+                if result is not True and result is not False:
+                    if on_output:
+                        for note in notes:
+                            on_output(note)
+                    return result
 
             if not self._buffer:
                 partial_since = None
+                continue
 
             # Process remaining data.  Prompt text is commonly emitted
             # without a newline, so retain partial chunks long enough for a
             # split prompt to arrive.  If it is still unmatched after a
             # short idle period, emit it instead of hiding it indefinitely.
-            if self._buffer:
-                buf_str = strip_ansi(self._buffer).rstrip()
-                if any(p.search(buf_str) for p in _HOST_KEY_PROMPTS):
-                    os.write(master_fd, b"yes\n")
-                    self._buffer = b""
-                    partial_since = None
-                    continue
-                # Sudo must be checked before generic auth (see note above).
-                if any(p.search(buf_str) for p in _SUDO_PROMPTS):
-                    if not sudo_bytes:
-                        if on_output:
-                            on_output(strip_ansi(self._buffer))
-                        return self._abort_child(pid, 1)
-                    if sudo_attempts >= max_sudo_attempts:
-                        if on_output:
-                            on_output(strip_ansi(self._buffer))
-                        return self._abort_child(pid, 1)
-                    os.write(master_fd, sudo_bytes + b"\n")
-                    sudo_attempts += 1
-                    self._buffer = b""
-                    partial_since = None
-                    continue
-                if any(p.search(buf_str) for p in _AUTH_PROMPTS):
-                    if pw_bytes and not sent_password:
-                        os.write(master_fd, pw_bytes + b"\n")
-                        sent_password = True
-                        self._buffer = b""
-                        partial_since = None
-                        continue
-                if (
-                    partial_since is not None
-                    and time.monotonic() - partial_since >= 0.5
-                ):
-                    if on_output:
-                        on_output(strip_ansi(self._buffer))
-                    self._buffer = b""
-                    partial_since = None
+            buf_str = strip_ansi(self._buffer).rstrip()
+            result = answer(buf_str)
+            if result is True:
+                self._buffer = b""
+                partial_since = None
+            elif result is not False:
+                if on_output:
+                    on_output(strip_ansi(self._buffer))
+                    for note in notes:
+                        on_output(note)
+                return result
+            elif partial_since is not None and time.monotonic() - partial_since >= 0.5:
+                if on_output:
+                    on_output(strip_ansi(self._buffer))
+                self._buffer = b""
+                partial_since = None
 
         return 0
 
@@ -316,14 +377,15 @@ class PTYRunner:
         *,
         password: str = "",
         sudo_password: str = "",
-        timeout: float = 30.0,
+        timeout: float | None = 30.0,
         env: dict[str, str] | None = None,
     ) -> int:
         """Run a command interactively in a PTY.
 
         Handles the auth phase (password/sudo/host-key injection), then
         enters raw relay mode connecting the remote PTY to the user's terminal.
-        Terminal is restored on exit even if interrupted.
+        Terminal is restored on exit even if interrupted. *timeout* bounds the
+        auth phase only.
         """
         self._buffer = b""
         self._line_buffer = b""
@@ -335,30 +397,7 @@ class PTYRunner:
         pid = -1
 
         try:
-            master_fd, slave_fd = pty.openpty()
-
-            # Set non-blocking on master
-            flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-            fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-            pid = os.fork()
-            if pid == 0:
-                # Child
-                os.close(master_fd)
-                os.setsid()
-                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-                os.dup2(slave_fd, 0)
-                os.dup2(slave_fd, 1)
-                os.dup2(slave_fd, 2)
-                if slave_fd > 2:
-                    os.close(slave_fd)
-                exec_env = os.environ.copy()
-                if env:
-                    exec_env.update(env)
-                os.execvpe(argv[0], argv, exec_env)
-
-            # Parent
-            os.close(slave_fd)
+            master_fd, pid = _spawn(argv, env)
             return self._drive_interactive(
                 master_fd, pid,
                 sec_password, sec_sudo,
@@ -370,16 +409,7 @@ class PTYRunner:
                 sec_password.zero()
             if sec_sudo:
                 sec_sudo.zero()
-            try:
-                if master_fd >= 0:
-                    os.close(master_fd)
-            except Exception:
-                pass
-            if pid > 0:
-                try:
-                    os.waitpid(pid, 0)
-                except ChildProcessError:
-                    pass
+            _reap(master_fd, pid)
 
     def _drive_interactive(
         self,
@@ -387,26 +417,25 @@ class PTYRunner:
         pid: int,
         password: SecureCredential | None,
         sudo_password: SecureCredential | None,
-        timeout: float,
+        timeout: float | None,
     ) -> int:
         """Drive the PTY through auth, then relay raw between user terminal and remote."""
         import sys
-        import time
-        import termios as termios_mod
+        import tty
 
-        fd_stdin = -1
         fd_stdout = sys.stdout.fileno()
 
         # Determine usable stdin fd (pytest captures stdin — fall back to /dev/null)
         try:
             fd_stdin = sys.stdin.fileno()
-        except (OSError, Exception):
+        except (OSError, ValueError):
             try:
                 fd_stdin = os.open("/dev/null", os.O_RDONLY)
             except OSError:
                 fd_stdin = -1
 
         start = time.monotonic()
+        last_data = start
         sent_password = False
         sent_sudo = False
         auth_done = False
@@ -415,18 +444,46 @@ class PTYRunner:
         # prompt has appeared, SSH key-based auth succeeded — don't wait
         # for a password prompt that's never coming.
         _received_output = False
+        got_data = False
 
         pw_bytes = password.value if password and not password.zeroed else b""
         sudo_bytes = sudo_password.value if sudo_password and not sudo_password.zeroed else b""
+        has_auth = bool(pw_bytes)
+        has_sudo = bool(sudo_bytes)
+
+        def answer(text: str) -> bool:
+            nonlocal sent_password, sent_sudo
+            if _matches(_HOST_KEY_PROMPTS, text):
+                os.write(master_fd, b"yes\n")
+                return True
+            # Sudo before generic auth (see _drive).
+            if _matches(_SUDO_PROMPTS, text):
+                if sudo_bytes and not sent_sudo:
+                    os.write(master_fd, sudo_bytes + b"\n")
+                    sent_sudo = True
+                return True
+            if _matches(_AUTH_PROMPTS, text) or _matches(_PRIVATE_KEY_PROMPTS, text):
+                if pw_bytes and not sent_password:
+                    os.write(master_fd, pw_bytes + b"\n")
+                    sent_password = True
+                return True
+            return False
 
         old_attr = None
         try:
             if os.isatty(fd_stdin):
-                old_attr = termios_mod.tcgetattr(fd_stdin)
+                old_attr = termios.tcgetattr(fd_stdin)
                 # Set raw mode so Ctrl+C, arrows, etc. pass through to the remote
-                import tty as tty_mod
-                tty_mod.setraw(fd_stdin)
+                tty.setraw(fd_stdin)
         except Exception:
+            pass
+
+        # Keep the remote terminal size in sync with ours.
+        old_winch = None
+        try:
+            _set_winsize(master_fd)
+            old_winch = signal.signal(signal.SIGWINCH, lambda *_: _set_winsize(master_fd))
+        except (ValueError, OSError):  # not the main thread
             pass
 
         try:
@@ -442,7 +499,7 @@ class PTYRunner:
                     return 1
 
                 # Timeout for auth phase only
-                if not auth_done and time.monotonic() - start > timeout:
+                if not auth_done and timeout is not None and time.monotonic() - start > timeout:
                     try:
                         os.kill(pid, signal.SIGTERM)
                     except OSError:
@@ -454,100 +511,64 @@ class PTYRunner:
                     data = os.read(master_fd, 4096)
                     if not data:
                         # EOF from remote — shell exited
-                        break
+                        status = _exit_status(pid)
+                        return 0 if status is None else status
+                    got_data = True
+                    last_data = time.monotonic()
 
                     if not auth_done:
                         self._buffer += data
                         # Process prompts in buffer
                         while b"\n" in self._buffer:
-                            line, rest = self._buffer.split(b"\n", 1)
-                            self._buffer = rest
+                            line, self._buffer = self._buffer.split(b"\n", 1)
                             text = strip_ansi(line)
-                            line_str = text.rstrip()
-
-                            if any(p.search(line_str) for p in _HOST_KEY_PROMPTS):
-                                os.write(master_fd, b"yes\n")
+                            if answer(text.rstrip()):
                                 continue
-                            # Sudo before generic auth: _AUTH_PROMPTS[1]
-                            # matches "password for user:" inside "[sudo]
-                            # password for user:" — intercept sudo first.
-                            if any(p.search(line_str) for p in _SUDO_PROMPTS):
-                                if sudo_bytes and not sent_sudo:
-                                    os.write(master_fd, sudo_bytes + b"\n")
-                                    sent_sudo = True
-                                continue
-                            if any(p.search(line_str) for p in _AUTH_PROMPTS):
-                                if pw_bytes and not sent_password:
-                                    os.write(master_fd, pw_bytes + b"\n")
-                                    sent_password = True
-                                continue
-                            if any(p.search(line_str) for p in _PRIVATE_KEY_PROMPTS):
-                                if pw_bytes and not sent_password:
-                                    os.write(master_fd, pw_bytes + b"\n")
-                                    sent_password = True
-                                continue
-
                             # Not a prompt — print to user
-                            os.write(fd_stdout, text.encode() + b"\n")
-                            os.fsync(fd_stdout)
+                            _write_all(fd_stdout, text.encode() + b"\n")
                             _received_output = True
 
                         # Check remaining buffer for prompt fragments
-                        if self._buffer:
-                            buf_str = strip_ansi(self._buffer).rstrip()
-                            if any(p.search(buf_str) for p in _SUDO_PROMPTS):
-                                if sudo_bytes and not sent_sudo:
-                                    os.write(master_fd, sudo_bytes + b"\n")
-                                    sent_sudo = True
-                                    self._buffer = b""
-                                    continue
-                            if any(p.search(buf_str) for p in _AUTH_PROMPTS):
-                                if pw_bytes and not sent_password:
-                                    os.write(master_fd, pw_bytes + b"\n")
-                                    sent_password = True
-                                    self._buffer = b""
-                                    continue
-                            if any(p.search(buf_str) for p in _HOST_KEY_PROMPTS):
-                                os.write(master_fd, b"yes\n")
-                                self._buffer = b""
-                                continue
-
-                        # Detect auth phase complete
-                        has_auth = bool(pw_bytes)
-                        has_sudo = bool(sudo_bytes)
-                        # If the remote already sent shell output (MOTD, prompt,
-                        # etc.) without us ever seeing a password prompt, key-based
-                        # SSH auth succeeded — don't wait for a prompt that's
-                        # never coming.
-                        auto_auth = _received_output and not sent_password and not sent_sudo
-                        if (not has_auth or sent_password or auto_auth) and (not has_sudo or sent_sudo or auto_auth):
-                            auth_done = True
-                            # Flush buffered output
-                            remaining = strip_ansi(self._buffer)
-                            if remaining.strip():
-                                os.write(fd_stdout, remaining.encode())
-                                os.fsync(fd_stdout)
+                        if self._buffer and answer(strip_ansi(self._buffer).rstrip()):
                             self._buffer = b""
                     else:
                         # Raw relay: PTY → user stdout
-                        os.write(fd_stdout, data)
-                        os.fsync(fd_stdout)
+                        _write_all(fd_stdout, data)
 
                 except (OSError, BlockingIOError):
                     pass
 
+                # Detect auth phase complete.
+                if not auth_done and got_data:
+                    # If the remote already sent shell output (MOTD, prompt,
+                    # etc.) without us ever seeing a password prompt, key-based
+                    # SSH auth succeeded — don't wait for a prompt that's
+                    # never coming.
+                    auto_auth = _received_output and not sent_password and not sent_sudo
+                    # A sudo prompt, if there is one, follows the login
+                    # immediately. A remote that has gone quiet is just a
+                    # shell (plain `spyro ssh`): stop waiting for sudo.
+                    quiet = time.monotonic() - last_data > 1.0 and (_received_output or bool(self._buffer))
+                    ssh_done = not has_auth or sent_password or auto_auth
+                    if ssh_done and (not has_sudo or sent_sudo or auto_auth or quiet):
+                        auth_done = True
+                        # Flush buffered output
+                        remaining = strip_ansi(self._buffer)
+                        if remaining.strip():
+                            _write_all(fd_stdout, remaining.encode())
+                        self._buffer = b""
+
                 # Forward user stdin → PTY (after auth)
                 if auth_done:
                     try:
-                        rlist, _, _ = select.select([fd_stdin], [], [], 0.05)
-                        if rlist:
+                        rlist, _, _ = select.select([fd_stdin, master_fd], [], [], 0.05)
+                        if fd_stdin in rlist:
                             input_data = os.read(fd_stdin, 4096)
                             if not input_data:
-                                # EOF from user (Ctrl+D or close)
+                                # EOF from user
                                 break
-                            # Handle SSH escape sequences we want to pass through
-                            os.write(master_fd, input_data)
-                    except (OSError, BlockingIOError):
+                            _write_all(master_fd, input_data)
+                    except (OSError, BlockingIOError, ValueError):
                         pass
                 else:
                     select.select([master_fd], [], [], 0.05)
@@ -556,9 +577,11 @@ class PTYRunner:
             return 0
 
         finally:
+            if old_winch is not None:
+                signal.signal(signal.SIGWINCH, old_winch)
             if old_attr and os.isatty(fd_stdin):
                 try:
-                    termios_mod.tcsetattr(fd_stdin, termios_mod.TCSADRAIN, old_attr)
+                    termios.tcsetattr(fd_stdin, termios.TCSADRAIN, old_attr)
                 except Exception:
                     pass
 
@@ -592,29 +615,29 @@ def build_ssh_args(
     strict_host_checking: bool = True,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    """Build ssh command arguments."""
-    import os
+    """Build ssh command arguments.
 
+    *strict_host_checking* uses ``accept-new``: unknown hosts are trusted on
+    first use, a *changed* host key is still refused. (Plain ``yes`` refuses
+    every first connection without prompting, which broke fresh setups.)
+    """
     args = ["ssh"]
     args.extend(["-o", "BatchMode=no"])
     args.extend(["-o", "ConnectTimeout=10"])
 
-    # Enable connection sharing to speed up multiple SSH calls to the same host
-    # Use ~/.spyro/sockets/ instead of OS tempdir — macOS has a 104-char Unix socket
-    # path limit, and tempdir on macOS (e.g. /var/folders/99/.../T/) burns ~51 chars
-    # before we even start. SSH appends a random suffix to ControlPath, so a path
-    # that looks fine can still exceed the limit (see the original bug report).
-    sock_dir = os.path.join(os.path.expanduser("~"), ".spyro", "sockets")
-    os.makedirs(sock_dir, exist_ok=True)
-    ctrl_path = os.path.join(sock_dir, f"s-{user or 'anon'}@{host}:{port}")
-    args.extend(["-o", f"ControlPath={ctrl_path}"])
+    # Enable connection sharing to speed up multiple SSH calls to the same host.
+    # ``%C`` is a fixed-length (40 hex) hash of local host + remote host + port
+    # + user, so the socket path never depends on how long the user/host names
+    # are; sockets_dir() keeps the directory part short enough for macOS's
+    # 104-byte Unix socket path limit.
+    args.extend(["-o", f"ControlPath={sockets_dir()}/%C"])
     args.extend(["-o", "ControlMaster=auto"])
     args.extend(["-o", "ControlPersist=15s"])
 
     if not strict_host_checking:
         args.extend(["-o", "StrictHostKeyChecking=no"])
     else:
-        args.extend(["-o", "StrictHostKeyChecking=yes"])
+        args.extend(["-o", "StrictHostKeyChecking=accept-new"])
 
     if port != 22:
         args.extend(["-p", str(port)])

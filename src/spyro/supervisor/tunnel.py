@@ -1,32 +1,37 @@
-"""SSH tunnel management and Spyro Tunnel Supervisor (STS).
+"""SSH tunnel management.
 
-Manages local port forwarding, daemon processes, self-healing, and
-network state transitions.
-
-Uses psutil for cross-platform POSIX process tree/PID handling
-as specified in the roadmap.
+A daemon tunnel is ``ssh -f -N -L ...`` run through the PTY engine (so keychain
+passwords are injected exactly like every other spyro command) that becomes its
+own ControlMaster. ``ssh -f`` only backgrounds itself once authentication and
+the port forwards have succeeded, so a failed tunnel surfaces as an error
+instead of a recorded PID that is already dead. Stopping goes through the
+control socket; signals are a fallback and only ever sent to a PID that is
+verifiably still an ssh/spyro process.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
 import time
-from pathlib import Path
+from typing import Callable
 
+from ..core.pty_engine import PTYRunner
 from ..utils.config import ProfileConfig, SpyroConfig
-from ..utils.paths import spyro_home
+from ..utils.keychain import get_credential
+from ..utils.paths import sockets_dir, spyro_home
 from .state import (
     TunnelState,
-    _pgid_alive,
-    _pid_alive,
+    all_tunnels,
     get_tunnel,
-    mark_running,
     mark_stopped,
     set_tunnel,
+    tunnel_alive,
 )
 
 log = logging.getLogger("spyro.tunnel")
@@ -64,9 +69,41 @@ def _resolve_port(preferred: int) -> int:
 
     raise RuntimeError(f"No available port found starting from {preferred}")
 
+
+def _wait_for_ports(ports: list[int], timeout: float = 5.0) -> bool:
+    """Wait until every local forward accepts connections."""
+    deadline = time.monotonic() + timeout
+    pending = list(ports)
+    while pending and time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", pending[0]), timeout=0.3):
+                pending.pop(0)
+        except OSError:
+            time.sleep(0.1)
+    return not pending
+
+
+def db_local_port(profile: ProfileConfig, state: TunnelState) -> int:
+    """Local port that forwards the profile's database port.
+
+    ``state.forwarded_ports`` holds local ports in the same order as
+    ``profile.forwarded_ports`` (remote ports), so the DB's local port is found
+    by position rather than assuming the DB is the first forward.
+    """
+    try:
+        return state.forwarded_ports[profile.forwarded_ports.index(profile.db.port)]
+    except (ValueError, IndexError):
+        return state.local_port
+
+
 # ---------------------------------------------------------------------------
 # Tunnel lifecycle
 # ---------------------------------------------------------------------------
+
+
+def _control_path(profile_name: str) -> str:
+    digest = hashlib.sha1(profile_name.encode()).hexdigest()[:16]
+    return str(sockets_dir() / f"tun-{digest}")
 
 
 class TunnelManager:
@@ -76,119 +113,167 @@ class TunnelManager:
         self.config = config
 
     def start(
-        self, profile_name: str, *, foreground: bool = False
+        self,
+        profile_name: str,
+        *,
+        foreground: bool = False,
+        on_ready: Callable[[TunnelState], None] | None = None,
     ) -> TunnelState:
-        """Start tunnels for *profile_name*."""
+        """Start tunnels for *profile_name*.
+
+        Raises RuntimeError (with ssh's own output) if the tunnel cannot be
+        established. In foreground mode this blocks until ssh exits; *on_ready*
+        is called first so the caller can tell the user.
+        """
         profile = self.config.get_profile(profile_name)
 
-        # Check if already running
         existing = get_tunnel(profile_name)
-        if existing and existing.status == "running":
-            if _pid_alive(existing.pid):
-                log.info(f"Tunnel for '{profile_name}' already running (PID {existing.pid})")
-                return existing
+        if existing and existing.status == "running" and tunnel_alive(existing):
+            log.info(f"Tunnel for '{profile_name}' already running (PID {existing.pid})")
+            return existing
 
-        # Build local port forwarding args
+        if not profile.forwarded_ports:
+            raise RuntimeError(f"'{profile_name}' has no forwarded_ports configured")
+
         fwd_args: list[str] = []
-        forwarded_ports: list[int] = []
-
+        local_ports: list[int] = []
         for remote_port in profile.forwarded_ports:
             local_port = _resolve_port(remote_port)
+            while local_port in local_ports:  # two profiles' ports must not collide
+                local_port = _resolve_port(local_port + 1)
             fwd_args.extend(["-L", f"{local_port}:127.0.0.1:{remote_port}"])
-            forwarded_ports.append(local_port)
+            local_ports.append(local_port)
             log.info(
                 f"Port forwarding: localhost:{local_port} -> "
                 f"{profile.host}:{remote_port}"
             )
 
-        # Build ssh command
         ssh_args = [
             "ssh",
             "-o", "BatchMode=no",
             "-o", "ConnectTimeout=10",
-            "-o", "StrictHostKeyChecking=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
             "-o", "ExitOnForwardFailure=yes",
             "-N",  # No remote command
         ]
-
         if profile.port != 22:
             ssh_args.extend(["-p", str(profile.port)])
-
         if profile.key:
             ssh_args.extend(["-i", profile.key])
-
         ssh_args.extend(fwd_args)
 
         target = f"{profile.user}@{profile.host}"
-        ssh_args.append(target)
-
-        log.info(f"Starting tunnel: {' '.join(ssh_args)}")
+        password = get_credential(profile_name, profile.user) or ""
 
         if foreground:
-            return self._start_foreground(profile, ssh_args, forwarded_ports)
-        else:
-            return self._start_daemon(profile, ssh_args, forwarded_ports)
+            return self._run_foreground(profile, ssh_args, target, local_ports, password, on_ready)
+        return self._start_daemon(profile, ssh_args, target, local_ports, password)
 
-    def _start_foreground(
+    def ensure(self, profile_name: str) -> TunnelState:
+        """A live tunnel for *profile_name*, starting one if needed."""
+        state = get_tunnel(profile_name)
+        if state and state.status == "running" and tunnel_alive(state):
+            return state
+        return self.start(profile_name)
+
+    def _new_state(self, profile: ProfileConfig, local_ports: list[int], pid: int, ctl: str = "") -> TunnelState:
+        return TunnelState(
+            profile=profile.name,
+            local_port=local_ports[0],
+            pid=pid,
+            ssh_pid=pid,
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            status="running",
+            forwarded_ports=local_ports,
+            control_path=ctl,
+        )
+
+    def _run_foreground(
         self,
         profile: ProfileConfig,
         ssh_args: list[str],
-        forwarded_ports: list[int],
+        target: str,
+        local_ports: list[int],
+        password: str,
+        on_ready: Callable[[TunnelState], None] | None,
     ) -> TunnelState:
-        """Run tunnel in foreground."""
-        proc = subprocess.Popen(
-            ssh_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        state = TunnelState(
-            profile=profile.name,
-            local_port=forwarded_ports[0] if forwarded_ports else 0,
-            pid=proc.pid,
-            pgid=os.getpgid(proc.pid),
-            ssh_pid=proc.pid,
-            started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            status="running",
-            forwarded_ports=forwarded_ports,
-        )
+        """Run the tunnel attached to this terminal until ssh exits (Ctrl+C)."""
+        args = ssh_args + ["-o", "ControlMaster=no", "-o", "ControlPath=none", target]
+        # The recorded PID is ours: `spyro down` from another terminal
+        # terminates this process, which closes the PTY and ends ssh.
+        state = self._new_state(profile, local_ports, os.getpid())
         set_tunnel(state)
+        if on_ready:
+            on_ready(state)
+        try:
+            exit_code = PTYRunner().interactive_run(args, password=password, timeout=30.0)
+        finally:
+            mark_stopped(profile.name)
+        if exit_code not in (0, 130, 255):
+            raise RuntimeError(f"ssh exited with code {exit_code}")
         return state
 
     def _start_daemon(
         self,
         profile: ProfileConfig,
         ssh_args: list[str],
-        forwarded_ports: list[int],
+        target: str,
+        local_ports: list[int],
+        password: str,
     ) -> TunnelState:
-        """Run tunnel as a background daemon."""
+        """Authenticate, let ssh background itself, and verify the forwards work."""
         log_dir = spyro_home() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{profile.name}.log"
+        ctl = _control_path(profile.name)
 
-        with open(log_file, "a") as log_fh:
-            proc = subprocess.Popen(
-                ssh_args,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        args = ssh_args + ["-f", "-o", "ControlMaster=yes", "-o", f"ControlPath={ctl}", target]
+        output: list[str] = []
+        exit_code = PTYRunner().run(args, password=password, on_output=output.append, timeout=30.0)
 
-        state = TunnelState(
-            profile=profile.name,
-            local_port=forwarded_ports[0] if forwarded_ports else 0,
-            pid=proc.pid,
-            pgid=os.getpgid(proc.pid),
-            ssh_pid=proc.pid,
-            started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            status="running",
-            forwarded_ports=forwarded_ports,
-        )
+        text = "\n".join(line for line in output if line.strip())
+        if text:
+            with open(log_dir / f"{profile.name}.log", "a") as fh:
+                fh.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {text}\n")
+        if exit_code != 0:
+            detail = text.splitlines()[-1] if text else f"ssh exited with code {exit_code}"
+            raise RuntimeError(detail)
+
+        pid = self._master_pid(ctl, target)
+        if not pid:
+            raise RuntimeError("ssh started but its process could not be found")
+        if not _wait_for_ports(local_ports):
+            self._exit_master(ctl, target)
+            raise RuntimeError("tunnel started but the forwarded ports are not accepting connections")
+
+        state = self._new_state(profile, local_ports, pid, ctl)
         set_tunnel(state)
-        log.info(f"Daemon started: PID={proc.pid}, PGID={state.pgid}")
+        log.info(f"Daemon started: PID={pid}")
         return state
+
+    @staticmethod
+    def _master_pid(ctl: str, target: str) -> int:
+        try:
+            res = subprocess.run(
+                ["ssh", "-S", ctl, "-O", "check", target],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        m = re.search(r"pid=(\d+)", res.stdout + res.stderr)
+        return int(m.group(1)) if m else 0
+
+    @staticmethod
+    def _exit_master(ctl: str, target: str) -> bool:
+        try:
+            res = subprocess.run(
+                ["ssh", "-S", ctl, "-O", "exit", target],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return res.returncode == 0
 
     def stop(self, profile_name: str) -> bool:
         """Stop tunnels for *profile_name*."""
@@ -197,34 +282,32 @@ class TunnelManager:
             log.warning(f"No tunnel state found for '{profile_name}'")
             return False
 
+        try:
+            p = self.config.get_profile(profile_name)
+            target = f"{p.user}@{p.host}"
+        except SystemExit:  # profile was removed from spyro.toml since
+            target = "spyro-tunnel"
+
         stopped = False
+        if state.control_path and os.path.exists(state.control_path):
+            stopped = self._exit_master(state.control_path, target)
 
-        # Use psutil to kill process tree if available
-        if state.pgid and _pgid_alive(state.pgid):
+        # Fallback: signal the PID, but only if it is still our ssh/spyro.
+        if not stopped and tunnel_alive(state):
             try:
-                os.killpg(state.pgid, signal.SIGTERM)
+                os.kill(state.pid, signal.SIGTERM)
                 stopped = True
-            except (OSError, ProcessLookupError):
+            except OSError:
                 pass
-
-        # Fallback: kill individual PIDs
-        for pid in [state.ssh_pid, state.pid]:
-            if pid and _pid_alive(pid):
+            for _ in range(20):  # up to 2s for a graceful exit
+                if not tunnel_alive(state):
+                    break
+                time.sleep(0.1)
+            else:
                 try:
-                    os.kill(pid, signal.SIGTERM)
-                    stopped = True
-                except (OSError, ProcessLookupError):
+                    os.kill(state.pid, signal.SIGKILL)
+                except OSError:
                     pass
-
-        # Brief wait for graceful shutdown
-        time.sleep(0.5)
-
-        # Force kill if still alive
-        if state.pgid and _pgid_alive(state.pgid):
-            try:
-                os.killpg(state.pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
 
         mark_stopped(profile_name)
         log.info(f"Tunnel for '{profile_name}' stopped")
@@ -232,33 +315,22 @@ class TunnelManager:
 
     def stop_all(self) -> int:
         """Stop all active tunnels. Returns count stopped."""
-        from .state import all_tunnels
-
-        tunnels = all_tunnels()
         count = 0
-        for name, state in tunnels.items():
-            if state.status == "running":
-                if self.stop(name):
-                    count += 1
+        for name, state in all_tunnels().items():
+            if state.status == "running" and self.stop(name):
+                count += 1
         return count
 
     def status(self, profile_name: str | None = None) -> dict[str, dict]:
-        """Get status of tunnels."""
-        from .state import all_tunnels
-
-        tunnels = all_tunnels()
+        """Get status of tunnels (a recorded tunnel whose process died is ``stale``)."""
         result = {}
-
-        for name, state in tunnels.items():
+        for name, state in all_tunnels().items():
             if profile_name and name != profile_name:
                 continue
 
-            alive = _pid_alive(state.pid) if state.pid else False
-
-            if alive and state.status == "running":
-                state.status = "running"
-            elif state.status == "running":
+            if state.status == "running" and not tunnel_alive(state):
                 state.status = "stale"
+                set_tunnel(state)
 
             result[name] = {
                 "status": state.status,
@@ -269,4 +341,3 @@ class TunnelManager:
             }
 
         return result
-

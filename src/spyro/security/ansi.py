@@ -36,77 +36,40 @@ _DCS_RE = re.compile(
     re.DOTALL,
 )
 
-# Single-char C0 sequences: ESC followed by a single byte @-Z, \, _
-_C0_RE = re.compile(r"\x1b[@-Z\\-_]")
+# Any other escape sequence: ESC, optional intermediate bytes, one final byte.
+# Covers charset selection (ESC ( B), terminal reset (ESC c), save/restore
+# cursor (ESC 7 / ESC 8), keypad modes (ESC = / ESC >) and the two-byte C1 forms.
+_ESC_RE = re.compile(r"\x1b[ -/]*[0-~]")
 
-# Charset selection: ESC ( A/B/0/1/2
-_CHARSET_RE = re.compile(r"\x1b[()][AB012]")
-
-# Broader fallback for anything remaining
-_FALLBACK_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-
-# Control characters that should be stripped
-_CONTROL_CHARS_RE = re.compile(
-    r"[\x00\x07\x08]"  # NUL, BEL, BS
-)
+# Control characters that should be stripped: NUL, BEL, BS, CR (line
+# spoofing and PTY CRLF), VT, FF, DEL and the 8-bit C1 range (U+0080-U+009F,
+# which includes single-character CSI/OSC/DCS introducers).
+_CONTROL_CHARS_RE = re.compile(r"[\x00\x07\x08\r\x0b\x0c\x7f\x80-\x9f]")
 
 
 def strip_ansi(text: str | bytes) -> str:
-    """Remove all ANSI escape sequences from *text*.
+    """Remove every terminal escape/control sequence from *text*.
 
-    Safe for logging, file output, and display. Returns plain text.
+    Used on remote output before it is printed or matched. Defends against:
+      - Terminal title / clipboard injection (OSC)
+      - Screen clearing / cursor repositioning (CSI)
+      - Charset switching, DCS payloads
+      - Terminal reset and save/restore (ESC c, ESC 7, ESC 8, ESC =)
+      - Carriage-return line spoofing and PTY CRLF line endings
+
+    Returns a string containing only printable characters, tabs and newlines.
     """
     if isinstance(text, bytes):
-        try:
-            text = text.decode("utf-8", errors="replace")
-        except Exception:
-            return ""
+        text = text.decode("utf-8", errors="replace")
 
-    for regex in (_CSI_RE, _OSC_RE, _DCS_RE, _C0_RE, _CHARSET_RE):
+    for regex in (_CSI_RE, _OSC_RE, _DCS_RE, _ESC_RE):
         text = regex.sub("", text)
 
-    # Catch anything we missed
-    text = _FALLBACK_RE.sub("", text)
-
-    # Strip control characters (NUL, BEL, BS)
     text = _CONTROL_CHARS_RE.sub("", text)
 
-    return text
+    # Anything still starting with ESC is an unknown sequence: drop the byte.
+    return text.replace("\x1b", "")
 
 
-def sanitize_output(data: bytes | str) -> str:
-    """Aggressively strip ALL terminal escape/control sequences.
-
-    Used on remote command output before printing to local console.
-    Defends against:
-      - Terminal title injection (OSC)
-      - Screen clearing / cursor repositioning (CSI)
-      - Charset switching
-      - DCS payload injection
-      - Any novel escape sequence
-
-    Returns a string guaranteed to contain only printable characters
-    and newlines.
-    """
-    if isinstance(data, bytes):
-        try:
-            text = data.decode("utf-8", errors="replace")
-        except Exception:
-            return ""
-    else:
-        text = data
-
-    # Apply all sanitizers
-    for regex in (_CSI_RE, _OSC_RE, _DCS_RE, _C0_RE, _CHARSET_RE):
-        text = regex.sub("", text)
-
-    # Aggressive fallback — strip any remaining ESC sequences
-    text = _FALLBACK_RE.sub("", text)
-
-    # Strip control characters (NUL, BEL, BS)
-    text = _CONTROL_CHARS_RE.sub("", text)
-
-    # Nuclear option: strip any remaining ESC bytes
-    text = text.replace("\x1b", "")
-
-    return text
+# Kept for callers that want the intent spelled out at the call site.
+sanitize_output = strip_ansi

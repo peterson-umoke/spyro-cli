@@ -62,6 +62,7 @@ class TestServiceDetectors:
         assert status.version == "7.2.4"
         assert status.details.get("port") == "6379"
 
+    @patch("spyro.core.services._run_check", return_value=(0, ""))
     @patch("spyro.core.services.detect_redis")
     @patch("spyro.core.services.detect_supervisor")
     @patch("spyro.core.services.detect_php_fpm")
@@ -72,7 +73,24 @@ class TestServiceDetectors:
     @patch("spyro.core.services.detect_nodejs")
     @patch("spyro.core.services.detect_npm")
     def test_detect_all_services(self, *mocks):
-        for m in mocks:
+        for m in mocks[:-1]:
             m.return_value = ServiceStatus(name="mock")
         results = detect_all_services("example.com")
         assert len(results) == 9
+
+
+class TestUnreachableHost:
+    @patch("spyro.core.services._run_check")
+    def test_unreachable_host_is_one_error_not_nine_timeouts(self, mock_run):
+        mock_run.return_value = (-1, "timeout")
+        with pytest.raises(ConnectionError, match="timeout"):
+            detect_all_services("10.255.255.1")
+        assert mock_run.call_count == 1  # no per-service probing
+
+    @patch("spyro.core.services._run_check")
+    def test_timeout_is_not_reported_as_not_installed(self, mock_run):
+        mock_run.return_value = (-1, "timeout")
+        status = detect_redis(["ssh", "dummy"])
+        assert status.available is False
+        assert status.error == "timeout"
+        assert "not found" not in status.error

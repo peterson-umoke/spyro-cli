@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-import signal
+import subprocess
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..utils.paths import spyro_home
 
@@ -31,8 +33,9 @@ class TunnelState:
     ssh_pid: int = 0
     started_at: str = ""
     last_keepalive: str = ""
-    status: str = "unknown"  # running | stopped | error
-    forwarded_ports: list[int] = field(default_factory=list)
+    status: str = "unknown"  # running | stopped | stale
+    forwarded_ports: list[int] = field(default_factory=list)  # local ports, same order as the profile's
+    control_path: str = ""  # ssh ControlMaster socket of a daemon tunnel
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,17 +64,34 @@ def _load_raw() -> dict[str, Any]:
     try:
         with open(path) as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        # Keep the evidence (PIDs of live tunnels) instead of overwriting it.
+        try:
+            path.replace(path.with_name(path.name + ".corrupt"))
+        except OSError:
+            pass
+        return {}
+    except OSError:
         return {}
 
 
 def _save_raw(data: dict[str, Any]) -> None:
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
-    tmp.rename(path)
+    os.replace(tmp, path)
+
+
+@contextmanager
+def _locked() -> Iterator[None]:
+    """Serialise read-modify-write cycles between concurrent spyro processes."""
+    lock = _state_path().with_name(_STATE_FILE + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -90,16 +110,18 @@ def get_tunnel(profile: str) -> TunnelState | None:
 
 def set_tunnel(state: TunnelState) -> None:
     """Upsert a tunnel state entry."""
-    raw = _load_raw()
-    raw[state.profile] = state.to_dict()
-    _save_raw(raw)
+    with _locked():
+        raw = _load_raw()
+        raw[state.profile] = state.to_dict()
+        _save_raw(raw)
 
 
 def remove_tunnel(profile: str) -> None:
     """Remove a tunnel state entry."""
-    raw = _load_raw()
-    raw.pop(profile, None)
-    _save_raw(raw)
+    with _locked():
+        raw = _load_raw()
+        raw.pop(profile, None)
+        _save_raw(raw)
 
 
 def all_tunnels() -> dict[str, TunnelState]:
@@ -129,63 +151,40 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
         return False
-
-
-def _pgid_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
+    except OSError:  # EPERM: exists, but belongs to someone else
         return True
-    except (OSError, ProcessLookupError):
-        return False
 
-def kill_tunnels(profiles: list[str] | None = None) -> int:
-    """Kill tunnel processes for given profiles (or all).
 
-    Returns the number of processes killed.
+def tunnel_alive(state: TunnelState) -> bool:
+    """True if the tunnel's process exists *and is still ours*.
+
+    PIDs are recycled (after a reboot ``tunnels.json`` still holds old ones),
+    so existence alone is not enough: the process must still be an ssh (daemon
+    tunnel) or spyro (foreground tunnel) command.
     """
-    tunnels = all_tunnels()
-    killed = 0
-
-    for name, state in tunnels.items():
-        if profiles and name not in profiles:
-            continue
-        if state.pgid and _pgid_alive(state.pgid):
-            try:
-                os.killpg(state.pgid, signal.SIGTERM)
-                killed += 1
-            except (OSError, ProcessLookupError):
-                pass
-        elif state.pid and _pid_alive(state.pid):
-            try:
-                os.kill(state.pid, signal.SIGTERM)
-                killed += 1
-            except (OSError, ProcessLookupError):
-                pass
-
-    return killed
+    if not state.pid or not _pid_alive(state.pid):
+        return False
+    try:
+        cmd = subprocess.run(
+            ["ps", "-p", str(state.pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True  # cannot tell; do not declare a working tunnel dead
+    return "ssh" in cmd or "spyro" in cmd
 
 
 def cleanup_stale() -> list[str]:
-    """Remove state entries for tunnels whose processes are dead.
+    """Mark tunnels whose processes are gone as stale.
 
     Returns list of cleaned profile names.
     """
-    tunnels = all_tunnels()
     cleaned = []
-
-    for name, state in tunnels.items():
-        alive = False
-        if state.pgid:
-            alive = _pgid_alive(state.pgid)
-        if not alive and state.pid:
-            alive = _pid_alive(state.pid)
-
-        if not alive and state.status == "running":
+    for name, state in all_tunnels().items():
+        if state.status == "running" and not tunnel_alive(state):
             state.status = "stale"
             set_tunnel(state)
             cleaned.append(name)
-
     return cleaned
-

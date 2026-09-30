@@ -95,7 +95,8 @@ class TestEnvToDbConfig:
             "DB_CONNECTION": "pgsql",
         }
         db = _env_to_db_config(env)
-        assert db.driver == "pgsql"
+        # Laravel calls it "pgsql"; spyro's driver name (and URL scheme) is "postgres"
+        assert db.driver == "postgres"
 
     def test_empty_env(self):
         db = _env_to_db_config({})
@@ -147,3 +148,83 @@ class TestGenerateConnectionUrl:
         db = DatabaseConfig(name="/tmp/test.db", driver="sqlite")
         url = generate_connection_url(db)
         assert url == "sqlite:////tmp/test.db"
+
+
+class TestEnvParsingEdgeCases:
+    def test_hash_inside_unquoted_value_is_not_a_comment(self):
+        from spyro.core.db import _parse_env_file
+
+        assert _parse_env_file("DB_PASSWORD=pa#ss\nDB_HOST=x")["DB_PASSWORD"] == "pa#ss"
+
+    def test_trailing_comment_is_dropped(self):
+        from spyro.core.db import _parse_env_file
+
+        env = _parse_env_file("A=value  # note\nB=\"quoted # kept\" # note\nC='single'")
+        assert env == {"A": "value", "B": "quoted # kept", "C": "single"}
+
+    def test_escaped_quote_and_empty_values(self):
+        from spyro.core.db import _parse_env_file
+
+        env = _parse_env_file('A="pa\\"ss"\nB=""\nC=\nexport D=1')
+        assert env == {"A": 'pa"ss', "B": "", "C": "", "D": "1"}
+
+    def test_crlf_files_parse(self):
+        from spyro.core.db import _parse_env_file
+
+        assert _parse_env_file("A=1\r\nB=2\r\n") == {"A": "1", "B": "2"}
+
+
+class TestClientHelpers:
+    def _db(self, password="s3cret"):
+        from spyro.utils.config import DatabaseConfig
+
+        return DatabaseConfig(user="forge", password=password, name="app", driver="mysql")
+
+    def test_password_is_not_on_the_command_line(self):
+        from spyro.core.db import client_argv, client_env
+
+        argv = client_argv("mysql", self._db(), 3307, "SELECT 1")
+        assert not any("s3cret" in a for a in argv)
+        assert argv[:3] == ["mysql", "-h127.0.0.1", "-P3307"]
+        assert argv[-2:] == ["-e", "SELECT 1"]
+        assert client_env(self._db(), 3307)["MYSQL_PWD"] == "s3cret"
+
+    def test_psql_uses_env(self):
+        from spyro.core.db import client_argv, client_env
+
+        env = client_env(self._db(), 5433)
+        assert client_argv("psql", self._db(), 5433, "SELECT 1") == ["psql", "-c", "SELECT 1"]
+        assert (env["PGHOST"], env["PGPORT"], env["PGPASSWORD"]) == ("127.0.0.1", "5433", "s3cret")
+
+
+class TestFetchRemoteFile:
+    def test_returns_text_with_single_trailing_newline(self):
+        from unittest.mock import MagicMock
+        from spyro.core.db import fetch_remote_file
+        from spyro.utils.config import ProfileConfig
+
+        runner = MagicMock()
+
+        def fake_run(argv, password="", on_output=None, timeout=0):
+            for line in ("A=1", "B=2", ""):
+                on_output(line)
+            return 0
+
+        runner.run.side_effect = fake_run
+        text = fetch_remote_file(ProfileConfig(name="p", host="h"), "/x/.env", runner=runner)
+        assert text == "A=1\nB=2\n"
+        assert "cat -- /x/.env" in runner.run.call_args.args[0][-1]
+
+    def test_failure_returns_none_even_if_output_was_produced(self):
+        from unittest.mock import MagicMock
+        from spyro.core.db import fetch_remote_file
+        from spyro.utils.config import ProfileConfig
+
+        runner = MagicMock()
+
+        def fake_run(argv, password="", on_output=None, timeout=0):
+            on_output("cat: /x/.env: No such file or directory")
+            return 1
+
+        runner.run.side_effect = fake_run
+        assert fetch_remote_file(ProfileConfig(name="p", host="h"), "/x/.env", runner=runner) is None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,7 @@ class ProfileConfig:
     wordpress: bool = False  # detect WordPress / WP-CLI
     wp_cli_path: str = ""  # custom path to wp-cli (default: auto-detect)
     sudo: bool = False  # whether sudo is available
+    sudo_user: str = ""  # run app commands as this user (sudo -u), default root
     env_files: list[str] = field(default_factory=lambda: [".env"])
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -161,48 +163,60 @@ def parse_ssh_config(path: Path | None = None) -> dict[str, dict[str, str]]:
     return result
 
 
-def resolve_ssh_for_profile(profile_name: str) -> dict[str, str]:
-    """Look up SSH config settings for a profile name.
-
-    Checks exact Host matches first, then wildcard ``*``.
-    Returns a dict with optional keys: hostname, user, port, identityfile.
-    """
-    ssh_cfg = parse_ssh_config()
-
-    # 1. Exact match on profile name
-    if profile_name in ssh_cfg:
-        return dict(ssh_cfg[profile_name])
-
-    # 2. Wildcard fallback
-    if "*" in ssh_cfg:
-        return dict(ssh_cfg["*"])
-
+def _specific_block(ssh_cfg: dict[str, dict[str, str]], name: str) -> dict[str, str]:
+    """The Host block for *name*: exact match first, then glob patterns."""
+    if name in ssh_cfg:
+        return ssh_cfg[name]
+    for pattern, block in ssh_cfg.items():
+        if pattern != "*" and fnmatch.fnmatchcase(name, pattern):
+            return block
     return {}
 
 
-def apply_ssh_to_profile(profile: ProfileConfig) -> None:
+def resolve_ssh_for_profile(profile_name: str, host: str = "") -> dict[str, str]:
+    """Look up SSH config settings for a profile.
+
+    Uses the Host block matching *profile_name* (or, failing that, *host*),
+    layered over ``Host *``. ``HostName`` is never taken from ``Host *`` — it
+    would silently redirect every profile to the same server.
+    Returns a dict with optional keys: hostname, user, port, identityfile.
+    """
+    ssh_cfg = parse_ssh_config()
+    specific = _specific_block(ssh_cfg, profile_name) or (
+        _specific_block(ssh_cfg, host) if host else {}
+    )
+    star = {k: v for k, v in ssh_cfg.get("*", {}).items() if k != "hostname"}
+    return {**star, **specific}
+
+
+def apply_ssh_to_profile(profile: ProfileConfig, explicit: set[str] | None = None) -> None:
     """Mutate a ProfileConfig in-place, inheriting SSH config settings.
 
-    If the profile's ``host`` value matches an SSH Host entry, the
-    SSH config's HostName replaces the profile host, and User/Port/
-    IdentityFile fill in any gaps.
+    HostName replaces the profile host; User/Port/IdentityFile only fill in
+    fields the profile did not set. *explicit* is the set of keys present in
+    the profile's TOML table; without it, fields still at their default value
+    are treated as unset.
     """
-    ssh_settings = resolve_ssh_for_profile(profile.name)
-    if not ssh_settings:
-        # Try matching profile host against SSH Host entries
-        ssh_settings = resolve_ssh_for_profile(profile.host)
+    ssh_settings = resolve_ssh_for_profile(profile.name, profile.host)
     if not ssh_settings:
         return
 
-    # HostName from SSH config overrides the profile's host
+    if explicit is None:
+        unset = {
+            "user": profile.user == "deploy",
+            "port": profile.port == 22,
+            "key": not profile.key,
+        }
+    else:
+        unset = {k: k not in explicit for k in ("user", "port", "key")}
+
     if "hostname" in ssh_settings:
         profile.host = ssh_settings["hostname"]
-    # Only inherit user/port/key if NOT explicitly set in profile
-    if "user" in ssh_settings and profile.user == "deploy":
+    if "user" in ssh_settings and unset["user"]:
         profile.user = ssh_settings["user"]
-    if "port" in ssh_settings and profile.port == 22:
+    if "port" in ssh_settings and unset["port"]:
         profile.port = int(ssh_settings["port"])
-    if "identityfile" in ssh_settings and not profile.key:
+    if "identityfile" in ssh_settings and unset["key"]:
         profile.key = ssh_settings["identityfile"]
 
 
@@ -233,11 +247,12 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
         key=raw.get("key", ""),
         db=_parse_db(raw.get("db")),
         remote_path=raw.get("remote_path", "/var/www"),
-        forwarded_ports=raw.get("forwarded_ports", []),
+        forwarded_ports=[int(x) for x in raw.get("forwarded_ports", [])],
         artisan=raw.get("artisan", False),
         wordpress=raw.get("wordpress", False),
         wp_cli_path=raw.get("wp_cli_path", ""),
         sudo=raw.get("sudo", False),
+        sudo_user=raw.get("sudo_user", ""),
         env_files=raw.get("env_files", [".env"]),
         extra={
             k: v
@@ -255,6 +270,7 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
                 "wordpress",
                 "wp_cli_path",
                 "sudo",
+                "sudo_user",
                 "env_files",
             }
         },
@@ -262,14 +278,26 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
 
 
 def parse_config(path: Path) -> SpyroConfig:
-    """Parse a spyro.toml file and return SpyroConfig."""
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+    """Parse a spyro.toml file and return SpyroConfig.
+
+    Problems with the file exit with a one-line message, not a traceback.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f"Invalid TOML in {path}: {e}") from None
 
     profiles: dict[str, ProfileConfig] = {}
-    raw_profiles = raw.get("profiles", {})
-    for name, data in raw_profiles.items():
-        profiles[name] = _parse_profile(name, data)
+    explicit: dict[str, set[str]] = {}
+    for name, data in raw.get("profiles", {}).items():
+        try:
+            profiles[name] = _parse_profile(name, data)
+        except KeyError as e:
+            raise SystemExit(f"Profile '{name}': {e.args[0]!r} is required in {path}") from None
+        except (TypeError, ValueError, AttributeError) as e:
+            raise SystemExit(f"Profile '{name}': invalid value in {path} ({e})") from None
+        explicit[name] = set(data)
 
     # Top-level settings that aren't profiles
     global_settings = {
@@ -284,9 +312,7 @@ def parse_config(path: Path) -> SpyroConfig:
             try:
                 defaults["command_timeout"] = float(ct)
             except (TypeError, ValueError):
-                import sys
-                print(f"spyro: [defaults] command_timeout must be a number, got {ct!r}", file=sys.stderr)
-                sys.exit(1)
+                raise SystemExit(f"[defaults] command_timeout must be a number, got {ct!r}") from None
 
     config = SpyroConfig(
         profiles=profiles,
@@ -295,8 +321,8 @@ def parse_config(path: Path) -> SpyroConfig:
     )
 
     # Apply SSH config inheritance to profiles
-    for profile in config.profiles.values():
-        apply_ssh_to_profile(profile)
+    for name, profile in config.profiles.items():
+        apply_ssh_to_profile(profile, explicit[name])
 
     return config
 
@@ -366,7 +392,7 @@ def resolve_profile(profile: str | None) -> str:
 
 CONFIG_TEMPLATE = """\
 # Spyro Configuration
-# Docs: https://github.com/yourorg/spyro
+# Docs: https://github.com/peterson-umoke/spyro-cli
 
 [profiles.staging]
 host = "staging.example.com"
@@ -376,11 +402,14 @@ port = 22
 remote_path = "/var/www/app"
 artisan = true
 sudo = true
-forwarded_ports = [33060, 63790]
+# sudo_user = "www-data"   # run artisan/tinker/wp as this user instead of root
+# Remote ports to tunnel to localhost (spyro up); the local port is the same
+# unless it is taken, in which case the next free one is used.
+forwarded_ports = [3306, 6379]
 
 [profiles.staging.db]
 host = "127.0.0.1"
-port = 33060
+port = 3306  # the remote DB port; must be one of forwarded_ports
 name = "app_staging"
 user = "forge"
 password = ""
@@ -393,11 +422,11 @@ port = 22
 remote_path = "/var/www/app"
 artisan = true
 sudo = false
-forwarded_ports = [33061]
+forwarded_ports = [3306]
 
 [profiles.production.db]
 host = "127.0.0.1"
-port = 33061
+port = 3306
 name = "app_production"
 user = "forge"
 password = ""
@@ -410,11 +439,11 @@ driver = "mysql"
 # remote_path = "/var/www/html"
 # wordpress = true
 # sudo = false
-# forwarded_ports = [33062]
+# forwarded_ports = [3306]
 #
 # [profiles.wordpress.db]
 # host = "127.0.0.1"
-# port = 33062
+# port = 3306
 # name = "wordpress"
 # user = "wp_user"
 # password = ""

@@ -131,6 +131,12 @@ FRAMEWORK_EXCLUSIONS = {
 }
 
 
+# Rules that only make sense once the framework is known. Applying them to an
+# unrecognised project would drop deployable files: Laravel's public/.htaccess
+# and public/build/ (Vite output) would never be synced.
+_ONLY_WHEN_DETECTED = {".htaccess", "build/", "dist/"}
+
+
 # ---------------------------------------------------------------------------
 # Pin configuration
 # ---------------------------------------------------------------------------
@@ -159,10 +165,11 @@ class SyncPin:
             files.update(fw.get("files", set()))
             dirs.update(fw.get("dirs", set()))
         elif self.framework == "" or self.framework == "auto":
-            # Apply all framework rules
+            # Unknown project: apply every framework's secrets/cache rules, but
+            # not the ones that are only safe to apply when we know what it is.
             for fw in FRAMEWORK_EXCLUSIONS.values():
-                files.update(fw.get("files", set()))
-                dirs.update(fw.get("dirs", set()))
+                files.update(fw.get("files", set()) - _ONLY_WHEN_DETECTED)
+                dirs.update(fw.get("dirs", set()) - _ONLY_WHEN_DETECTED)
 
         # Add custom exclusions
         files.update(self.exclude_files)
@@ -205,11 +212,19 @@ def should_exclude(
             if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(str(rel), pattern):
                 return False
 
-    # Check directory exclusions
-    for part in parts[:-1]:  # All parts except filename
+    # Check directory exclusions. A pattern may name one segment ("vendor/")
+    # or a path ("storage/framework/sessions/"), so test every leading path
+    # prefix as well as each segment.
+    dir_parts = parts[:-1]
+    for i, part in enumerate(dir_parts):
+        prefix = "/".join(dir_parts[: i + 1])
         for pattern in exclude_dirs:
-            if fnmatch.fnmatch(part, pattern) or fnmatch.fnmatch(part + "/", pattern):
+            pattern = pattern.rstrip("/")
+            if fnmatch.fnmatch(part, pattern) or fnmatch.fnmatch(prefix, pattern):
                 return True
+    # Patterns listed as "dirs" may also name a single file (wp-content/debug.log)
+    if any(fnmatch.fnmatch(str(rel), pat.rstrip("/")) for pat in exclude_dirs):
+        return True
 
     # Check file exclusions
     for pattern in exclude_files:
@@ -273,20 +288,38 @@ def _pins_path() -> Path:
 
 
 def load_pins() -> list[SyncPin]:
-    """Load pinned sync directories from ~/.spyro/sync_pins.json."""
+    """Load pinned sync directories from ~/.spyro/sync_pins.json.
+
+    Unknown keys (written by another spyro version) are ignored and an
+    unreadable entry is skipped, so one bad pin never hides the others.
+    """
     path = _pins_path()
     if not path.exists():
         return []
     try:
         with open(path) as f:
             data = json.load(f)
-        return [SyncPin(**item) for item in data]
-    except (json.JSONDecodeError, OSError, TypeError):
+    except json.JSONDecodeError:
+        try:  # keep the file; the next save must not silently overwrite it
+            path.replace(path.with_name(path.name + ".corrupt"))
+        except OSError:
+            pass
         return []
+    except OSError:
+        return []
+
+    known = set(SyncPin.__dataclass_fields__)
+    pins = []
+    for item in data if isinstance(data, list) else []:
+        try:
+            pins.append(SyncPin(**{k: v for k, v in item.items() if k in known}))
+        except (TypeError, AttributeError):
+            continue
+    return pins
 
 
 def save_pins(pins: list[SyncPin]) -> None:
-    """Save pinned sync directories."""
+    """Save pinned sync directories (atomically)."""
     path = _pins_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = [
@@ -301,8 +334,10 @@ def save_pins(pins: list[SyncPin]) -> None:
         }
         for p in pins
     ]
-    with open(path, "w") as f:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def add_pin(pin: SyncPin) -> list[SyncPin]:

@@ -16,8 +16,6 @@ from .commands import (
     cmd_config,
     cmd_cp,
     cmd_db,
-    cmd_db_shell,
-    cmd_db_tunnel,
     cmd_doctor,
     cmd_down,
     cmd_env,
@@ -103,9 +101,14 @@ def main(ctx: click.Context, verbose: bool, quiet: bool, install_completion: boo
     ctx.obj["verbose"] = verbose
     ctx.obj["quiet"] = quiet
 
-    # Post-command: check for updates (unless quiet or running update itself)
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+        return
+
+    # After the command: tell the user about a newer release (skipped when
+    # quiet or when the command is `update` itself).
     if not quiet and ctx.invoked_subcommand != "update":
-        notify_update()
+        ctx.call_on_close(notify_update)
 
 
 # Register commands
@@ -124,8 +127,6 @@ main.add_command(cmd_artisan, "artisan")
 main.add_command(cmd_cp, "cp")
 main.add_command(cmd_cp, "deploy")
 main.add_command(cmd_cp, "upload")
-main.add_command(cmd_db_tunnel, "db-tunnel")
-main.add_command(cmd_db_shell, "db-shell")
 main.add_command(cmd_wp, "wp")
 main.add_command(cmd_pin, "pin")
 main.add_command(cmd_unpin, "unpin")
@@ -141,6 +142,9 @@ main.add_command(cmd_tinker, "tinker")
 main.add_command(cmd_eval, "eval")
 main.add_command(cmd_script, "script")
 main.add_command(cmd_db, "db")
+# Legacy top-level aliases for `db tunnel` / `db shell`
+main.add_command(cmd_db.commands["tunnel"], "db-tunnel")
+main.add_command(cmd_db.commands["shell"], "db-shell")
 main.add_command(cmd_auth, "auth")
 main.add_command(cmd_ssh, "ssh")
 main.add_command(cmd_shell, "shell")

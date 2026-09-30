@@ -127,3 +127,61 @@ class TestSecureCredential:
 
         # SecureString should be deleted (YAGNI/redundant)
         assert not hasattr(mem, "SecureString")
+
+
+class TestKeychainHeadless:
+    def test_env_credential_per_profile_beats_global(self, monkeypatch):
+        from spyro.utils.keychain import get_credential
+
+        monkeypatch.setenv("SPYRO_PASSWORD", "global")
+        monkeypatch.setenv("SPYRO_PASSWORD_MY_STAGING", "specific")
+        assert get_credential("my-staging", "deploy") == "specific"
+        assert get_credential("other", "deploy") == "global"
+
+    def test_no_prompt_when_stdin_is_not_a_tty(self, monkeypatch):
+        import getpass
+        from spyro.utils import keychain
+
+        monkeypatch.delenv("SPYRO_PASSWORD", raising=False)
+        monkeypatch.setattr(keychain, "get_credential", lambda *a: None)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        monkeypatch.setattr(getpass, "getpass", lambda *a: (_ for _ in ()).throw(AssertionError("prompted")))
+        assert keychain.prompt_for_credential("p", "u") == ""
+
+
+class TestSocketsDir:
+    def test_short_home_uses_spyro_sockets(self, tmp_path, monkeypatch):
+        from spyro.utils import paths
+
+        monkeypatch.setattr(paths, "spyro_home", lambda: tmp_path / "h")
+        monkeypatch.setattr(paths, "_MAX_SOCKET_DIR", 10_000)
+        d = paths.sockets_dir()
+        assert d == tmp_path / "h" / "sockets" and oct(d.stat().st_mode & 0o777) == "0o700"
+
+    def test_long_home_falls_back_to_a_short_private_dir(self, tmp_path, monkeypatch):
+        from spyro.utils import paths
+
+        monkeypatch.setattr(paths, "spyro_home", lambda: tmp_path / ("x" * 60))
+        d = paths.sockets_dir()
+        try:
+            assert d == Path(f"/tmp/spyro-{os.getuid()}")
+            assert len(f"{d}/{'0' * 40}.{'a' * 16}") < 104        # fits macOS's sun_path
+            assert oct(d.stat().st_mode & 0o777) == "0o700"
+        finally:
+            try:
+                d.rmdir()  # only removes it if empty (nothing else is using it)
+            except OSError:
+                pass
+
+    def test_chosen_dir_always_fits_the_socket_limit(self, tmp_path, monkeypatch):
+        from spyro.utils import paths
+
+        for home in (tmp_path / "h", tmp_path / ("y" * 80)):
+            monkeypatch.setattr(paths, "spyro_home", lambda home=home: home)
+            d = paths.sockets_dir()
+            assert len(f"{d}/{'0' * 40}.{'a' * 16}") < 104
+            if str(d).startswith("/tmp/spyro-"):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass

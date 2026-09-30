@@ -2,26 +2,38 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from typing import Callable
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 from ..utils.config import (
     DatabaseConfig,
+    ProfileConfig,
     SpyroConfig,
     generate_config,
     load_config,
     resolve_profile,
 )
-from ..core.db import generate_connection_url, resolve_db_credentials
+from ..core.db import (
+    client_argv,
+    client_env,
+    fetch_remote_file,
+    generate_connection_url,
+    resolve_db_credentials,
+)
 from ..core.services import detect_all_services
 from ..core.sync import (
     SyncPin, load_pins, add_pin, remove_pin,
@@ -32,12 +44,89 @@ from ..core.pty_engine import PTYRunner, build_scp_args, build_ssh_args
 from ..supervisor.state import (
     all_tunnels,
     get_tunnel,
+    tunnel_alive,
 )
-from ..supervisor.tunnel import TunnelManager
+from ..supervisor.tunnel import TunnelManager, db_local_port
 from ..utils.paths import safe_quote
 
 console = Console()
+err_console = Console(stderr=True)
 log = logging.getLogger("spyro")
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+
+def _remote(line: str, prefix: str = "") -> None:
+    """Print a line of remote output verbatim.
+
+    Remote text must never be parsed as Rich markup (``[/var/www]`` raises,
+    ``[stacktrace]`` silently vanishes) or emoji codes, nor re-wrapped.
+    """
+    console.print(Text(prefix + line), soft_wrap=True)
+
+
+def _emit_json(obj: object) -> None:
+    """Machine-readable output: plain stdout, never wrapped or highlighted."""
+    click.echo(json.dumps(obj, indent=2, default=str))
+
+
+def _report_exit(ec: int, timeout: float | None, prefix: str = "  ") -> None:
+    if ec == 124:
+        console.print(
+            f"{prefix}[red]Timed out after {timeout:g}s. The remote command may still be "
+            f"running; raise the limit with --timeout.[/red]"
+        )
+    elif ec != 0:
+        console.print(f"{prefix}[red]Exit code: {ec}[/red]")
+
+
+def _sudo_prefix(p: "ProfileConfig", no_escalate: bool = False) -> str:
+    """``sudo `` (or ``sudo -u <sudo_user> ``) for app commands, ``""`` when not escalating.
+
+    Running the app as root leaves root-owned files in storage/ and cache/ that
+    the web server user can no longer write; ``sudo_user`` avoids that.
+    """
+    if no_escalate or not p.sudo:
+        return ""
+    return f"sudo -u {safe_quote(p.sudo_user)} " if p.sudo_user else "sudo "
+
+
+def _tunnel_for(config: SpyroConfig, profile_name: str):
+    """A live tunnel for the profile, starting one if needed (exits with the ssh error on failure)."""
+    state = get_tunnel(profile_name)
+    if not (state and state.status == "running" and tunnel_alive(state)):
+        console.print(f"[cyan]Starting tunnel for {profile_name}...[/cyan]")
+    try:
+        return TunnelManager(config).ensure(profile_name)
+    except RuntimeError as e:
+        raise click.ClickException(f"Could not start tunnel for '{profile_name}': {e}") from None
+
+
+def _resolve_db(p: "ProfileConfig", profile_name: str) -> DatabaseConfig:
+    """``[profiles.x.db]`` as configured, or read from the remote .env when its password is empty."""
+    if p.db.password:
+        return p.db
+    from ..utils.keychain import prompt_for_credential
+
+    console.print("[dim]db.password is empty: reading credentials from the remote .env...[/dim]")
+    return resolve_db_credentials(p, password=prompt_for_credential(profile_name, p.user))
+
+
+def _db_target(profile_name: str, *, no_tunnel: bool = False, port: int | None = None):
+    """Everything a local DB client needs: ``(profile, database config, local port)``."""
+    config = load_config()
+    p = config.get_profile(profile_name)
+    db = _resolve_db(p, profile_name)
+    if port:
+        local_port = port
+    elif no_tunnel:
+        local_port = db.port
+    else:
+        local_port = db_local_port(p, _tunnel_for(config, profile_name))
+    return p, db, local_port
 
 
 # ---------------------------------------------------------------------------
@@ -84,21 +173,36 @@ def _audit_deps() -> None:
 
 @click.command()
 @click.argument("profile", required=False)
-@click.option("--no-daemon", is_flag=True, help="Run in foreground")
+@click.option("--no-daemon", is_flag=True, help="Run in the foreground (Ctrl+C stops it)")
 def cmd_up(profile: str | None, no_daemon: bool) -> None:
-    """Start tunnels for a profile (or all if omitted)."""
+    """Start tunnels for a profile (or every profile with forwarded_ports)."""
     config = load_config()
     manager = TunnelManager(config)
 
-    profiles = [profile] if profile else config.profile_names
+    if profile:
+        profiles = [profile]
+    else:
+        profiles = [n for n in config.profile_names if config.profiles[n].forwarded_ports]
+        if not profiles:
+            console.print("[yellow]No profile has forwarded_ports configured[/yellow]")
+            return
 
+    failed = 0
     for name in profiles:
+        console.print(f"[cyan]Starting tunnel: {name}[/cyan]")
         try:
-            console.print(f"[cyan]Starting tunnel: {name}[/cyan]")
-            state = manager.start(name, foreground=no_daemon)
-            _print_tunnel_info(name, state)
-        except Exception as e:
-            console.print(f"[red]Failed to start '{name}': {e}[/red]")
+            state = manager.start(
+                name,
+                foreground=no_daemon,
+                on_ready=lambda st, n=name: _print_tunnel_info(n, st),
+            )
+            if not no_daemon:
+                _print_tunnel_info(name, state)
+        except (RuntimeError, SystemExit) as e:
+            failed += 1
+            console.print(Text(f"Failed to start '{name}': {e}", style="red"))
+    if failed:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -133,21 +237,19 @@ def cmd_down(profile: str | None) -> None:
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 def cmd_status(profile: str | None, json_output: bool) -> None:
     """Display health, active tunnels, and port mappings."""
-    import json as json_mod
-
     config = load_config()
     manager = TunnelManager(config)
     statuses = manager.status(profile)
 
     if not statuses:
         if json_output:
-            console.print(json_mod.dumps({"tunnels": [], "status": "no_tunnels"}))
+            _emit_json({"tunnels": [], "status": "no_tunnels"})
         else:
             console.print("[yellow]No tunnels configured[/yellow]")
         return
 
     if json_output:
-        console.print(json_mod.dumps({"tunnels": statuses}, indent=2, default=str))
+        _emit_json({"tunnels": statuses})
         return
 
     table = Table(title="Spyro Tunnels")
@@ -187,7 +289,7 @@ def _show_log(path: Path, follow: bool) -> None:
         try:
             lines = path.read_text().splitlines()
             for line in lines[-50:]:
-                console.print(line)
+                _remote(line)
         except FileNotFoundError:
             console.print(f"[red]Log file not found: {path}[/red]")
 
@@ -296,8 +398,6 @@ def _find_wp_cli(ssh_args: list[str], wp_cli_path: str = "") -> str:
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 def cmd_doctor(json_output: bool) -> None:
     """Run automated diagnostics."""
-    import json as json_mod
-
     issues: list[str] = []
     results: dict[str, list[dict]] = {}
 
@@ -506,26 +606,27 @@ def cmd_doctor(json_output: bool) -> None:
             )
             for svc in services:
                 if not json_output:
-                    line = f"    {svc.icon} {svc.summary}"
+                    # summary/path/details come from the remote host: never markup
+                    line = f"    {svc.icon} {escape(svc.summary)}"
                     if svc.path:
-                        line += f" ({svc.path})"
+                        line += f" ({escape(svc.path)})"
                     console.print(line)
                     if svc.details:
                         for k, v in svc.details.items():
-                            console.print(f"      {k}: {v}")
+                            console.print(f"      {escape(k)}: {escape(v)}")
                 _record("remote_services", f"{name}/{svc.summary}", True, str(svc.details) if json_output else "")
         except Exception as e:
             if not json_output:
-                console.print(f"    [yellow]⚠ Service check interrupted: {e}[/yellow]")
+                console.print(f"    [yellow]⚠ Service check interrupted: {escape(str(e))}[/yellow]")
             issues.append(f"Service check failed for {name}: {e}")
             _record("remote_services", name, False, str(e))
 
     if json_output:
-        console.print(json_mod.dumps({
+        _emit_json({
             "sections": results,
             "issues": issues,
             "healthy": len(issues) == 0,
-        }, indent=2, default=str))
+        })
         return
 
     console.print(f"\n[bold]Summary:[/bold] {len(issues)} issue(s) found")
@@ -549,35 +650,23 @@ def cmd_pull_env(dest: str, profile: str) -> None:
     config = load_config()
     p = config.get_profile(profile)
 
+    from ..utils.keychain import prompt_for_credential
+
+    ssh_pw = prompt_for_credential(profile, p.user)
     console.print(f"[cyan]Pulling .env from {p.host}...[/cyan]")
 
-    ssh_args = build_ssh_args(
-        host=p.host,
-        user=p.user,
-        port=p.port,
-        key=p.key,
-    )
-
-    output_lines: list[str] = []
-
-    def collect(line: str) -> None:
-        output_lines.append(line)
-
-    runner = PTYRunner()
-
     for env_file in p.env_files:
-        remote_path = f"{p.remote_path}/{env_file}"
-        cmd = ssh_args + [f"cat {safe_quote(remote_path)}"]
-
-        exit_code = runner.run(cmd, on_output=collect, timeout=15.0)
-
-        if exit_code == 0 and output_lines:
-            content = "\n".join(output_lines)
-            Path(dest).write_text(content)
-            console.print(f"[green]Saved to {dest}[/green]")
+        content = fetch_remote_file(p, f"{p.remote_path}/{env_file}", password=ssh_pw)
+        if content:
+            # Secrets: owner-only, even when the file already existed with looser modes
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            os.chmod(dest, 0o600)
+            console.print(Text(f"Saved to {dest}", style="green"))
             return
 
-    console.print("[red]Failed to pull environment config[/red]")
+    raise click.ClickException("Failed to pull environment config")
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +683,6 @@ def cmd_pull_env(dest: str, profile: str) -> None:
 def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdir: bool, command: str) -> None:
     """Execute a command on remote server(s)."""
     config = load_config()
-    resolved_timeout = _get_timeout(config, timeout, 60.0)
 
     if run_all:
         profiles = config.profile_names
@@ -608,51 +696,13 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
             console.print("[red]Specify --all, --profile, or set SPYRO_PROFILE[/red]")
             return
 
-    runner = PTYRunner()
-
     for name in profiles:
         p = config.get_profile(name)
         console.print(f"\n[bold cyan]=== {name} ===[/bold cyan]")
 
-        ssh_args = build_ssh_args(
-            host=p.host,
-            user=p.user,
-            port=p.port,
-            key=p.key,
-        )
-
-        # Force PTY allocation so remote sudo can prompt for password
-        if p.sudo:
-            ssh_args.insert(1, "-t")
-
         # Optionally wrap command with cd to remote_path
-        remote_cmd = command
-        if chdir:
-            remote_cmd = f"{_capistrano_cd(p.remote_path)} && {command}"
-
-        ssh_args.append(remote_cmd)
-
-        def output_line(line: str) -> None:
-            console.print(f"  {line}")
-
-        from ..utils.keychain import prompt_for_credential
-
-        sudo_pw = ""
-        if p.sudo:
-            sudo_pw = prompt_for_credential(name, p.user)
-
-        ssh_pw = prompt_for_credential(name, p.user)
-
-        exit_code = runner.run(
-            ssh_args,
-            password=ssh_pw,
-            sudo_password=sudo_pw,
-            on_output=output_line,
-            timeout=resolved_timeout,
-        )
-
-        if exit_code != 0:
-            console.print(f"  [red]Exit code: {exit_code}[/red]")
+        remote_cmd = f"{_capistrano_cd(p.remote_path)} && {command}" if chdir else command
+        _run_svc_cmd(name, remote_cmd, timeout=60.0, cli_timeout=timeout, escalate=p.sudo)
 
 
 # ---------------------------------------------------------------------------
@@ -685,21 +735,17 @@ def cmd_proxy_url(profile: str, port: int | None) -> None:
     """Generate a local connection string for database GUIs."""
     config = load_config()
     p = config.get_profile(profile)
+    db = _resolve_db(p, profile)
 
     tunnel = get_tunnel(profile)
-    local_port = port or (tunnel.local_port if tunnel else p.db.port)
+    if port:
+        local_port = port
+    elif tunnel and tunnel.status == "running" and tunnel_alive(tunnel):
+        local_port = db_local_port(p, tunnel)
+    else:
+        local_port = db.port
 
-    db = DatabaseConfig(
-        host=p.db.host,
-        port=local_port,
-        name=p.db.name,
-        user=p.db.user,
-        password=p.db.password,
-        driver=p.db.driver,
-    )
-
-    url = generate_connection_url(db)
-    console.print(url)
+    click.echo(generate_connection_url(db, port_override=local_port))
 
 
 # ---------------------------------------------------------------------------
@@ -722,55 +768,18 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | N
 
     config = load_config()
     p = config.get_profile(profile)
-    resolved_timeout = _get_timeout(config, timeout, 60.0)
     if not p.artisan:
         console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
         return
 
-    runner = PTYRunner()
-
-    sudo_prefix = ""
-    if not no_escalate and p.sudo:
-        sudo_prefix = "sudo "
-
-    ssh_args = build_ssh_args(
-        host=p.host,
-        user=p.user,
-        port=p.port,
-        key=p.key,
+    artisan_cmd = (
+        f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}"
+        f"php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
     )
-
-    cd_cmd = _capistrano_cd(p.remote_path)
-
-    artisan_cmd = f"{cd_cmd} && {sudo_prefix}php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
-
-    # Force PTY allocation so remote sudo can prompt for password
-    if p.sudo and not no_escalate:
-        ssh_args.insert(1, "-t")
-
-    ssh_args.append(artisan_cmd)
-
-    from ..utils.keychain import prompt_for_credential
-
-    sudo_pw = ""
-    if p.sudo and not no_escalate:
-        sudo_pw = prompt_for_credential(profile, p.user)
-
-    ssh_pw = prompt_for_credential(profile, p.user)
-
-    def output_line(line: str) -> None:
-        console.print(line)
-
-    exit_code = runner.run(
-        ssh_args,
-        password=ssh_pw,
-        sudo_password=sudo_pw,
-        on_output=output_line,
-        timeout=resolved_timeout,
+    _run_svc_cmd(
+        profile, artisan_cmd, timeout=60.0, cli_timeout=timeout,
+        escalate=p.sudo and not no_escalate, prefix="",
     )
-
-    if exit_code != 0:
-        console.print(f"\n[red]Exit code: {exit_code}[/red]")
 
 
 # ---------------------------------------------------------------------------
@@ -842,12 +851,10 @@ def cmd_unpin(local_path: str, profile: str) -> None:
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 def cmd_pins(json_output: bool) -> None:
     """List all pinned sync directories."""
-    import json as json_mod
-
     pins = load_pins()
     if not pins:
         if json_output:
-            console.print(json_mod.dumps({"pins": []}))
+            _emit_json({"pins": []})
         else:
             console.print("[yellow]No pinned directories. Use 'spyro pin' to add one.[/yellow]")
         return
@@ -862,7 +869,7 @@ def cmd_pins(json_output: bool) -> None:
             }
             for p in pins
         ]
-        console.print(json_mod.dumps({"pins": pin_list}, indent=2))
+        _emit_json({"pins": pin_list})
         return
 
     table = Table(title="Pinned Sync Directories")
@@ -882,9 +889,21 @@ def cmd_pins(json_output: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_sync_watch(profile: str, pins: list[SyncPin], dry_run: bool = False) -> None:
-    """Internal helper to watch directory pins using watchdog."""
+def _run_sync_watch(
+    profile: str,
+    pins: list[SyncPin],
+    dry_run: bool = False,
+    stop: "threading.Event | None" = None,
+) -> None:
+    """Watch directory pins with watchdog and upload changed files.
+
+    Watchdog calls the handler from its own thread, which must not fork PTYs or
+    print: it only queues paths. This (main) thread drains the queue.
+    """
+    import posixpath
+    import queue
     import time
+
     try:
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
@@ -903,75 +922,109 @@ def _run_sync_watch(profile: str, pins: list[SyncPin], dry_run: bool = False) ->
     console.print(f"[cyan]Syncing {len(pins)} pinned director(y/ies) for {profile}[/cyan]")
     for pin in pins:
         exclude_files, _ = pin.get_all_excludes()
-        console.print(f"  {pin.local_path} -> {pin.remote_path} ({len(exclude_files)} exclude patterns)")
+        console.print(Text(f"  {pin.local_path} -> {pin.remote_path} ({len(exclude_files)} exclude patterns)"))
 
     if dry_run:
         console.print("\n[yellow]Dry run mode -- no files will be uploaded[/yellow]\n")
 
+    changed: "queue.Queue[tuple[Path, SyncPin]]" = queue.Queue()
+
     class SyncHandler(FileSystemEventHandler):
+        """Queue files that were created, modified or moved in.
+
+        Not ``on_any_event``: "opened"/"closed"/"deleted" events would make every
+        scp read of a file (an "opened" event on Linux) trigger another upload.
+        """
+
         def __init__(self) -> None:
             self._debounce: dict[str, float] = {}
 
-        def on_any_event(self, event: object) -> None:
-            if event.is_directory:  # type: ignore[attr-defined]
+        def _queue(self, path: str, is_directory: bool) -> None:
+            if is_directory:
                 return
-            src = Path(event.src_path)  # type: ignore[attr-defined]
-            matched_pin = None
+            src = Path(path)
             for pin in pins:
-                local = Path(pin.local_path)
                 try:
-                    src.relative_to(local)
-                    matched_pin = pin
-                    break
+                    src.relative_to(pin.local_path)
                 except ValueError:
                     continue
-            if not matched_pin:
+                now = time.monotonic()
+                if now - self._debounce.get(path, 0.0) >= 0.3:
+                    self._debounce[path] = now
+                    changed.put((src, pin))
                 return
 
-            now = time.time()
-            key = str(src)
-            if key in self._debounce and now - self._debounce[key] < 0.1:
-                return
-            self._debounce[key] = now
+        def on_created(self, event: object) -> None:
+            self._queue(event.src_path, event.is_directory)  # type: ignore[attr-defined]
 
-            local_base = Path(matched_pin.local_path)
-            exclude_files, exclude_dirs = matched_pin.get_all_excludes()
-            if should_exclude(src, local_base, exclude_files, exclude_dirs, matched_pin.include_patterns):
-                if dry_run:
-                    console.print(f"  [dim]Skipped (excluded): {src.relative_to(local_base)}[/dim]")
-                return
+        def on_modified(self, event: object) -> None:
+            self._queue(event.src_path, event.is_directory)  # type: ignore[attr-defined]
 
-            rel = src.relative_to(local_base)
-            remote_dest = f"{p.host}:{matched_pin.remote_path}/{rel}"
-            if dry_run:
-                console.print(f"  [green]Would sync: {rel}[/green]")
-                return
-
-            scp_args = build_scp_args(src=str(src), dest=remote_dest, host=p.host, user=p.user, port=p.port, key=p.key, recursive=False)
-            try:
-                proc = subprocess.run(scp_args, capture_output=True, timeout=15)
-                if proc.returncode == 0:
-                    console.print(f"  [green]Synced: {rel}[/green]")
-                else:
-                    console.print(f"  [red]Failed: {rel}[/red]")
-            except Exception as e:
-                console.print(f"  [red]Error syncing {rel}: {e}[/red]")
+        def on_moved(self, event: object) -> None:
+            self._queue(event.dest_path, event.is_directory)  # type: ignore[attr-defined]
 
     observer = Observer()
     for pin in pins:
         local = Path(pin.local_path)
         if local.exists():
             observer.schedule(SyncHandler(), str(local), recursive=True)
-            console.print(f"  [dim]Watching: {local}[/dim]")
+            console.print(Text(f"  Watching: {local}", style="dim"))
+
+    from ..core.pty_engine import _scp_target
+    from ..utils.keychain import prompt_for_credential
+
+    ssh_pw = "" if dry_run else prompt_for_credential(profile, p.user)
+    runner = PTYRunner()
+    made_dirs: set[str] = set()
+
+    def upload(src: Path, pin: SyncPin) -> None:
+        local_base = Path(pin.local_path)
+        exclude_files, exclude_dirs = pin.get_all_excludes()
+        rel = src.relative_to(local_base)
+        if should_exclude(src, local_base, exclude_files, exclude_dirs, pin.include_patterns):
+            if dry_run:
+                console.print(Text(f"  Skipped (excluded): {rel}", style="dim"))
+            return
+        if not src.is_file():  # deleted or replaced before we got to it
+            return
+        if dry_run:
+            console.print(Text(f"  Would sync: {rel}", style="green"))
+            return
+
+        remote_file = f"{pin.remote_path.rstrip('/')}/{rel.as_posix()}"
+        remote_dir = posixpath.dirname(remote_file)
+        if remote_dir not in made_dirs:
+            mkdir = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+            mkdir.append(f"mkdir -p {safe_quote(remote_dir)}")
+            if runner.run(mkdir, password=ssh_pw, timeout=15.0) != 0:
+                console.print(Text(f"  Failed: {rel} (cannot create {remote_dir})", style="red"))
+                return
+            made_dirs.add(remote_dir)
+
+        scp_args = build_scp_args(
+            src=str(src), dest=_scp_target(remote_file, p.host, p.user),
+            host=p.host, user=p.user, port=p.port, key=p.key, recursive=False,
+        )
+        ec = runner.run(scp_args, password=ssh_pw, timeout=60.0)
+        if ec == 0:
+            console.print(Text(f"  Synced: {rel}", style="green"))
+        else:
+            console.print(Text(f"  Failed: {rel} (exit code {ec})", style="red"))
 
     observer.start()
     console.print("\n[cyan]Syncing... (Ctrl+C to stop)[/cyan]\n")
     try:
-        while True:
-            time.sleep(1)
+        while not (stop and stop.is_set()):
+            try:
+                src, pin = changed.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            upload(src, pin)
     except KeyboardInterrupt:
+        pass
+    finally:
         observer.stop()
-    observer.join()
+        observer.join()
 
 
 @click.command()
@@ -1005,53 +1058,18 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
         console.print(f"[yellow]Profile '{profile}' is not configured for WordPress[/yellow]")
         return
 
-    runner = PTYRunner()
-
     # Find WP-CLI on remote
-    ssh_args = build_ssh_args(
-        host=p.host,
-        user=p.user,
-        port=p.port,
-        key=p.key,
+    wp_bin = _find_wp_cli(
+        build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key), p.wp_cli_path
     )
-    wp_bin = _find_wp_cli(ssh_args, p.wp_cli_path)
-
-    cd_cmd = _capistrano_cd(p.remote_path)
-
-    # Build command
-    sudo_prefix = ""
-    if not no_escalate and p.sudo:
-        sudo_prefix = "sudo "
-
-    wp_cmd = f"{cd_cmd} && {sudo_prefix}{wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
-
-    ssh_args.append(wp_cmd)
-
-    # Force PTY allocation so remote sudo can prompt for password
-    if p.sudo and not no_escalate:
-        ssh_args.insert(1, "-t")
-
-    from ..utils.keychain import prompt_for_credential
-
-    sudo_pw = ""
-    if p.sudo and not no_escalate:
-        sudo_pw = prompt_for_credential(profile, p.user)
-
-    ssh_pw = prompt_for_credential(profile, p.user)
-
-    def output_line(line: str) -> None:
-        console.print(line)
-
-    exit_code = runner.run(
-        ssh_args,
-        password=ssh_pw,
-        sudo_password=sudo_pw,
-        on_output=output_line,
-        timeout=60.0,
+    wp_cmd = (
+        f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}"
+        f"{wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
     )
-
-    if exit_code != 0:
-        console.print(f"\n[red]Exit code: {exit_code}[/red]")
+    _run_svc_cmd(
+        profile, wp_cmd, timeout=60.0,
+        escalate=p.sudo and not no_escalate, prefix="",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1090,14 @@ def _is_local_path(path: str) -> bool:
     return True
 
 
-def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str, parents: bool = False) -> int:
+def _copy_to_profile(
+    src: str,
+    dest: str,
+    recursive: bool,
+    profile_name: str,
+    parents: bool = False,
+    timeout: float = 120.0,
+) -> int:
     """Copy files to/from a single profile. Returns exit code."""
     config = load_config()
     p = config.get_profile(profile_name)
@@ -1089,15 +1114,17 @@ def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str, pa
     if src_is_local:
         # Local -> remote (dest is on the remote host via profile)
         resolved_src = str(Path(src).expanduser().resolve())
-        remote_dest = dest
+        remote_dest = dest[1:] if dest.startswith(":") else dest  # ":" only marks "remote"
         if parents:
             # Preserve source directory structure: app/Foo/Bar.php -> /remote/app/Foo/Bar.php
-            remote_dest = dest.rstrip("/") + "/" + src
+            remote_dest = remote_dest.rstrip("/") + "/" + src
             remote_parent = str(Path(remote_dest).parent)
             # Create parent dirs on remote before scp
             mkdir_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
             mkdir_ssh.append(f"mkdir -p {safe_quote(remote_parent)}")
-            runner.run(mkdir_ssh, password=ssh_pw, timeout=10)
+            if runner.run(mkdir_ssh, password=ssh_pw, timeout=10) != 0:
+                console.print(f"[red]  [{profile_name}] Could not create {remote_parent} on the remote[/red]")
+                return 1
         scp_args = build_scp_args(
             src=resolved_src,
             dest=_scp_target(remote_dest, p.host, p.user),
@@ -1121,22 +1148,23 @@ def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str, pa
         )
 
     display_dest = dest.rstrip("/") + "/" + src if parents else dest
-    console.print(f"[cyan][{profile_name}] Copying {src} -> {display_dest}...[/cyan]")
-
-    def output_line(line: str) -> None:
-        console.print(f"  [{profile_name}] {line}")
+    console.print(Text(f"[{profile_name}] Copying {src} -> {display_dest}...", style="cyan"))
 
     exit_code = runner.run(
         scp_args,
         password=ssh_pw,
-        on_output=output_line,
-        timeout=120.0,
+        on_output=lambda line: _remote(line, f"  [{profile_name}] "),
+        timeout=timeout,
     )
 
     if exit_code == 0:
-        console.print(f"[green]  [{profile_name}] Copy complete[/green]")
+        console.print(Text(f"  [{profile_name}] Copy complete", style="green"))
+    elif exit_code == 124:
+        console.print(Text(
+            f"  [{profile_name}] Copy timed out after {timeout:g}s and may be incomplete; "
+            f"raise the limit with --timeout", style="red"))
     else:
-        console.print(f"[red]  [{profile_name}] Copy failed (exit code: {exit_code})[/red]")
+        console.print(Text(f"  [{profile_name}] Copy failed (exit code: {exit_code})", style="red"))
 
     return exit_code
 
@@ -1149,7 +1177,8 @@ def _copy_to_profile(src: str, dest: str, recursive: bool, profile_name: str, pa
 @click.option("--profile", "-p", multiple=True, default=None, help="Profile name (can be used multiple times)")
 @click.option("--all", "all_profiles", is_flag=True, help="Copy to all profiles")
 @click.option("--except", "except_profiles", default="", help="Comma-separated profiles to exclude when using --all")
-def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str) -> None:
+@click.option("--timeout", type=float, default=None, help="Per-profile transfer timeout in seconds (default: 120)")
+def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str, timeout: float | None) -> None:
     """Securely copy files with auto-sudo escalation.
 
     Supports copying to one or multiple profiles:
@@ -1187,11 +1216,12 @@ def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[s
         console.print("[red]No profiles matched[/red]")
         return
 
-    console.print(f"[bold cyan]Copying to {len(targets)} profile(s): {', '.join(targets)}[/bold cyan]\n")
+    console.print(Text(f"Copying to {len(targets)} profile(s): {', '.join(targets)}\n", style="bold cyan"))
 
+    resolved_timeout = _get_timeout(config, timeout, 120.0)
     results: dict[str, int] = {}
     for name in targets:
-        ec = _copy_to_profile(src, dest, recursive, name, parents=parents)
+        ec = _copy_to_profile(src, dest, recursive, name, parents=parents, timeout=resolved_timeout)
         results[name] = ec
 
     # Summary
@@ -1200,95 +1230,8 @@ def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[s
     if successes:
         console.print(f"\n[green]✓ Succeeded: {len(successes)} profile(s)[/green]")
     if failures:
-        console.print(f"\n[red]✗ Failed: {len(failures)} profile(s) — {', '.join(failures)}[/red]")
-
-
-# ---------------------------------------------------------------------------
-# spyro db-tunnel
-# ---------------------------------------------------------------------------
-
-
-@click.command(name="db-tunnel")
-@click.option("--port", type=int, help="Override local port")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_db_tunnel(port: int | None, profile: str) -> None:
-    """Manage tunnel and print connection status."""
-    config = load_config()
-    manager = TunnelManager(config)
-
-    tunnel = get_tunnel(profile)
-    if not tunnel or tunnel.status != "running":
-        console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
-        tunnel = manager.start(profile)
-
-    local_port = port or tunnel.local_port
-    p = config.get_profile(profile)
-
-    db_url = generate_connection_url(p.db, port_override=local_port)
-    console.print(f"\n[bold green]Database tunnel active[/bold green]")
-    console.print(f"  Profile:   {profile}")
-    console.print(f"  Local:     127.0.0.1:{local_port}")
-    console.print(f"  Remote:    {p.host}:{p.db.port}")
-    console.print(f"  URL:       {db_url}")
-
-
-# ---------------------------------------------------------------------------
-# spyro db-shell
-# ---------------------------------------------------------------------------
-
-
-@click.command(name="db-shell")
-@click.option("--no-tunnel", is_flag=True, help="Skip tunnel management")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_db_shell(no_tunnel: bool, profile: str) -> None:
-    """Launch pre-authenticated local database CLI."""
-    config = load_config()
-    p = config.get_profile(profile)
-
-    if not no_tunnel:
-        manager = TunnelManager(config)
-        tunnel = get_tunnel(profile)
-        if not tunnel or tunnel.status != "running":
-            console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
-            tunnel = manager.start(profile)
-
-        local_port = tunnel.local_port
-    else:
-        local_port = p.db.port
-
-    if p.db.driver == "mysql":
-        client = "mysql"
-        args = [
-            client,
-            f"-h127.0.0.1",
-            f"-P{local_port}",
-            f"-u{p.db.user}",
-        ]
-        if p.db.password:
-            args.append(f"-p{p.db.password}")
-        args.append(p.db.name)
-    elif p.db.driver == "postgres":
-        client = "psql"
-        env = os.environ.copy()
-        env["PGHOST"] = "127.0.0.1"
-        env["PGPORT"] = str(local_port)
-        env["PGUSER"] = p.db.user
-        env["PGDATABASE"] = p.db.name
-        if p.db.password:
-            env["PGPASSWORD"] = p.db.password
-        args = [client]
-    else:
-        console.print(f"[red]Unsupported driver: {p.db.driver}[/red]")
-        return
-
-    console.print(f"[cyan]Connecting to {p.db.name} via {client}...[/cyan]")
-    try:
-        if p.db.driver == "postgres":
-            os.execvpe(client, args, env)
-        else:
-            os.execvp(client, args)
-    except FileNotFoundError:
-        console.print(f"[red]Database client '{client}' not found[/red]")
+        console.print(Text(f"\n✗ Failed: {len(failures)} profile(s) — {', '.join(failures)}", style="red"))
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1313,11 +1256,11 @@ def cmd_auth() -> None:
     """Manage stored credentials (macOS Keychain / Linux Secret Service)."""
 
 
-@cmd_auth.command()
+@cmd_auth.command("set")  # not `def set`: that would shadow the builtin for this whole module
 @click.option("--profile", "-p", required=True, help="Profile name")
 @click.option("--password", "-w", default="", help="Password (omit to prompt)")
 @click.option("--force", "-f", is_flag=True, help="Overwrite without prompting")
-def set(profile: str, password: str, force: bool) -> None:
+def set_credential(profile: str, password: str, force: bool) -> None:
     """Store a credential in the OS keychain.
 
     One password per profile — used for both SSH and sudo.
@@ -1396,8 +1339,7 @@ def list_credentials() -> None:
         for name, username in profiles:
             pw = get_credential(name, username)
             if pw is not None:
-                masked = pw[:2] + "••••" + pw[-2:] if len(pw) > 4 else "••••"
-                console.print(f"  [green]✓[/green] {name}: {username} / {masked}")
+                console.print(Text(f"  ✓ {name}: {username} (password stored, {len(pw)} characters)"))
                 found = True
 
     if not found:
@@ -1414,35 +1356,48 @@ def list_credentials() -> None:
 
 
 
-def _run_svc_cmd(profile: str, cmd: str, timeout: float = 30.0, cli_timeout: float | None = None, show_exit_code: bool = True) -> int:
-    """Run a command via SSH with PTY auth for a profile."""
+def _run_svc_cmd(
+    profile: str,
+    cmd: str,
+    timeout: float | None = 30.0,
+    cli_timeout: float | None = None,
+    show_exit_code: bool = True,
+    escalate: bool | None = None,
+    prefix: str = "  ",
+) -> int:
+    """Run *cmd* on a profile's server through the PTY engine and print its output.
+
+    *timeout* ``None`` means "until it exits" (``logs -f``). *escalate* says
+    whether the command will use sudo (allocates a remote tty so sudo can
+    prompt); ``None`` keeps the service-command rule: the profile's ``sudo``.
+    """
     config = load_config()
     p = config.get_profile(profile)
-    runner = PTYRunner()
-    resolved = _get_timeout(config, cli_timeout, timeout)
+    resolved = None if timeout is None else _get_timeout(config, cli_timeout, timeout)
 
-    if not p.sudo and "sudo" in cmd:
-        console.print(f"[red]  ✗ User '{p.user}' does not have sudo access on {profile}[/red]")
-        console.print("[yellow]  Set sudo = true in your spyro.toml for this profile[/yellow]")
-        return 1
+    if escalate is None:
+        if not p.sudo and "sudo" in cmd:
+            console.print(f"[red]  ✗ User '{p.user}' does not have sudo access on {profile}[/red]")
+            console.print("[yellow]  Set sudo = true in your spyro.toml for this profile[/yellow]")
+            return 1
+        escalate = p.sudo
 
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-    if p.sudo:
+    if escalate:
         ssh_args.insert(1, "-t")
     ssh_args.append(cmd)
 
     from ..utils.keychain import prompt_for_credential
 
-    sudo_pw = prompt_for_credential(profile, p.user) if p.sudo else ""
+    sudo_pw = prompt_for_credential(profile, p.user) if escalate else ""
     ssh_pw = prompt_for_credential(profile, p.user)
 
-    def output_line(line: str) -> None:
-        console.print(f"  {line}")
-
-    ec = runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-                    on_output=output_line, timeout=resolved)
-    if ec != 0 and show_exit_code:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    ec = PTYRunner().run(
+        ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+        on_output=lambda line: _remote(line, prefix), timeout=resolved,
+    )
+    if show_exit_code:
+        _report_exit(ec, resolved, prefix)
     return ec
 
 @click.group()
@@ -1463,7 +1418,7 @@ def status(profile: str) -> None:
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 60)")
 def restart(profile: str, process: str, timeout: float | None) -> None:
     """Restart Supervisor process(es). Default: all."""
-    _run_svc_cmd(profile, f"sudo supervisorctl restart {process}", timeout=60, cli_timeout=timeout)
+    _run_svc_cmd(profile, f"sudo supervisorctl restart {safe_quote(process)}", timeout=60, cli_timeout=timeout)
 
 
 @cmd_supervisor.command()
@@ -1471,7 +1426,7 @@ def restart(profile: str, process: str, timeout: float | None) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def start(profile: str, process: str) -> None:
     """Start a Supervisor process."""
-    _run_svc_cmd(profile, f"sudo supervisorctl start {process}")
+    _run_svc_cmd(profile, f"sudo supervisorctl start {safe_quote(process)}")
 
 
 @cmd_supervisor.command()
@@ -1479,7 +1434,7 @@ def start(profile: str, process: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def stop(profile: str, process: str) -> None:
     """Stop a Supervisor process."""
-    _run_svc_cmd(profile, f"sudo supervisorctl stop {process}")
+    _run_svc_cmd(profile, f"sudo supervisorctl stop {safe_quote(process)}")
 
 
 @cmd_supervisor.command()
@@ -1488,7 +1443,7 @@ def stop(profile: str, process: str) -> None:
 @click.option("--lines", "-n", default=50, help="Number of lines to tail")
 def tail(profile: str, process: str, lines: int) -> None:
     """Tail Supervisor process stderr log."""
-    _run_svc_cmd(profile, f"sudo supervisorctl tail -{lines} {process} 2>/dev/null || sudo supervisorctl tail {process}")
+    _run_svc_cmd(profile, f"sudo supervisorctl tail -{int(lines)} {safe_quote(process)} 2>/dev/null || sudo supervisorctl tail {safe_quote(process)}")
 
 # ---------------------------------------------------------------------------
 # spyro redis — Redis CLI wrapper
@@ -1512,7 +1467,7 @@ def ping(profile: str) -> None:
 @click.option("--section", "-s", default="", help="Info section (server, stats, keyspace, etc.)")
 def info(profile: str, section: str) -> None:
     """Show Redis server info."""
-    _run_svc_cmd(profile, f"redis-cli info {section}".strip(), timeout=10)
+    _run_svc_cmd(profile, f"redis-cli info {safe_quote(section)}".strip() if section else "redis-cli info", timeout=10)
 
 
 @cmd_redis.command()
@@ -1702,6 +1657,54 @@ def restart(profile: str, timeout: float | None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _upload_and_run(
+    profile: str,
+    local_file: Path,
+    build_cmd: "Callable[[str], str]",
+    *,
+    no_escalate: bool,
+    label: str,
+    timeout: float = 120.0,
+) -> int:
+    """scp *local_file* to a private remote /tmp name, run ``build_cmd(remote_path)`` there, then delete it.
+
+    The remote name is unguessable (128 random bits): with sudo the file is
+    executed as another user, so a predictable name in /tmp would let anyone
+    on a shared server pre-create or swap it.
+    """
+    import uuid
+
+    from ..core.pty_engine import _scp_target
+    from ..utils.keychain import prompt_for_credential
+
+    config = load_config()
+    p = config.get_profile(profile)
+    runner = PTYRunner()
+    ssh_pw = prompt_for_credential(profile, p.user)
+
+    tmp_remote = f"/tmp/spyro-{label}-{uuid.uuid4().hex}.php"
+    scp_args = build_scp_args(
+        src=str(local_file),
+        dest=_scp_target(tmp_remote, p.host, p.user),
+        host=p.host, user=p.user, port=p.port, key=p.key,
+    )
+    console.print(Text(f"Uploading {local_file.name} to {p.host}:{tmp_remote}...", style="cyan"))
+    if runner.run(scp_args, password=ssh_pw, timeout=30) != 0:
+        console.print(f"[red]Failed to upload {label}[/red]")
+        return 1
+
+    try:
+        command = f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}{build_cmd(safe_quote(tmp_remote))}"
+        return _run_svc_cmd(
+            profile, command, timeout=timeout,
+            escalate=p.sudo and not no_escalate, prefix="",
+        )
+    finally:
+        clean = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        clean.append(f"rm -f {safe_quote(tmp_remote)}")
+        runner.run(clean, password=ssh_pw, timeout=10)
+
+
 @click.command()
 @click.option("--eval", "-e", default="", help="Evaluate expression and exit")
 @click.option("--file", "-f", type=click.Path(exists=True), help="Run PHP file")
@@ -1722,76 +1725,34 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
         console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
         return
 
-    runner = PTYRunner()
+    escalate = p.sudo and not no_escalate
 
-    sudo_prefix = ""
-    if not no_escalate and p.sudo:
-        sudo_prefix = "sudo "
-
-    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    if file:
+        _upload_and_run(
+            profile, Path(file).expanduser().resolve(),
+            lambda remote: f"php artisan tinker < {remote}",
+            no_escalate=no_escalate, label="tinker",
+        )
+        return
 
     cd_cmd = _capistrano_cd(p.remote_path)
-
     if eval:
-        tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker --execute={safe_quote(eval)}"
-    elif file:
-        tmp_path = f"/tmp/spyro-tinker-{os.path.basename(file)}"
-        console.print(f"[cyan]Uploading {file} to {p.host}:{tmp_path}...[/cyan]")
-        from ..core.pty_engine import _scp_target
-        scp_args = build_scp_args(
-            src=file,
-            dest=_scp_target(tmp_path, p.host, p.user),
-            host=p.host, user=p.user, port=p.port, key=p.key,
-        )
-        from ..utils.keychain import prompt_for_credential as pfc
-        ssh_pw = pfc(profile, p.user) if not no_escalate else ""
-        runner.run(scp_args, password=ssh_pw, timeout=30)
-        tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker < {tmp_path}; {sudo_prefix}rm -f {tmp_path}"
-    else:
-        tinker_cmd = f"{cd_cmd} && {sudo_prefix}php artisan tinker"
+        tinker_cmd = f"{cd_cmd} && {_sudo_prefix(p, no_escalate)}php artisan tinker --execute={safe_quote(eval)}"
+        _run_svc_cmd(profile, tinker_cmd, timeout=120.0, escalate=escalate, prefix="")
+        return
 
-    # Force PTY allocation
-    # - sudo profiles already got -t above
-    # - non-sudo profiles need -t here (used by both interactive and eval/file)
-    if not no_escalate and not p.sudo:
-        ssh_args.insert(1, "-t")
+    # Interactive REPL: needs a remote tty whether or not sudo is involved
+    from ..utils.keychain import prompt_for_credential
 
-    ssh_args.append(tinker_cmd)
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    ssh_args.insert(1, "-t")
+    ssh_args.append(f"{cd_cmd} && {_sudo_prefix(p, no_escalate)}php artisan tinker")
+    ssh_pw = prompt_for_credential(profile, p.user)
+    sudo_pw = ssh_pw if escalate else ""
 
-    from ..utils.keychain import prompt_for_credential as pfc2
-
-    ssh_pw = pfc2(profile, p.user)
-    sudo_pw = pfc2(profile, p.user) if p.sudo and not no_escalate else ""
-
-    if eval or file:
-        # Eval/file mode: use subprocess.run() for reliable output capture.
-        # No PTY needed for one-shot commands. Falls back to PTY if SSH
-        # needs interactive auth (exit 255) — SSH ControlMaster multiplexing
-        # means subsequent connections reuse the auth from an earlier PTY call.
-        import subprocess as sbproc
-
-        # Remove -t flags from ssh_args — subprocess doesn't need a PTY
-        ssh_args_run = [a for a in ssh_args if a not in ("-t", "-tt")]
-
-        try:
-            result = sbproc.run(
-                ssh_args_run, capture_output=True, text=True, timeout=120,
-            )
-            output = result.stdout + result.stderr
-            output = output.strip()
-            if output:
-                for line in output.split("\n"):
-                    console.print(line)
-            if result.returncode != 0:
-                console.print(f"  [red]Exit code: {result.returncode}[/red]")
-        except sbproc.TimeoutExpired:
-            console.print("[red]Command timed out[/red]")
-    else:
-        console.print(f"[cyan]Starting Tinker on {profile}...[/cyan]")
-        console.print("[dim]Exit with Ctrl+D or type 'exit'[/dim]")
-        exit_code = runner.interactive_run(
-            ssh_args, password=ssh_pw, sudo_password=sudo_pw, timeout=3600,
-        )
+    console.print(f"[cyan]Starting Tinker on {profile}...[/cyan]")
+    console.print("[dim]Exit with Ctrl+D or type 'exit'[/dim]")
+    PTYRunner().interactive_run(ssh_args, password=ssh_pw, sudo_password=sudo_pw, timeout=30.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1914,75 +1875,20 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
         console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
         return
 
-    php_code = build_eval_php(expression, json_output, no_aliases)
-
-    # Write temp file locally
-    import uuid
     import tempfile
-    from pathlib import Path
 
-    tmp_name = f"spyro-eval-{uuid.uuid4().hex[:8]}.php"
-    tmp_local = Path(tempfile.gettempdir()) / tmp_name
-    tmp_local.write_text(php_code)
-
-    runner = PTYRunner()
-
+    # mkstemp creates the file 0600: the expression may contain sensitive data
+    fd, tmp_name = tempfile.mkstemp(prefix="spyro-eval-", suffix=".php")
+    tmp_local = Path(tmp_name)
     try:
-        # Upload to remote /tmp/
-        from ..core.pty_engine import _scp_target
-
-        tmp_remote = f"/tmp/{tmp_name}"
-        scp_args = build_scp_args(
-            src=str(tmp_local),
-            dest=_scp_target(tmp_remote, p.host, p.user),
-            host=p.host, user=p.user, port=p.port, key=p.key,
+        with os.fdopen(fd, "w") as f:
+            f.write(build_eval_php(expression, json_output, no_aliases))
+        _upload_and_run(
+            profile, tmp_local, lambda remote: f"php {remote}",
+            no_escalate=no_escalate, label="eval",
         )
-
-        from ..utils.keychain import prompt_for_credential
-
-        ssh_pw = prompt_for_credential(profile, p.user)
-
-        console.print(f"[cyan]Uploading eval to {p.host}:{tmp_remote}...[/cyan]")
-        ec = runner.run(scp_args, password=ssh_pw, timeout=30)
-        if ec != 0:
-            console.print("[red]Failed to upload eval script[/red]")
-            return
-
-        # Run it
-        cd_cmd = _capistrano_cd(p.remote_path)
-        sudo_prefix = "sudo " if not no_escalate and p.sudo else ""
-        run_cmd = f"{cd_cmd} && {sudo_prefix}php {tmp_remote}"
-
-        ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-        if not no_escalate and p.sudo:
-            ssh_args.insert(1, "-t")
-        ssh_args.append(run_cmd)
-
-        sudo_pw = prompt_for_credential(profile, p.user) if p.sudo and not no_escalate else ""
-
-        def output_line(line: str) -> None:
-            console.print(line)
-
-        exit_code = runner.run(
-            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-            on_output=output_line, timeout=120,
-        )
-
-        # Cleanup remote
-        clean_cmd = f"rm -f {safe_quote(tmp_remote)}"
-        clean_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-        clean_ssh.append(clean_cmd)
-        runner.run(clean_ssh, password=ssh_pw, timeout=10)
-
-        if exit_code != 0:
-            console.print(f"  [red]Exit code: {exit_code}[/red]")
     finally:
-        # Cleanup local
-        try:
-            tmp_local.unlink()
-        except Exception:
-            pass
-
+        tmp_local.unlink(missing_ok=True)
 
 
 @click.command()
@@ -2014,62 +1920,10 @@ def cmd_script(file: str, profile: str, no_escalate: bool) -> None:
         console.print(f"[red]File not found: {file_path}[/red]")
         return
 
-    import uuid
-    tmp_name = f"spyro-script-{uuid.uuid4().hex[:8]}.php"
-    tmp_remote = f"/tmp/{tmp_name}"
-
-    runner = PTYRunner()
-
-    try:
-        # Upload to remote /tmp/
-        from ..core.pty_engine import _scp_target
-
-        scp_args = build_scp_args(
-            src=str(file_path),
-            dest=_scp_target(tmp_remote, p.host, p.user),
-            host=p.host, user=p.user, port=p.port, key=p.key,
-        )
-
-        from ..utils.keychain import prompt_for_credential
-
-        ssh_pw = prompt_for_credential(profile, p.user)
-
-        console.print(f"[cyan]Uploading {file_path.name} to {p.host}:{tmp_remote}...[/cyan]")
-        ec = runner.run(scp_args, password=ssh_pw, timeout=30)
-        if ec != 0:
-            console.print("[red]Failed to upload script[/red]")
-            return
-
-        # Run it
-        cd_cmd = _capistrano_cd(p.remote_path)
-        sudo_prefix = "sudo " if not no_escalate and p.sudo else ""
-        run_cmd = f"{cd_cmd} && {sudo_prefix}php {tmp_remote}"
-
-        ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-        if not no_escalate and p.sudo:
-            ssh_args.insert(1, "-t")
-        ssh_args.append(run_cmd)
-
-        sudo_pw = prompt_for_credential(profile, p.user) if p.sudo and not no_escalate else ""
-
-        def output_line(line: str) -> None:
-            console.print(line)
-
-        exit_code = runner.run(
-            ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-            on_output=output_line, timeout=120,
-        )
-
-        # Cleanup remote
-        clean_cmd = f"rm -f {safe_quote(tmp_remote)}"
-        clean_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-        clean_ssh.append(clean_cmd)
-        runner.run(clean_ssh, password=ssh_pw, timeout=10)
-
-        if exit_code != 0:
-            console.print(f"  [red]Exit code: {exit_code}[/red]")
-    finally:
-        pass  # Local file is never deleted — it's the user's file
+    _upload_and_run(
+        profile, file_path, lambda remote: f"php {remote}",
+        no_escalate=no_escalate, label="script",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2087,49 +1941,28 @@ def _detect_db_client(profile: str) -> str:
 
 def _run_db_query(profile: str, query: str, tunnel_port: int | None = None) -> tuple[int, str]:
     """Run a SQL query through the tunnel and return (exit_code, output)."""
-    config = load_config()
-    p = config.get_profile(profile)
-
-    manager = TunnelManager(config)
-    tunnel = get_tunnel(profile)
-    if not tunnel or tunnel.status != "running":
-        tunnel = manager.start(profile)
-    local_port = tunnel_port or (tunnel.local_port if tunnel else p.db.port)
-
+    _, db, local_port = _db_target(profile, port=tunnel_port)
     client = _detect_db_client(profile)
-    if client in ("mysql", "mariadb"):
-        pw_flag = f"-p{p.db.password}" if p.db.password else "--skip-password"
-        cmd_list = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}",
-                    "--skip-ssl", pw_flag, p.db.name, "-e", query]
-    elif client == "psql":
-        env = os.environ.copy()
-        env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name})
-        if p.db.password:
-            env["PGPASSWORD"] = p.db.password
-        cmd_list = [client, "-c", query]
-        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=10, env=env)
-        return result.returncode, result.stdout + result.stderr
-    else:
-        return 1, f"Unknown client: {client}"
-
     try:
-        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=10)
-        return result.returncode, result.stdout
+        result = subprocess.run(
+            client_argv(client, db, local_port, query),
+            capture_output=True, text=True, timeout=30, env=client_env(db, local_port),
+        )
     except FileNotFoundError:
-        return 1, f"Client not found. Install mysql-client, mariadb-client, or postgresql-client."
+        return 1, "Client not found. Install mysql-client, mariadb-client, or postgresql-client."
     except subprocess.TimeoutExpired:
         return 1, "Query timed out"
+    if result.returncode == 0:
+        return 0, result.stdout
+    return result.returncode, (result.stderr or result.stdout).strip()
 
 
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cmd_db(ctx: click.Context) -> None:
-    """Database commands (MySQL/MariaDB/PostgreSQL).
-
-    If no subcommand is given, starts a tunnel and shows connection info.
-    """
+    """Database commands (MySQL/MariaDB/PostgreSQL)."""
     if ctx.invoked_subcommand is None:
-        ctx.invoke(tunnel)
+        click.echo(ctx.get_help())
 
 
 @cmd_db.command()
@@ -2137,20 +1970,12 @@ def cmd_db(ctx: click.Context) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def tunnel(port: int | None, profile: str) -> None:
     """Start tunnel and print connection URL."""
-    config = load_config()
-    manager = TunnelManager(config)
-    tunnel_state = get_tunnel(profile)
-    if not tunnel_state or tunnel_state.status != "running":
-        console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
-        tunnel_state = manager.start(profile)
-    local_port = port or (tunnel_state.local_port if tunnel_state else 3306)
-    p = config.get_profile(profile)
-    db_url = generate_connection_url(p.db, port_override=local_port)
-    console.print(f"\n[bold green]Database tunnel active[/bold green]")
+    p, db, local_port = _db_target(profile, port=port)
+    console.print("\n[bold green]Database tunnel active[/bold green]")
     console.print(f"  Profile:   {profile}")
     console.print(f"  Local:     127.0.0.1:{local_port}")
-    console.print(f"  Remote:    {p.host}:{p.db.port}")
-    console.print(f"  URL:       {db_url}")
+    console.print(f"  Remote:    {p.host}:{db.port}")
+    console.print(Text(f"  URL:       {generate_connection_url(db, port_override=local_port)}"))
 
 
 @cmd_db.command()
@@ -2158,40 +1983,12 @@ def tunnel(port: int | None, profile: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def shell(no_tunnel: bool, profile: str) -> None:
     """Launch pre-authenticated database CLI (mysql/mariadb/psql)."""
-    config = load_config()
-    p = config.get_profile(profile)
-    if not no_tunnel:
-        manager = TunnelManager(config)
-        tunnel_state = get_tunnel(profile)
-        if not tunnel_state or tunnel_state.status != "running":
-            console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
-            tunnel_state = manager.start(profile)
-        local_port = tunnel_state.local_port
-    else:
-        local_port = p.db.port
+    _, db, local_port = _db_target(profile, no_tunnel=no_tunnel)
     client = _detect_db_client(profile)
-    if client in ("mysql", "mariadb"):
-        args = [client, f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}", "--skip-ssl"]
-        args.append(f"-p{p.db.password}" if p.db.password else "--skip-password")
-        args.append(p.db.name)
-        env = None
-    elif client == "psql":
-        env = os.environ.copy()
-        env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name})
-        if p.db.password:
-            env["PGPASSWORD"] = p.db.password
-        args = [client]
-    else:
-        console.print("[red]No database client found. Install mysql, mariadb, or psql.[/red]")
-        return
-    console.print(f"[cyan]Connecting to {p.db.name} via {client}...[/cyan]")
-    try:
-        if env:
-            os.execvpe(client, args, env)
-        else:
-            os.execvp(client, args)
-    except FileNotFoundError:
-        console.print(f"[red]'{client}' not found locally[/red]")
+    if not shutil.which(client):
+        raise click.ClickException("No database client found. Install mysql, mariadb, or psql.")
+    console.print(f"[cyan]Connecting to {db.name} via {client}...[/cyan]")
+    os.execvpe(client, client_argv(client, db, local_port), client_env(db, local_port))
 
 
 @cmd_db.command()
@@ -2199,50 +1996,29 @@ def shell(no_tunnel: bool, profile: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def ping(port: int | None, profile: str) -> None:
     """Test database connectivity through the tunnel."""
-    config = load_config()
-    p = config.get_profile(profile)
-    manager = TunnelManager(config)
-    tunnel_state = get_tunnel(profile)
-    if not tunnel_state or tunnel_state.status != "running":
-        console.print(f"[cyan]Starting tunnel for {profile}...[/cyan]")
-        tunnel_state = manager.start(profile)
-    local_port = port or (tunnel_state.local_port if tunnel_state else p.db.port)
+    p, db, local_port = _db_target(profile, port=port)
     client = _detect_db_client(profile)
-    console.print(f"[cyan]Pinging {p.db.driver}@{p.host}:{p.db.port} via 127.0.0.1:{local_port}...[/cyan]")
+    console.print(f"[cyan]Pinging {db.driver}@{p.host}:{db.port} via 127.0.0.1:{local_port}...[/cyan]")
+    env = client_env(db, local_port)
     if client in ("mysql", "mariadb"):
-        cmd = ["mysqladmin", f"-h127.0.0.1", f"-P{local_port}", f"-u{p.db.user}",
-               "--skip-ssl"]
-        if p.db.password:
-            cmd.append(f"-p{p.db.password}")
-        cmd.extend(["ping", "--silent"])
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=10)
-            stdout = result.stdout.decode()
-            stderr = result.stderr.decode()
-            # mysqladmin returns exit code 0 on success even with SSL warnings
-            if result.returncode == 0 or "mysqld is alive" in stdout:
-                console.print("[green]✓ mysqld is alive[/green]")
-            elif "Access denied" in stderr:
-                console.print("[red]✗ Access denied[/red]")
-            else:
-                console.print(f"[red]✗ Ping failed[/red]")
-                if stderr:
-                    console.print(f"  {stderr.strip()}")
-        except FileNotFoundError:
-            console.print("[red]mysqladmin not found locally[/red]")
-    elif client == "psql":
-        env = os.environ.copy()
-        env.update({"PGHOST": "127.0.0.1", "PGPORT": str(local_port), "PGUSER": p.db.user, "PGDATABASE": p.db.name or "postgres"})
-        if p.db.password:
-            env["PGPASSWORD"] = p.db.password
-        try:
-            result = subprocess.run(["psql", "-c", "SELECT 1"], capture_output=True, timeout=10, env=env)
-            if result.returncode == 0:
-                console.print("[green]✓ PONG[/green]")
-            else:
-                console.print(f"[red]✗ {result.stderr.decode()[:200]}[/red]")
-        except FileNotFoundError:
-            console.print("[red]psql not found locally[/red]")
+        cmd = ["mysqladmin", "-h127.0.0.1", f"-P{local_port}", f"-u{db.user}", "--skip-ssl", "ping", "--silent"]
+        ok_text, missing = "✓ mysqld is alive", "mysqladmin not found locally"
+    else:
+        cmd = ["psql", "-c", "SELECT 1"]
+        ok_text, missing = "✓ PONG", "psql not found locally"
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=10, env=env)
+    except FileNotFoundError:
+        raise click.ClickException(missing) from None
+    except subprocess.TimeoutExpired:
+        raise click.ClickException("Ping timed out") from None
+    stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
+    if result.returncode == 0 or "mysqld is alive" in stdout:
+        console.print(f"[green]{ok_text}[/green]")
+    elif "Access denied" in stderr:
+        raise click.ClickException("Access denied")
+    else:
+        raise click.ClickException(f"Ping failed: {stderr.strip()[:200]}")
 
 
 @cmd_db.command()
@@ -2252,10 +2028,10 @@ def ping(port: int | None, profile: str) -> None:
 def query(profile: str, query: str, port: int | None) -> None:
     """Run a SQL query through the tunnel."""
     ec, output = _run_db_query(profile, query, tunnel_port=port)
-    if ec == 0:
-        console.print(output)
-    else:
-        console.print(f"[red]{output}[/red]")
+    if ec != 0:
+        raise click.ClickException(output)
+    for line in output.splitlines():
+        _remote(line)
 
 
 @cmd_db.command()
@@ -2263,18 +2039,12 @@ def query(profile: str, query: str, port: int | None) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def list_databases(port: int | None, profile: str) -> None:
     """List databases on the remote server."""
-    client = _detect_db_client(profile)
-    if client in ("mysql", "mariadb"):
-        ec, output = _run_db_query(profile, "SHOW DATABASES", tunnel_port=port)
-    elif client == "psql":
-        ec, output = _run_db_query(profile, "\\l", tunnel_port=port)
-    else:
-        console.print("[red]Unknown client[/red]")
-        return
-    if ec == 0:
-        console.print(output)
-    else:
-        console.print(f"[red]{output}[/red]")
+    sql = "\\l" if _detect_db_client(profile) == "psql" else "SHOW DATABASES"
+    ec, output = _run_db_query(profile, sql, tunnel_port=port)
+    if ec != 0:
+        raise click.ClickException(output)
+    for line in output.splitlines():
+        _remote(line)
 
 
 # ---------------------------------------------------------------------------
@@ -2316,11 +2086,9 @@ def laravel(profile: str, lines: int, follow: bool) -> None:
     """Tail the Laravel log file."""
     config = load_config()
     p = config.get_profile(profile)
-    log_path = f"{p.remote_path}/storage/logs/laravel.log"
+    log_path = safe_quote(f"{p.remote_path}/storage/logs/laravel.log")
     tail_flag = " -f" if follow else ""
-    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} {log_path} 2>/dev/null || echo 'Log not found'", timeout=60 if follow else 15)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} {log_path} 2>/dev/null || echo 'Log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command()
@@ -2330,9 +2098,7 @@ def laravel(profile: str, lines: int, follow: bool) -> None:
 def nginx(profile: str, lines: int, follow: bool) -> None:
     """Tail Nginx access log."""
     tail_flag = " -f" if follow else ""
-    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/nginx/access.log 2>/dev/null || tail -n {lines}{tail_flag} /var/log/nginx/*access* 2>/dev/null || echo 'Nginx access log not found'", timeout=60 if follow else 15)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/nginx/access.log 2>/dev/null || tail -n {int(lines)}{tail_flag} /var/log/nginx/*access* 2>/dev/null || echo 'Nginx access log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command(name="nginx-error")
@@ -2342,9 +2108,7 @@ def nginx(profile: str, lines: int, follow: bool) -> None:
 def nginx_error(profile: str, lines: int, follow: bool) -> None:
     """Tail Nginx error log."""
     tail_flag = " -f" if follow else ""
-    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/nginx/error.log 2>/dev/null || echo 'Nginx error log not found'", timeout=60 if follow else 15)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/nginx/error.log 2>/dev/null || echo 'Nginx error log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command()
@@ -2354,9 +2118,7 @@ def nginx_error(profile: str, lines: int, follow: bool) -> None:
 def apache(profile: str, lines: int, follow: bool) -> None:
     """Tail Apache access log."""
     tail_flag = " -f" if follow else ""
-    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/apache2/access.log 2>/dev/null || tail -n {lines}{tail_flag} /var/log/httpd/access_log 2>/dev/null || echo 'Apache access log not found'", timeout=60 if follow else 15)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/apache2/access.log 2>/dev/null || tail -n {int(lines)}{tail_flag} /var/log/httpd/access_log 2>/dev/null || echo 'Apache access log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command()
@@ -2366,9 +2128,7 @@ def apache(profile: str, lines: int, follow: bool) -> None:
 def php(profile: str, lines: int, follow: bool) -> None:
     """Tail PHP-FPM error log."""
     tail_flag = " -f" if follow else ""
-    ec = _run_svc_cmd(profile, f"tail -n {lines}{tail_flag} /var/log/php*-fpm.log 2>/dev/null || tail -n {lines}{tail_flag} /var/log/php*.log 2>/dev/null || echo 'PHP-FPM log not found'", timeout=60 if follow else 15)
-    if ec != 0:
-        console.print(f"  [red]Exit code: {ec}[/red]")
+    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/php*-fpm.log 2>/dev/null || tail -n {int(lines)}{tail_flag} /var/log/php*.log 2>/dev/null || echo 'PHP-FPM log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command()
@@ -2403,116 +2163,110 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
       spyro db dump -p staging -d                       # Schema only
       spyro db dump -p staging -o ./backups/latest.sql  # Custom path
     """
+    import gzip as gz
+    from datetime import datetime
+
     config = load_config()
     p = config.get_profile(profile)
-    table_list = [t.strip() for t in tables.split(",") if t.strip()] if tables else []
+    db = _resolve_db(p, profile)
+    table_list = [t.strip() for t in tables.split(",") if t.strip()]
 
-    if p.db.driver not in ("mysql", "mariadb"):
-        console.print(f"[red]Dump not yet supported for driver: {p.db.driver}[/red]")
-        return
+    if db.driver not in ("mysql", "mariadb"):
+        raise click.ClickException(f"Dump not yet supported for driver: {db.driver}")
 
-    # Build remote mysqldump command — run through SSH on remote server
-    # This avoids tunnel port mapping issues and uses the remote mysqldump
-    dump_cmd_parts = [
-        "mysqldump",
-        f"-h{p.db.host}",
-        f"-P3306",  # Remote MySQL always on 3306 for remote execution
-        f"-u{p.db.user}",
-        f"-p{p.db.password}" if p.db.password else "--skip-password",
-        "--single-transaction", "--quick", "--no-tablespaces",
-        "--routines", "--triggers",
+    # mysqldump runs on the remote server. Every argument is shell-quoted, and
+    # the password is fed through stdin into MYSQL_PWD rather than put on a
+    # command line that `ps` (on either machine) can read.
+    parts = [
+        "mysqldump", f"-h{db.host}", f"-P{db.port}", f"-u{db.user}",
+        "--single-transaction", "--quick", "--no-tablespaces", "--routines", "--triggers",
     ]
     if no_data:
-        dump_cmd_parts.append("--no-data")
+        parts.append("--no-data")
     if where:
-        dump_cmd_parts += ["--where", where]
-    dump_cmd_parts.append(p.db.name)
-    dump_cmd_parts += table_list
+        parts += ["--where", where]
+    parts.append(db.name)
+    parts += table_list
+    remote_cmd = " ".join(safe_quote(a) for a in parts)
+    if db.password:
+        remote_cmd = "IFS= read -r MYSQL_PWD && export MYSQL_PWD && " + remote_cmd
 
-    # Quote args for remote shell
-    import shlex
-    quoted = []
-    for a in dump_cmd_parts:
-        if not a.startswith("-"):
-            quoted.append(a)
-        elif a.startswith("-p") and len(a) > 2:
-            # Password arg: use -p with quoted password
-            quoted.append(f"-p{shlex.quote(a[2:])}")
-        else:
-            quoted.append(shlex.quote(a))
-    ssh_cmd = " ".join(quoted)
-    if gzip:
-        ssh_cmd += " | gzip -c"
-
-    # Determine output path
-    from datetime import datetime
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if not output:
-        suffix = ".sql.gz" if gzip else ".sql"
-        tbl_suffix = f"-{tables.replace(',', '-')}" if tables else ""
-        output_path = Path.cwd() / f"{profile}-{p.db.name}{tbl_suffix}-{ts}{suffix}"
-    else:
+    if output:
         output_path = Path(output).expanduser().resolve()
-        if gzip and not str(output_path).endswith(".gz"):
-            output_path = Path(str(output_path) + ".gz")
-
+        if gzip and not output_path.name.endswith(".gz"):
+            output_path = output_path.with_name(output_path.name + ".gz")
+    else:
+        tbl_suffix = f"-{'-'.join(table_list)}" if table_list else ""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = Path.cwd() / f"{profile}-{db.name}{tbl_suffix}-{ts}{'.sql.gz' if gzip else '.sql'}"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    console.print(f"[cyan]Dumping '{p.db.name}' from {p.host}...[/cyan]")
+    console.print(Text(f"Dumping '{db.name}' from {p.host}...", style="cyan"))
     if table_list:
-        console.print(f"  Tables: {', '.join(table_list)}")
+        console.print(Text(f"  Tables: {', '.join(table_list)}"))
     if where:
-        console.print(f"  WHERE: {where}")
-    console.print(f"  Output: {output_path}")
+        console.print(Text(f"  WHERE: {where}"))
+    console.print(Text(f"  Output: {output_path}"))
 
-    # Run mysqldump on remote server via SSH, pipe output to local file
-    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-    if p.sudo:
-        ssh_args.insert(1, "-t")
-    ssh_args.append(ssh_cmd)
-
-    dump_buf: list[str] = []
-
-    def capture(line: str) -> None:
-        dump_buf.append(line)
-
+    # 1. Authenticate through the PTY engine (keychain password). That opens an
+    #    ssh ControlMaster, which the next step reuses without any password.
     from ..utils.keychain import prompt_for_credential
 
-    ssh_pw = prompt_for_credential(profile, p.user)
-    sudo_pw = prompt_for_credential(profile, p.user) if p.sudo else ""
-
-    runner = PTYRunner()
-    ec = runner.run(ssh_args, password=ssh_pw, sudo_password=sudo_pw,
-                    on_output=capture, timeout=600)
-
+    base = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    ec = PTYRunner().run(
+        base + ["true"], password=prompt_for_credential(profile, p.user),
+        on_output=lambda line: _remote(line, "  "), timeout=30.0,
+    )
     if ec != 0:
-        console.print(f"[red]Dump failed (exit code: {ec})[/red]")
-        return
+        raise click.ClickException(f"Could not connect to {p.host} (exit code: {ec})")
 
-    raw = "\n".join(dump_buf)
+    # 2. Stream the dump as raw bytes. A PTY would rewrite newlines, strip
+    #    control bytes, merge stderr into the data and buffer it all in memory.
+    #    BatchMode is listed first because ssh keeps the first value it sees.
+    import tempfile
 
-    if gzip:
-        # Write gzipped directly
-        import gzip as gz
-        with gz.open(str(output_path), "wt", encoding="utf-8") as f:
-            f.write(raw)
-    else:
-        output_path.write_text(raw, encoding="utf-8")
+    ssh_args = list(base)
+    ssh_args[1:1] = ["-o", "BatchMode=yes", "-o", "Compression=yes"]
+    ssh_args.append(remote_cmd)
+
+    part = output_path.with_name(output_path.name + ".part")
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # dumps hold real data
+    raw = os.fdopen(fd, "wb")
+    sink = gz.GzipFile(fileobj=raw, mode="wb") if gzip else raw
+    proc = None
+    try:
+        with tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(ssh_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err)
+            if db.password:
+                proc.stdin.write(db.password.encode() + b"\n")
+            proc.stdin.close()
+            shutil.copyfileobj(proc.stdout, sink, 1 << 20)
+            rc = proc.wait()
+            err.seek(0)
+            err_text = err.read().decode(errors="replace").strip()
+        sink.close()
+        raw.close()
+        if rc != 0 or part.stat().st_size == 0:
+            raise click.ClickException(
+                f"Dump failed (exit code: {rc})" + (f": {err_text.splitlines()[-1]}" if err_text else "")
+            )
+        os.replace(part, output_path)
+    except BaseException:
+        if proc and proc.poll() is None:
+            proc.kill()
+        for f in (sink, raw):
+            try:
+                f.close()
+            except Exception:
+                pass
+        part.unlink(missing_ok=True)
+        raise
 
     size = output_path.stat().st_size
     size_str = f"{size/1024:.1f} KB" if size < 1024**2 else f"{size/1024**2:.1f} MB"
-    # Count lines (approximate)
-    line_count = 0
-    try:
-        with open(output_path, "rb") as f:
-            for _ in f:
-                line_count += 1
-    except Exception:
-        line_count = 0
-    console.print(f"[green]✓ Dump complete[/green]")
-    console.print(f"  File:  {output_path}")
+    console.print("[green]✓ Dump complete[/green]")
+    console.print(Text(f"  File:  {output_path}"))
     console.print(f"  Size:  {size_str}")
-    console.print(f"  Lines: ~{line_count}")
 
 
 # ---------------------------------------------------------------------------
@@ -2523,7 +2277,7 @@ def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, wher
 _CHECK_CACHE = None  # (needs_update, latest_tag) cached per process
 
 
-def _fetch_latest_version() -> str | None:
+def _fetch_latest_version(timeout: float = 15) -> str | None:
     """Fetch the latest semver tag from GitHub.
 
     Returns the version string (e.g. "0.8.7") or None on failure.
@@ -2539,7 +2293,7 @@ def _fetch_latest_version() -> str | None:
             f"{GITHUB_API}/releases/latest",
             headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             release = json.loads(resp.read().decode())
         latest_tag = release.get("tag_name", "").lstrip("v")
         if latest_tag:
@@ -2552,7 +2306,7 @@ def _fetch_latest_version() -> str | None:
                     f"{GITHUB_API}/tags?per_page=10",
                     headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
                 )
-                with urllib.request.urlopen(tag_req, timeout=15) as resp:
+                with urllib.request.urlopen(tag_req, timeout=timeout) as resp:
                     tags = json.loads(resp.read().decode())
                 if not tags:
                     return None
@@ -2584,10 +2338,12 @@ def _compare_versions(current: str, latest: str) -> bool:
 
 
 def notify_update() -> None:
-    """Check GitHub and print a yellow notice if an update is available.
+    """Print a one-line notice on *stderr* if a newer release exists.
 
-    Cache: checks at most once per 24 hours (per ``~/.spyro/version_check``).
-    Silently does nothing on failure (network down, no tags, etc.).
+    Runs after the command, only when stderr is a terminal (so scripts and
+    ``--json`` pipelines never see it or wait for it). The answer is cached for
+    24h; a failed check is cached for 1h so being offline costs one short
+    timeout, not one per command.
     """
     import json
     import time
@@ -2595,15 +2351,20 @@ def notify_update() -> None:
     from .. import __version__ as current_version
     global _CHECK_CACHE
 
-    # Per-process cache
-    if _CHECK_CACHE is not None:
-        needs_update, latest_tag = _CHECK_CACHE
-        if needs_update:
-            console.print(f"[yellow]Update available: v{current_version} → v{latest_tag}[/yellow]")
-            console.print("  Run [bold]spyro update[/bold] to upgrade.")
+    if not sys.stderr.isatty():
         return
 
-    # Disk cache (24 hours)
+    def show(needs_update: bool, latest: str) -> None:
+        if needs_update:
+            err_console.print(f"[yellow]Update available: v{current_version} → v{latest}[/yellow]")
+            err_console.print("  Run [bold]spyro update[/bold] to upgrade.")
+
+    # Per-process cache
+    if _CHECK_CACHE is not None:
+        show(*_CHECK_CACHE)
+        return
+
+    # Disk cache
     from ..utils.paths import spyro_home
     cache_path = spyro_home() / "version_check"
     now = time.time()
@@ -2611,37 +2372,28 @@ def notify_update() -> None:
     try:
         if cache_path.exists():
             data = json.loads(cache_path.read_text())
-            if now - data.get("checked_at", 0) < 86400:
-                needs_update = data.get("needs_update", False)
-                latest_tag = data.get("latest_version", "")
-                _CHECK_CACHE = (needs_update, latest_tag)
-                if needs_update:
-                    console.print(f"[yellow]Update available: v{current_version} → v{latest_tag}[/yellow]")
-                    console.print("  Run [bold]spyro update[/bold] to upgrade.")
+            if now - data.get("checked_at", 0) < data.get("ttl", 86400):
+                _CHECK_CACHE = (data.get("needs_update", False), data.get("latest_version", ""))
+                show(*_CHECK_CACHE)
                 return
     except Exception:
         pass
 
-    # Fetch from GitHub
-    latest_tag = _fetch_latest_version()
-    if latest_tag is None:
-        return
-
-    needs_update = _compare_versions(current_version, latest_tag)
-    _CHECK_CACHE = (needs_update, latest_tag)
+    latest_tag = _fetch_latest_version(timeout=3)
+    needs_update = latest_tag is not None and _compare_versions(current_version, latest_tag)
+    _CHECK_CACHE = (needs_update, latest_tag or "")
 
     try:
         cache_path.write_text(json.dumps({
             "checked_at": now,
+            "ttl": 86400 if latest_tag else 3600,
             "needs_update": needs_update,
-            "latest_version": latest_tag,
+            "latest_version": latest_tag or "",
         }))
     except Exception:
         pass
 
-    if needs_update:
-        console.print(f"[yellow]Update available: v{current_version} → v{latest_tag}[/yellow]")
-        console.print("  Run [bold]spyro update[/bold] to upgrade.")
+    show(*_CHECK_CACHE)
 
 
 # ---------------------------------------------------------------------------
@@ -2660,7 +2412,8 @@ def cmd_update(force: bool, check: bool) -> None:
     install --reinstall`` from the canonical git URL.
 
     Works whether spyro was installed with ``uv tool install`` or via pip.
-    ``git`` is not required — the update uses the GitHub REST API.
+    The release lookup uses the GitHub REST API, but installing clones the
+    repository, so ``git`` must be on PATH.
     """
     from .. import __version__ as current_version
 
@@ -2770,7 +2523,9 @@ def _interactive_ssh(profile: str) -> None:
         timeout=30.0,
     )
 
-    if exit_code != 0 and exit_code != 124:
+    if exit_code == 124:
+        console.print("\n[red]Timed out while logging in (30s)[/red]")
+    elif exit_code != 0:
         console.print(f"\n[red]Session exited with code: {exit_code}[/red]")
 
 
@@ -2812,7 +2567,7 @@ def config_validate(resolve: bool) -> None:
     try:
         config = load_config()
     except SystemExit as e:
-        console.print(f"[red]✗ Could not load config: {e}[/red]")
+        console.print(f"[red]✗ Could not load config: {escape(str(e))}[/red]")
         return
 
     console.print("[bold cyan]Spyro Config Validate[/bold cyan]\n")
@@ -2842,7 +2597,7 @@ def config_validate(resolve: bool) -> None:
                 console.print(f"  [green]  ✓[/green] {profile.host}:{profile.port} resolves")
             except socket.gaierror as e:
                 issues.append(f"[{name}] {profile.host}:{profile.port} — {e}")
-                console.print(f"  [red]  ✗[/red] {profile.host}:{profile.port} — {e}")
+                console.print(f"  [red]  ✗[/red] {profile.host}:{profile.port} — {escape(str(e))}")
 
         # SSH key existence
         if profile.key:
@@ -2859,17 +2614,20 @@ def config_validate(resolve: bool) -> None:
             if not (1 <= fp <= 65535):
                 issues.append(f"[{name}] forwarded_port {fp} out of range (1-65535)")
 
-        # Duplicate forwarded ports across profiles
-        all_ports: dict[int, str] = {}
-        for n, p in config.profiles.items():
-            for fp in p.forwarded_ports:
-                if fp in all_ports and all_ports[fp] != n:
-                    warnings.append(f"Port {fp} forwarded in both '{all_ports[fp]}' and '{n}'")
-                all_ports[fp] = n
-
         # DB config
         if profile.db.name and not profile.db.host:
             warnings.append(f"[{name}] db.host is empty")
+
+    # Duplicate forwarded ports across profiles (the second tunnel gets the next free local port)
+    all_ports: dict[int, str] = {}
+    for n, prof in config.profiles.items():
+        for fp in prof.forwarded_ports:
+            if fp in all_ports and all_ports[fp] != n:
+                warnings.append(
+                    f"Port {fp} forwarded in both '{all_ports[fp]}' and '{n}' "
+                    f"(the second tunnel will use another local port)"
+                )
+            all_ports[fp] = n
 
     # SSH config integration check
     ssh_config = parse_ssh_config()
@@ -2914,10 +2672,12 @@ def cmd_ps(profile: str | None, grep: str, json_output: bool) -> None:
     p = config.get_profile(profile)
 
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-    ps_cmd = "ps aux --no-headers 2>/dev/null || ps aux 2>/dev/null || ps -ef 2>/dev/null"
+    # `ps aux` for people; a fixed, header-less column set (args last) for JSON.
+    ps_cmd = (
+        "ps -eo user=,pid=,pcpu=,pmem=,vsz=,rss=,tty=,stat=,args=" if json_output else "ps aux"
+    )
     if grep:
-        import shlex
-        ps_cmd += f" | grep -i {shlex.quote(grep)}"
+        ps_cmd += f" | grep -i -- {safe_quote(grep)}"
     ssh_args.append(ps_cmd)
 
     try:
@@ -2929,38 +2689,29 @@ def cmd_ps(profile: str | None, grep: str, json_output: bool) -> None:
         console.print("[red]ssh not found[/red]")
         return
 
-    if result.returncode != 0:
+    output = result.stdout.strip()
+    # grep exits 1 when nothing matched; that is not an ssh/ps failure
+    if result.returncode != 0 and not (grep and result.returncode == 1 and not result.stderr.strip()):
         stderr = result.stderr.strip()
         if stderr:
-            console.print(f"[red]{stderr}[/red]")
+            console.print(Text(stderr, style="red"))
         return
 
-    output = result.stdout.strip()
     if not output:
         console.print("[yellow]No matching processes[/yellow]")
         return
 
     if json_output:
-        import json as json_mod
-        lines = output.splitlines()
-        entries = []
-        for line in lines:
-            parts = line.split(None, 10)
-            if len(parts) >= 8:
-                entries.append({
-                    "user": parts[0],
-                    "pid": parts[1],
-                    "cpu": parts[2],
-                    "mem": parts[3],
-                    "vsz": parts[4],
-                    "rss": parts[5],
-                    "tty": parts[6],
-                    "stat": parts[7],
-                    "command": " ".join(parts[8:]),
-                })
-        console.print(json_mod.dumps(entries, indent=2))
+        keys = ("user", "pid", "cpu", "mem", "vsz", "rss", "tty", "stat", "command")
+        entries = [
+            dict(zip(keys, line.split(None, 8)))
+            for line in output.splitlines()
+            if len(line.split(None, 8)) == 9
+        ]
+        _emit_json(entries)
     else:
-        console.print(output)
+        for line in output.splitlines():
+            _remote(line)
 
 
 # ---------------------------------------------------------------------------
@@ -2984,54 +2735,33 @@ def cmd_env() -> None:
 def diff(profile: str) -> None:
     """Compare local .env with remote .env."""
     import difflib
-    from ..core.pty_engine import _scp_target
 
     config = load_config()
     p = config.get_profile(profile)
 
     # Pull remote .env
     console.print(f"[cyan]Fetching remote .env from {p.host}...[/cyan]")
-    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-    remote_lines: list[str] = []
-
-    def collect(line: str) -> None:
-        remote_lines.append(line)
-
-    runner = PTYRunner()
-    remote_path = f"{p.remote_path}/.env"
-    cmd = ssh_args + [f"cat {safe_quote(remote_path)}"]
-
     from ..utils.keychain import prompt_for_credential
-    ssh_pw = prompt_for_credential(profile, p.user)
-    ec = runner.run(cmd, password=ssh_pw, on_output=collect, timeout=15.0)
 
-    if ec != 0:
-        console.print("[red]Failed to pull remote .env[/red]")
-        return
-
-    remote_text = "\n".join(remote_lines)
+    remote_text = fetch_remote_file(
+        p, f"{p.remote_path}/.env", password=prompt_for_credential(profile, p.user)
+    )
+    if remote_text is None:
+        raise click.ClickException("Failed to pull remote .env")
 
     # Read local .env
-    local_candidates = [Path.cwd() / ".env", Path(p.remote_path) / ".env"]
-    local_path = None
-    for cand in local_candidates:
-        if cand.exists():
-            local_path = cand
-            break
-
-    if not local_path:
+    local_path = Path.cwd() / ".env"
+    if not local_path.exists():
         console.print("[yellow]No local .env found — showing remote .env only:[/yellow]")
-        console.print(remote_text)
+        for line in remote_text.splitlines():
+            _remote(line)
         return
 
     local_text = local_path.read_text(encoding="utf-8")
 
     # Diff
-    local_lines = local_text.splitlines(keepends=True)
-    remote_lines_split = remote_text.splitlines(keepends=True)
-
     diff = list(difflib.unified_diff(
-        local_lines, remote_lines_split,
+        local_text.splitlines(keepends=True), remote_text.splitlines(keepends=True),
         fromfile=f"{local_path.name} (local)",
         tofile=f".env ({p.host} remote)",
         lineterm="",
@@ -3042,14 +2772,16 @@ def diff(profile: str) -> None:
         return
 
     for line in diff:
+        line = line.rstrip("\n")
         if line.startswith("+") and not line.startswith("+++"):
-            console.print(f"[green]{line}[/green]")
+            style = "green"
         elif line.startswith("-") and not line.startswith("---"):
-            console.print(f"[red]{line}[/red]")
+            style = "red"
         elif line.startswith("@@"):
-            console.print(f"[cyan]{line}[/cyan]")
+            style = "cyan"
         else:
-            console.print(line)
+            style = ""
+        console.print(Text(line, style=style), soft_wrap=True)
 
 
 @cmd_env.command()
@@ -3090,5 +2822,5 @@ def push(profile: str, source: str) -> None:
     if ec == 0:
         console.print(f"[green]✓ .env pushed to {profile}[/green]")
     else:
-        console.print(f"[red]Push failed (exit code: {ec})[/red]")
+        raise click.ClickException(f"Push failed (exit code: {ec})")
 

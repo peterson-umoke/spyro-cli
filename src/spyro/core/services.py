@@ -46,11 +46,18 @@ class ServiceStatus:
         return " ".join(parts)
 
 
-def _run_check(ssh_args: list[str], cmd: str, timeout: int = 3) -> tuple[int, str]:
-    """Run a command on the remote server via SSH."""
+def _run_check(ssh_args: list[str], cmd: str, timeout: int = 8) -> tuple[int, str]:
+    """Run a command on the remote server via SSH.
+
+    Returns ``(-1, reason)`` when ssh itself could not run or timed out.
+    """
     try:
         res = subprocess.run(ssh_args + [cmd], capture_output=True, timeout=timeout)
-        return res.returncode, res.stdout.decode().strip()
+        out = res.stdout.decode(errors="replace").strip()
+        if res.returncode == 255:  # ssh's own failure code: surface its message
+            err = res.stderr.decode(errors="replace").strip().splitlines()
+            out = err[-1] if err else out
+        return res.returncode, out
     except subprocess.TimeoutExpired:
         return -1, "timeout"
     except Exception as e:
@@ -87,7 +94,9 @@ def _detect_service(
         status.available = True
         status.path = path.splitlines()[0].strip()
     else:
-        status.error = f"{bin_candidates[0]} not found"
+        # rc -1/255 means we never reached the host (timeout, refused, auth):
+        # that is not the same as "not installed".
+        status.error = path if rc in (-1, 255) else f"{bin_candidates[0]} not found"
         return status
 
     vcmd = ver_cmd or f"{status.path} --version 2>/dev/null"
@@ -244,8 +253,15 @@ def detect_caddy(ssh_args: list[str]) -> ServiceStatus:
 
 
 def detect_all_services(host: str, user: str = "", port: int = 22, key: str = "") -> list[ServiceStatus]:
-    """Run all service detectors and return results."""
+    """Run all service detectors and return results.
+
+    Raises ConnectionError if the host cannot be reached, instead of running
+    every detector into its own timeout and reporting each service missing.
+    """
     ssh_args = build_ssh_args(host=host, user=user, port=port, key=key)
+    rc, out = _run_check(ssh_args, "true", timeout=15)
+    if rc != 0:
+        raise ConnectionError(out or f"ssh exited with code {rc}")
     return [
         detect_redis(ssh_args),
         detect_supervisor(ssh_args),
