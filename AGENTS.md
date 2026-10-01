@@ -38,6 +38,7 @@ Spyro is a Python CLI tool for SSH tunneling, remote command execution, and data
 - **`utils/config.py`** — `SpyroConfig`/`ProfileConfig`/`DatabaseConfig` dataclasses, `spyro.toml` parsing via `tomllib`, SSH config (`~/.ssh/config`) inheritance
 - **`utils/keychain.py`** — OS keychain wrapper via `keyring` library (`spyro-cli` service), with `prompt_for_credential()` fallback chain: `SPYRO_PASSWORD[_<PROFILE>]` env → keychain → getpass prompt (only on a tty) → store
 - **`utils/paths.py`** — `discover_config()` (walks up from cwd for `spyro.toml`), `spyro_home()` (`~/.spyro/`), `safe_quote()` for shell argument escaping
+- **`skills.py`** — Agent Skills generator: `generate()` (one `SKILL.md` per command from the Click tree + `NOTES`), `detect_targets()`, `install()`; backs `spyro install ai-skills`. The checked-in `skills/` dir must match `generate()` — regenerate with `uv run spyro install ai-skills --dest skills`
 - **`tests/unit/test_eval.py`** — Unit tests for `build_eval_php()`, the PHP code generator behind `spyro eval`
 
 ### Key Data Flow

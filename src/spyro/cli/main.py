@@ -21,6 +21,7 @@ from .commands import (
     cmd_env,
     cmd_eval,
     cmd_init,
+    cmd_install,
     cmd_logs,
     cmd_nginx,
     cmd_php,
@@ -142,6 +143,7 @@ main.add_command(cmd_ssh, "ssh")
 main.add_command(cmd_config, "config")
 main.add_command(cmd_ps, "ps")
 main.add_command(cmd_profiles, "profiles")
+main.add_command(cmd_install, "install")
 main.add_command(cmd_env, "env")
 # Register cmd_pull_env as env pull subcommand
 cmd_env.add_command(cmd_pull_env, "pull")

@@ -640,6 +640,21 @@ spyro profiles -p staging --json
 
 Check this before a `run`/`cp`: it shows the effective host, user, `remote_path` (and whether it is the `/var/www` default), sudo, and forwarded ports.
 
+### AI Agent Skills
+
+Spyro ships one [Agent Skill](https://agentskills.io) (`SKILL.md`) per command plus a `spyro` overview, so Claude Code, Codex, Cursor, Gemini CLI, omp or any SKILL.md-aware agent can drive spyro without guessing flags, remote paths or which profile is safe. The reference part of each skill is generated from the live `--help`, so it cannot drift; the "Before you run it" part holds the gotchas (`run` needs `-C`, `eval` is PHP-only, `doctor` hits every profile, never print `.env`, ...).
+
+```bash
+spyro install ai-skills --dry-run         # where they would go
+spyro install ai-skills                   # ~/.agents, ~/.claude, ~/.codex, ~/.cursor, ~/.omp/agent, ~/.gemini — whichever exist
+spyro install ai-skills --project         # same detection in the current repo (.claude/skills, ...)
+spyro install ai-skills --dest ./skills   # explicit directory (repeatable)
+spyro install ai-skills run logs eval     # only these (skill or command names)
+spyro install ai-skills --select          # numbered list; answer '1 3-5' or 'all'
+```
+
+Files spyro generated earlier are overwritten on reinstall; a `SKILL.md` it did not write is kept unless you pass `--force`. The same files are checked in under [`skills/`](skills/) for browsing and `gh skill install`.
+
 ### Default Profile
 
 Set a default profile in `spyro.toml` so you can omit `-p`:
