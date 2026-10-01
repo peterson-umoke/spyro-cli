@@ -92,7 +92,7 @@ uv run spyro --version
 # Or install globally for daily use
 uv tool install .
 
-# With filesystem watcher support (for spyro sync/watch)
+# With filesystem watcher support (for spyro sync)
 uv tool install . --with watchdog
 ```
 
@@ -480,18 +480,7 @@ spyro db dump -p staging -o backup.sql             # Streams raw bytes; written 
 
 # Listing
 spyro db list-databases -p staging                 # List all databases
-
-# GUI tools
-spyro proxy-url -p staging              # Generate connection string
-spyro proxy-url -p staging | pbcopy     # Copy to clipboard
 ```
-
-**Proxy URL output:**
-```
-mysql://forge:@127.0.0.1:3306/myapp_staging
-```
-
-Paste this into TablePlus, Sequel Ace, DBeaver, or any database GUI.
 
 ### Service Management
 
@@ -571,7 +560,6 @@ spyro artisan migrate -p staging --timeout 600      # or [defaults] command_time
 # Open an interactive SSH session for a profile.
 # It starts in the profile's remote_path (when spyro.toml sets one)
 spyro ssh -p staging
-spyro shell -p staging       # Alias for ssh
 
 # Start in your home directory (where plain ssh lands) instead
 spyro ssh -p staging --home  # --root is the same flag
@@ -609,7 +597,6 @@ spyro ps -p staging --json
 ```bash
 # Validate spyro.toml schema
 spyro config validate
-spyro cfg validate          # alias
 
 # Checks:
 #   - Required fields (host, user)
@@ -661,7 +648,6 @@ spyro --install-completion
 ```bash
 # Upload local file to remote
 spyro cp ./README.md :/var/www/app/README.md -p staging
-spyro upload ./README.md :/var/www/app/README.md -p staging   # alias
 
 # Relative remote paths start in the profile's remote_path (when spyro.toml sets one)
 spyro cp .env :.env -p staging                 # -> <remote_path>/.env
@@ -708,9 +694,6 @@ spyro env diff -p staging                        # Unified diff of keys; values 
 # Push local .env to remote
 spyro env push -p staging                        # Uploads .env
 spyro env push -p staging custom.env             # Upload custom file
-
-# Legacy alias (still works)
-spyro pull-env -p staging
 ```
 
 ### Logs
@@ -774,9 +757,9 @@ spyro logs laravel -p staging -f
 # One-liner: open MySQL shell
 spyro db shell -p staging
 
-# Or get connection string for GUI tools
-spyro proxy-url -p staging | pbcopy
-# Paste into TablePlus/Sequel Ace/DBeaver
+# Or open a tunnel and print the connection URL for GUI tools
+spyro db tunnel -p staging
+# Paste the URL into TablePlus/Sequel Ace/DBeaver
 ```
 
 ### Check before you deploy
@@ -1046,7 +1029,7 @@ health_check = "/health"    # HTTP endpoint to check
 health_timeout = 30         # Seconds to wait
 ```
 
-**Status:** Planned — implementation in progress. (Today `spyro deploy` is an alias for `spyro cp`.)
+**Status:** Planned — implementation in progress.
 
 ---
 

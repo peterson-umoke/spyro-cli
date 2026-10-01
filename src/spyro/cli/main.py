@@ -26,7 +26,6 @@ from .commands import (
     cmd_php,
     cmd_pin,
     cmd_pins,
-    cmd_proxy_url,
     cmd_ps,
     cmd_pull_env,
     cmd_redis,
@@ -40,7 +39,6 @@ from .commands import (
     cmd_unpin,
     cmd_up,
     cmd_update,
-    cmd_watch,
     cmd_wp,
     notify_update,
 )
@@ -118,14 +116,9 @@ main.add_command(cmd_down, "down")
 main.add_command(cmd_status, "status")
 main.add_command(cmd_logs, "logs")
 main.add_command(cmd_doctor, "doctor")
-main.add_command(cmd_pull_env, "pull-env")
 main.add_command(cmd_run, "run")
-main.add_command(cmd_watch, "watch")
-main.add_command(cmd_proxy_url, "proxy-url")
 main.add_command(cmd_artisan, "artisan")
 main.add_command(cmd_cp, "cp")
-main.add_command(cmd_cp, "deploy")
-main.add_command(cmd_cp, "upload")
 main.add_command(cmd_wp, "wp")
 main.add_command(cmd_pin, "pin")
 main.add_command(cmd_unpin, "unpin")
@@ -141,19 +134,13 @@ main.add_command(cmd_tinker, "tinker")
 main.add_command(cmd_eval, "eval")
 main.add_command(cmd_script, "script")
 main.add_command(cmd_db, "db")
-# Legacy top-level aliases for `db tunnel` / `db shell`
-main.add_command(cmd_db.commands["tunnel"], "db-tunnel")
-main.add_command(cmd_db.commands["shell"], "db-shell")
 main.add_command(cmd_auth, "auth")
 main.add_command(cmd_ssh, "ssh")
-main.add_command(cmd_ssh, "shell")  # alias
 
 # New commands for 0.7.0
 main.add_command(cmd_config, "config")
 main.add_command(cmd_ps, "ps")
 main.add_command(cmd_env, "env")
-# Alias: spyro cfg → spyro config
-main.add_command(cmd_config, "cfg")
 # Register cmd_pull_env as env pull subcommand
 cmd_env.add_command(cmd_pull_env, "pull")
 

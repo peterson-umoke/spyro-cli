@@ -688,7 +688,7 @@ def cmd_doctor(json_output: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# spyro pull-env
+# spyro env pull
 # ---------------------------------------------------------------------------
 
 
@@ -757,49 +757,6 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
         )
         failed = failed or ec  # every profile still runs; the first failure is the exit status
     _exit_with(failed)
-
-
-# ---------------------------------------------------------------------------
-# spyro watch
-# ---------------------------------------------------------------------------
-
-
-@click.command()
-@click.argument("src")
-@click.argument("dest")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_watch(src: str, dest: str, profile: str) -> None:
-    """Sync local file changes to remote server in real-time."""
-    src_path = Path(src).resolve()
-    if not src_path.exists():
-        console.print(f"[red]Source path does not exist: {src}[/red]")
-        return
-    pin = SyncPin(local_path=str(src_path), remote_path=dest, profile=profile)
-    _run_sync_watch(profile, [pin], dry_run=False)
-
-# ---------------------------------------------------------------------------
-# spyro proxy-url
-# ---------------------------------------------------------------------------
-
-
-@click.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
-@click.option("--port", type=int, help="Override local port")
-def cmd_proxy_url(profile: str, port: int | None) -> None:
-    """Generate a local connection string for database GUIs."""
-    config = load_config()
-    p = config.get_profile(profile)
-    db = _resolve_db(p, profile)
-
-    tunnel = get_tunnel(profile)
-    if port:
-        local_port = port
-    elif tunnel and tunnel.status == "running" and tunnel_alive(tunnel):
-        local_port = db_local_port(p, tunnel)
-    else:
-        local_port = db.port
-
-    click.echo(generate_connection_url(db, port_override=local_port))
 
 
 # ---------------------------------------------------------------------------
@@ -2581,7 +2538,7 @@ def cmd_update(force: bool, check: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# spyro ssh / spyro shell
+# spyro ssh
 # ---------------------------------------------------------------------------
 
 

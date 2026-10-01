@@ -253,7 +253,7 @@ def test_auth_list_reveals_nothing_about_the_password(project, monkeypatch):
 
 def test_pull_env_sends_password_and_writes_owner_only(project):
     with patch.object(commands, "fetch_remote_file", return_value="A=1\n") as fetch:
-        result = invoke("pull-env", "-p", "a", "--dest", "out.env")
+        result = invoke("env", "pull", "-p", "a", "--dest", "out.env")
     assert result.exit_code == 0, result.output
     assert fetch.call_args.kwargs["password"] == "pw"
     assert Path("out.env").read_text() == "A=1\n"
@@ -306,15 +306,18 @@ class TestDb:
         result = invoke("db")
         assert result.exit_code == 0 and "Commands:" in result.output
 
-    def test_empty_password_triggers_remote_env_detection(self, project):
-        (project / "spyro.toml").write_text(TOML.replace('password = "s3cret"', 'password = ""'))
+    def test_empty_password_triggers_remote_env_detection(self, project, fake_client):
+        from spyro.supervisor.state import TunnelState
         from spyro.utils.config import DatabaseConfig
 
+        (project / "spyro.toml").write_text(TOML.replace('password = "s3cret"', 'password = ""'))
         detected = DatabaseConfig(name="fromenv", user="envuser", password="envpw")
-        with patch.object(commands, "resolve_db_credentials", return_value=detected) as resolve:
-            result = invoke("proxy-url", "-p", "a")
-        assert resolve.called
-        assert "envuser:envpw@127.0.0.1" in result.output and result.output.strip().endswith("/fromenv")
+        state = TunnelState(profile="a", local_port=6379, forwarded_ports=[3310], status="running")
+        with patch.object(commands, "resolve_db_credentials", return_value=detected) as resolve, \
+                patch.object(commands, "_tunnel_for", return_value=state):
+            result = invoke("db", "query", "SELECT 1", "-p", "a")
+        assert resolve.called and result.exit_code == 0, result.output
+        assert json.loads(fake_client.read_text())["pwd"] == "envpw"
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ Spyro is a Python CLI tool for SSH tunneling, remote command execution, and data
 - **`core/pty_engine.py`** — PTYRunner: spawns native `ssh` via `pty.openpty()` + `os.fork()`, matches auth/sudo prompt regexes, injects credentials into the PTY buffer, hands off to raw terminal relay. Also builds `ssh`/`scp` argument lists.
 - **`core/db.py`** — Database credential resolution (local config vs remote `.env` scan), connection URL generation, and local client argv/env (passwords go via `MYSQL_PWD`/`PGPASSWORD`)
 - **`core/services.py`** — Remote service detection (Redis, Supervisor, PHP-FPM, Node.js, Apache, Nginx, Caddy) used by `spyro doctor`
-- **`core/sync.py`** — SyncPin dataclass, framework-aware exclusion rules (Laravel, WordPress, Node, Python), and `should_exclude()` logic for `spyro sync`/`watch`
+- **`core/sync.py`** — SyncPin dataclass, framework-aware exclusion rules (Laravel, WordPress, Node, Python), and `should_exclude()` logic for `spyro sync`
 - **`supervisor/tunnel.py`** — TunnelManager: `ssh -f -N -L` through the PTY engine (ControlMaster per tunnel), verified before success is reported; `stop()` uses the control socket and only signals a PID that is still ssh/spyro. No restart loop: a dead tunnel shows as `stale`
 - **`supervisor/state.py`** — TunnelState dataclass, JSON persistence via `~/.spyro/tunnels.json` (flock + atomic write), `tunnel_alive()` PID identity check
 - **`security/memory.py`** — `SecureCredential`: mutable `bytearray` wrapper with triple-pass zeroing (zero → random → zero), context manager support, destructor-based cleanup
@@ -69,4 +69,4 @@ Credentials flow:
 - Python: >= 3.11 (uses stdlib `tomllib`)
 - Test config: pytest with `testpaths = ["tests"]`, default `-v --tb=short`
 - Dependencies: click, rich, keyring
-- Optional: watchdog (for `spyro sync/watch`), pytest/pytest-cov/pip-audit (dev)
+- Optional: watchdog (for `spyro sync`), pytest/pytest-cov/pip-audit (dev)

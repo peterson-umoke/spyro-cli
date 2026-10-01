@@ -249,12 +249,6 @@ class TestSshCommand:
         _, call = self._run("ssh", "-p", "plain")
         assert call.args[0][-1] == "u@p.example.com"
 
-    def test_shell_is_an_alias_with_the_same_flags(self, project):
-        _, default_call = self._run("shell", "-p", "a")
-        _, home_call = self._run("shell", "-p", "a", "--home")
-        assert default_call.args[0][-1].startswith("sh -c ")
-        assert home_call.args[0][-1] == "u@h.example.com"
-
     def test_tilde_remote_path_expands_on_the_server(self, project):
         _, call = self._run("ssh", "-p", "tilde")
         assert '"$HOME"/site' in call.args[0][-1]
