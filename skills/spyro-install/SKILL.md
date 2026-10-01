@@ -38,8 +38,9 @@ Usage: spyro install ai-skills [OPTIONS] [NAMES]...
 
   Install Agent Skills (SKILL.md) for spyro commands, generated from the live --help.
 
-  With no NAMES every skill is installed. NAMES are skill or command names (`run` and `spyro-run`
-  both work); `--select` shows a numbered list to pick from.
+  Choose skills one of four ways: no arguments opens a checkbox TUI (arrows, space, enter; needs a
+  terminal); NAMES install just those (`run` and `spyro-run` both work); `--select` is a numbered
+  prompt; `--all` installs everything after one confirmation (`-f` skips it).
 
   Lets any SKILL.md-aware agent (Claude Code, Codex, Cursor, Gemini CLI, omp, ...) run spyro without
   guessing flags or remote paths. Detected agents: ~/.agents, ~/.claude, ~/.codex, ~/.cursor,
@@ -47,11 +48,13 @@ Usage: spyro install ai-skills [OPTIONS] [NAMES]...
   overwritten (see --force).
 
 Options:
-  --select     Pick skills from a numbered list (e.g. '1 3-5' or 'all')
+  --all        Install every skill (asks once unless -f)
+  --select     Numbered list instead of the TUI; answer '1 3-5' or 'all'
   --dest PATH  Skills directory to write into (repeatable). Default: every detected agent's skills
                dir
   --project    Detect agent dirs in the current directory (.claude/, .agents/, ...) instead of $HOME
-  --force      Also overwrite SKILL.md files spyro did not generate
+  -f, --force  No questions: skip the --all confirmation and overwrite SKILL.md files spyro did not
+               generate
   --dry-run    Only show where skills would be written
   --help       Show this message and exit.
 ```

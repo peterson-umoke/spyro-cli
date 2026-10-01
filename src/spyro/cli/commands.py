@@ -2722,21 +2722,29 @@ def cmd_install() -> None:
     """Install spyro add-ons on this machine (currently: AI agent skills)."""
 
 
+def _interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 @cmd_install.command(name="ai-skills")
 @click.argument("names", nargs=-1)
-@click.option("--select", "select", is_flag=True, help="Pick skills from a numbered list (e.g. '1 3-5' or 'all')")
+@click.option("--all", "install_all", is_flag=True, help="Install every skill (asks once unless -f)")
+@click.option("--select", "select", is_flag=True, help="Numbered list instead of the TUI; answer '1 3-5' or 'all'")
 @click.option("--dest", "dests", type=click.Path(path_type=Path), multiple=True,
               help="Skills directory to write into (repeatable). Default: every detected agent's skills dir")
 @click.option("--project", is_flag=True, help="Detect agent dirs in the current directory (.claude/, .agents/, ...) instead of $HOME")
-@click.option("--force", is_flag=True, help="Also overwrite SKILL.md files spyro did not generate")
+@click.option("--force", "-f", is_flag=True, help="No questions: skip the --all confirmation and overwrite SKILL.md files spyro did not generate")
 @click.option("--dry-run", is_flag=True, help="Only show where skills would be written")
 def install_ai_skills(
-    names: tuple[str, ...], select: bool, dests: tuple[Path, ...], project: bool, force: bool, dry_run: bool
+    names: tuple[str, ...], install_all: bool, select: bool, dests: tuple[Path, ...],
+    project: bool, force: bool, dry_run: bool,
 ) -> None:
     """Install Agent Skills (SKILL.md) for spyro commands, generated from the live --help.
 
-    With no NAMES every skill is installed. NAMES are skill or command names
-    (`run` and `spyro-run` both work); `--select` shows a numbered list to pick from.
+    Choose skills one of four ways: no arguments opens a checkbox TUI (arrows, space,
+    enter; needs a terminal); NAMES install just those (`run` and `spyro-run` both
+    work); `--select` is a numbered prompt; `--all` installs everything after one
+    confirmation (`-f` skips it).
 
     Lets any SKILL.md-aware agent (Claude Code, Codex, Cursor, Gemini CLI, omp, ...) run
     spyro without guessing flags or remote paths. Detected agents: ~/.agents, ~/.claude,
@@ -2744,27 +2752,44 @@ def install_ai_skills(
     Only files spyro generated earlier are overwritten (see --force).
     """
     from .. import skills
+    from . import picker
+
+    if sum(map(bool, (names, install_all, select))) > 1:
+        raise click.UsageError("use only one of NAMES, --all or --select")
 
     targets = list(dests) or skills.detect_targets(Path.cwd() if project else Path.home())
     generated = skills.generate()
+    ordered = sorted(generated)
+
     if names:
         try:
-            generated = skills.pick_by_name(generated, names)
+            chosen = list(skills.pick_by_name(generated, names))
         except KeyError as exc:
-            raise click.UsageError(f"unknown skill {exc.args[0]!r}; available: {', '.join(sorted(generated))}") from None
-    if select:
-        ordered = sorted(generated)
+            raise click.UsageError(f"unknown skill {exc.args[0]!r}; available: {', '.join(ordered)}") from None
+    elif install_all:
+        chosen = ordered
+        if not force and not dry_run:
+            where = ", ".join(str(t) for t in targets)
+            if not click.confirm(f"Install {len(chosen)} skills into {where}?", default=False):
+                return
+    elif select:
         for i, name in enumerate(ordered, 1):
             console.print(f"{i:2}) {name}")
         answer = click.prompt("Install which? (numbers, ranges like 3-5, or 'all')", default="", show_default=False)
         try:
-            chosen = skills.parse_selection(answer, len(ordered))
+            chosen = [ordered[i - 1] for i in skills.parse_selection(answer, len(ordered))]
         except ValueError as exc:
             raise click.UsageError(str(exc)) from None
-        if not chosen:
-            console.print("Nothing selected.")
-            return
-        generated = {ordered[i - 1]: generated[ordered[i - 1]] for i in chosen}
+    else:
+        if not _interactive_terminal():
+            raise click.UsageError("no terminal for the picker; use --all, --select, or skill NAMES")
+        picked = picker.pick(ordered, title=f"spyro install ai-skills → {', '.join(str(t) for t in targets)}")
+        chosen = picked or []
+
+    if not chosen:
+        console.print("Nothing selected.")
+        return
+    generated = {name: generated[name] for name in chosen}
     if dry_run:
         for t in targets:
             console.print(f"  would write {len(generated)} skills to {escape(str(t))}")

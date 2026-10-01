@@ -259,12 +259,11 @@ def parse_selection(answer: str, count: int) -> list[int]:
         return list(range(1, count + 1))
     chosen: list[int] = []
     for token in answer.replace(",", " ").split():
-        lo, _, hi = token.partition("-")
-        try:
-            start, end = int(lo), int(hi or lo)
-        except ValueError:
-            raise ValueError(f"not a number or range: {token!r}") from None
+        lo, dash, hi = token.partition("-")
+        if not lo.isdigit() or (dash and not hi.isdigit()):
+            raise ValueError(f"not a number or range: {token!r}")
+        start, end = int(lo), int(hi) if hi else int(lo)
         if not (1 <= start <= end <= count):
-            raise ValueError(f"{token!r} is outside 1-{count}")
+            raise ValueError(f"{token!r} is outside 1-{count} or reversed")
         chosen.extend(i for i in range(start, end + 1) if i not in chosen)
     return chosen
