@@ -226,6 +226,19 @@ class TestTunnelLifecycle:
             victim.kill()
             victim.wait()
 
+    def test_stopping_a_stale_tunnel_reports_nothing_stopped_and_clears_the_state(self, fake_ssh, caplog):
+        import logging
+        import subprocess
+        from spyro.supervisor.state import TunnelState, get_tunnel, set_tunnel
+
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        set_tunnel(TunnelState(profile="a", local_port=1, pid=dead.pid, pgid=dead.pid, status="running"))
+        with caplog.at_level(logging.INFO):
+            assert _manager(_free_port()).stop("a") is False
+        assert get_tunnel("a").status == "stopped"
+        assert "was not running" in caplog.text and "Tunnel for 'a' stopped" not in caplog.text
+
     def test_no_forwarded_ports_is_an_error_not_a_useless_ssh(self, fake_ssh):
         import pytest
         from spyro.supervisor.tunnel import TunnelManager

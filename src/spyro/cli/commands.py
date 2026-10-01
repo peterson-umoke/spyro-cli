@@ -49,6 +49,7 @@ from ..supervisor.state import (
 )
 from ..supervisor.tunnel import TunnelManager, db_local_port
 from ..utils.paths import safe_quote
+from ..utils.envdiff import redact_env
 
 console = Console()
 err_console = Console(stderr=True)
@@ -82,6 +83,12 @@ def _report_exit(ec: int, timeout: float | None, prefix: str = "  ") -> None:
         )
     elif ec != 0:
         console.print(f"{prefix}[red]Exit code: {ec}[/red]")
+
+
+def _exit_with(ec: int) -> None:
+    """Make a remote failure spyro's own exit status (``Exit code: N`` is only the message)."""
+    if ec:
+        raise SystemExit(ec)
 
 
 def _sudo_prefix(p: "ProfileConfig", no_escalate: bool = False) -> str:
@@ -733,19 +740,23 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
         profiles = list(profile)
     else:
         env_profile = os.environ.get("SPYRO_PROFILE", "")
-        if env_profile:
-            profiles = [n.strip() for n in env_profile.split(",") if n.strip()]
-        else:
-            console.print("[red]Specify --all, --profile, or set SPYRO_PROFILE[/red]")
-            return
+        if not env_profile:
+            raise click.UsageError("Specify --all, --profile, or set SPYRO_PROFILE")
+        profiles = [n.strip() for n in env_profile.split(",") if n.strip()]
 
+    failed = 0
     for name in profiles:
         p = config.get_profile(name)
         console.print(f"\n[bold cyan]=== {name} ===[/bold cyan]")
 
         # Optionally wrap command with cd to remote_path
         remote_cmd = f"{_capistrano_cd(p.remote_path)} && {command}" if chdir else command
-        _run_svc_cmd(name, remote_cmd, timeout=60.0, cli_timeout=timeout, escalate=p.sudo)
+        ec = _run_svc_cmd(
+            name, remote_cmd, timeout=60.0, cli_timeout=timeout,
+            escalate=p.sudo, exit_on_error=False,
+        )
+        failed = failed or ec  # every profile still runs; the first failure is the exit status
+    _exit_with(failed)
 
 
 # ---------------------------------------------------------------------------
@@ -806,14 +817,12 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | N
     profile = resolve_profile(profile)
 
     if not cmd_args:
-        console.print("[red]Usage: spyro artisan <command> [--profile NAME][/red]")
-        return
+        raise click.UsageError("a command is required: spyro artisan <command> [--profile NAME]")
 
     config = load_config()
     p = config.get_profile(profile)
     if not p.artisan:
-        console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
-        return
+        raise click.ClickException(f"Profile '{profile}' is not configured for artisan")
 
     artisan_cmd = (
         f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}"
@@ -1093,15 +1102,13 @@ def cmd_sync(profile: str, dry_run: bool) -> None:
 def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
     """Run WP-CLI commands on the remote host."""
     if not cmd_args:
-        console.print("[red]Usage: spyro wp <command> [--profile NAME][/red]")
-        return
+        raise click.UsageError("a command is required: spyro wp <command> [--profile NAME]")
 
     config = load_config()
     p = config.get_profile(profile)
 
     if not p.wordpress:
-        console.print(f"[yellow]Profile '{profile}' is not configured for WordPress[/yellow]")
-        return
+        raise click.ClickException(f"Profile '{profile}' is not configured for WordPress")
 
     # Find WP-CLI on remote
     wp_bin = _find_wp_cli(
@@ -1427,12 +1434,16 @@ def _run_svc_cmd(
     show_exit_code: bool = True,
     escalate: bool | None = None,
     prefix: str = "  ",
+    exit_on_error: bool = True,
 ) -> int:
     """Run *cmd* on a profile's server through the PTY engine and print its output.
 
     *timeout* ``None`` means "until it exits" (``logs -f``). *escalate* says
     whether the command will use sudo (allocates a remote tty so sudo can
     prompt); ``None`` keeps the service-command rule: the profile's ``sudo``.
+
+    A non-zero remote exit status ends spyro with that status unless
+    *exit_on_error* is False (callers that retry, aggregate or clean up).
     """
     config = load_config()
     p = config.get_profile(profile)
@@ -1442,6 +1453,8 @@ def _run_svc_cmd(
         if not p.sudo and "sudo" in cmd:
             console.print(f"[red]  ✗ User '{p.user}' does not have sudo access on {profile}[/red]")
             console.print("[yellow]  Set sudo = true in your spyro.toml for this profile[/yellow]")
+            if exit_on_error:
+                raise SystemExit(1)
             return 1
         escalate = p.sudo
 
@@ -1461,6 +1474,8 @@ def _run_svc_cmd(
     )
     if show_exit_code:
         _report_exit(ec, resolved, prefix)
+    if exit_on_error:
+        _exit_with(ec)
     return ec
 
 @click.group()
@@ -1561,7 +1576,7 @@ def cmd_php() -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def version(profile: str) -> None:
     """Show PHP version."""
-    if _run_svc_cmd(profile, "php -v 2>/dev/null | head -3", timeout=10, show_exit_code=False) != 0:
+    if _run_svc_cmd(profile, "php -v 2>/dev/null | head -3", timeout=10, show_exit_code=False, exit_on_error=False) != 0:
         _run_svc_cmd(profile, "php --version 2>/dev/null | head -3", timeout=10)
 
 
@@ -1569,7 +1584,7 @@ def version(profile: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def fpm_status(profile: str) -> None:
     """Show PHP-FPM status (pools, processes)."""
-    if _run_svc_cmd(profile, 'php-fpm -tt 2>/dev/null || (echo "PHP-FPM config test:" && pgrep -af "php-fpm" 2>/dev/null || echo "not running")', timeout=10, show_exit_code=False) != 0:
+    if _run_svc_cmd(profile, 'php-fpm -tt 2>/dev/null || (echo "PHP-FPM config test:" && pgrep -af "php-fpm" 2>/dev/null || echo "not running")', timeout=10, show_exit_code=False, exit_on_error=False) != 0:
         _run_svc_cmd(profile, "pgrep -af 'php-fpm' 2>/dev/null || echo 'PHP-FPM not running'", timeout=10)
 
 
@@ -1581,7 +1596,7 @@ def extensions(profile: str, filter: str) -> None:
     cmd = "php -m 2>/dev/null | tail -n +2"
     if filter:
         cmd += f" | grep -i {safe_quote(filter)}"
-    if _run_svc_cmd(profile, cmd, timeout=10, show_exit_code=False) != 0:
+    if _run_svc_cmd(profile, cmd, timeout=10, show_exit_code=False, exit_on_error=False) != 0:
         _run_svc_cmd(profile, "php -m 2>/dev/null || echo 'PHP not available'", timeout=10)
 
 
@@ -1667,7 +1682,8 @@ def version(profile: str) -> None:
 @click.option("--profile", "-p", required=True, help="Profile name")
 def status(profile: str) -> None:
     """Show Nginx server status."""
-    _run_svc_cmd(profile, "nginx -t 2>&1 && (pgrep -x nginx >/dev/null && echo 'Nginx running' || echo 'Nginx not running')", timeout=10)
+    sudo = "sudo " if load_config().get_profile(profile).sudo else ""  # certs are root-readable
+    _run_svc_cmd(profile, f"{sudo}nginx -t 2>&1 && (pgrep -x nginx >/dev/null && echo 'Nginx running' || echo 'Nginx not running')", timeout=10)
 
 
 @cmd_nginx.command()
@@ -1751,7 +1767,7 @@ def _upload_and_run(
         dest=_scp_target(tmp_remote, p.host, p.user),
         host=p.host, user=p.user, port=p.port, key=p.key,
     )
-    console.print(Text(f"Uploading {local_file.name} to {p.host}:{tmp_remote}...", style="cyan"))
+    err_console.print(Text(f"Uploading {local_file.name} to {p.host}:{tmp_remote}...", style="cyan"))
     if runner.run(scp_args, password=ssh_pw, timeout=30) != 0:
         console.print(f"[red]Failed to upload {label}[/red]")
         return 1
@@ -1768,7 +1784,7 @@ def _upload_and_run(
         command = f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}{build_cmd(safe_quote(tmp_remote))}"
         return _run_svc_cmd(
             profile, command, timeout=timeout,
-            escalate=p.sudo and not no_escalate, prefix="",
+            escalate=p.sudo and not no_escalate, prefix="", exit_on_error=False,
         )
     finally:
         clean = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
@@ -1793,17 +1809,16 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
     p = config.get_profile(profile)
 
     if not p.artisan:
-        console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
-        return
+        raise click.ClickException(f"Profile '{profile}' is not configured for artisan")
 
     escalate = p.sudo and not no_escalate
 
     if file:
-        _upload_and_run(
+        _exit_with(_upload_and_run(
             profile, Path(file).expanduser().resolve(),
             lambda remote: f"php artisan tinker < {remote}",
             no_escalate=no_escalate, label="tinker",
-        )
+        ))
         return
 
     cd_cmd = _capistrano_cd(p.remote_path)
@@ -1939,12 +1954,10 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
     p = config.get_profile(profile)
 
     if not p.artisan:
-        console.print(f"[yellow]Profile '{profile}' is not configured for artisan[/yellow]")
-        return
+        raise click.ClickException(f"Profile '{profile}' is not configured for artisan")
 
     if not p.remote_path:
-        console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
-        return
+        raise click.ClickException(f"Profile '{profile}' has no remote_path configured")
 
     import tempfile
 
@@ -1954,10 +1967,10 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
     try:
         with os.fdopen(fd, "w") as f:
             f.write(build_eval_php(expression, json_output, no_aliases))
-        _upload_and_run(
+        _exit_with(_upload_and_run(
             profile, tmp_local, lambda remote: f"php {remote}",
             no_escalate=no_escalate, label="eval",
-        )
+        ))
     finally:
         tmp_local.unlink(missing_ok=True)
 
@@ -1967,34 +1980,37 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
 @click.option("--profile", "-p", required=True, help="Profile name")
 @click.option("--no-escalate", is_flag=True, help="Don't use sudo")
 def cmd_script(file: str, profile: str, no_escalate: bool) -> None:
-    """Upload a PHP file and execute it in the remote Laravel context.
+    """Upload a PHP file and run it with plain ``php`` on the remote server.
 
     Reads a local .php file, uploads it to the remote server, executes it
     with ``php`` from the configured ``remote_path``, prints the output,
     and cleans up the remote temp file. The local file is untouched.
+    The remote exit status becomes spyro's exit status.
+
+    Laravel is NOT booted: the script must load it itself (``require
+    'vendor/autoload.php'`` then ``bootstrap/app.php``). To evaluate an
+    expression inside the app use ``spyro eval``.
 
     Examples:
 
       spyro script fix_stuck_users.php -p staging
 
-      spyro script app/scripts/deploy_hook.php -p production
+      spyro script app/scripts/deploy_hook.php -p staging
     """
     config = load_config()
     p = config.get_profile(profile)
 
     if not p.remote_path:
-        console.print(f"[red]Profile '{profile}' has no remote_path configured[/red]")
-        return
+        raise click.ClickException(f"Profile '{profile}' has no remote_path configured")
 
     file_path = Path(file).expanduser().resolve()
     if not file_path.exists():
-        console.print(f"[red]File not found: {file_path}[/red]")
-        return
+        raise click.ClickException(f"File not found: {file_path}")
 
-    _upload_and_run(
+    _exit_with(_upload_and_run(
         profile, file_path, lambda remote: f"php {remote}",
         no_escalate=no_escalate, label="script",
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -2157,9 +2173,12 @@ def laravel(profile: str, lines: int, follow: bool) -> None:
     """Tail the Laravel log file."""
     config = load_config()
     p = config.get_profile(profile)
-    log_path = safe_quote(f"{p.remote_path}/storage/logs/laravel.log")
+    log_dir = safe_quote(f"{p.remote_path}/storage/logs")
     tail_flag = " -f" if follow else ""
-    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} {log_path} 2>/dev/null || echo 'Log not found'", timeout=None if follow else 15)
+    # daily/stack channels write laravel-YYYY-MM-DD.log; laravel.log may sit empty beside them
+    newest = f'f=$(ls -t {log_dir}/laravel*.log 2>/dev/null | head -1); '
+    tail = f'if [ -n "$f" ]; then tail -n {int(lines)}{tail_flag} "$f"; else echo \'Log not found\'; fi'
+    _run_svc_cmd(profile, newest + tail, timeout=None if follow else 15)
 
 
 @cmd_logs.command()
@@ -2822,18 +2841,19 @@ def diff(profile: str) -> None:
     # Read local .env
     local_path = Path.cwd() / ".env"
     if not local_path.exists():
-        console.print("[yellow]No local .env found — showing remote .env only:[/yellow]")
-        for line in remote_text.splitlines():
+        console.print("[yellow]No local .env found — showing remote keys only (values hidden):[/yellow]")
+        for line in redact_env(remote_text):
             _remote(line)
         return
 
     local_text = local_path.read_text(encoding="utf-8")
 
-    # Diff
+    # Values are secrets: diff the redacted text, marking keys whose value differs
     diff = list(difflib.unified_diff(
-        local_text.splitlines(keepends=True), remote_text.splitlines(keepends=True),
-        fromfile=f"{local_path.name} (local)",
-        tofile=f".env ({p.host} remote)",
+        [l + "\n" for l in redact_env(local_text, remote_text, "local")],
+        [l + "\n" for l in redact_env(remote_text, local_text, "remote")],
+        fromfile=f"{local_path.name} (local, values hidden)",
+        tofile=f".env ({p.host} remote, values hidden)",
         lineterm="",
     ))
 
@@ -2863,8 +2883,7 @@ def push(profile: str, source: str) -> None:
 
     src = Path(source).expanduser().resolve()
     if not src.exists():
-        console.print(f"[red]Local file not found: {source}[/red]")
-        return
+        raise click.ClickException(f"Local file not found: {source}")
 
     config = load_config()
     p = config.get_profile(profile)
@@ -2886,7 +2905,7 @@ def push(profile: str, source: str) -> None:
     ssh_pw = prompt_for_credential(profile, p.user)
 
     runner = PTYRunner()
-    console.print(f"[cyan]Uploading {source} to {p.host}:{remote_dest}...[/cyan]")
+    err_console.print(f"[cyan]Uploading {source} to {p.host}:{remote_dest}...[/cyan]")
     ec = runner.run(scp_args, password=ssh_pw, timeout=30.0)
 
     if ec == 0:

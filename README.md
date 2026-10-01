@@ -703,7 +703,7 @@ spyro env pull -p staging                        # Creates .env.remote
 spyro env pull -p staging --dest .env.staging    # Custom output path
 
 # Compare local .env with remote
-spyro env diff -p staging                        # Unified diff output
+spyro env diff -p staging                        # Unified diff of keys; values are never printed
 
 # Push local .env to remote
 spyro env push -p staging                        # Uploads .env

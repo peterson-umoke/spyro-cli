@@ -345,7 +345,10 @@ class TunnelManager:
                     pass
 
         mark_stopped(profile_name)
-        log.info(f"Tunnel for '{profile_name}' stopped")
+        if stopped:
+            log.info(f"Tunnel for '{profile_name}' stopped")
+        else:
+            log.info(f"Tunnel for '{profile_name}' was not running; state cleared")
         return stopped
 
     def stop_all(self) -> int:
