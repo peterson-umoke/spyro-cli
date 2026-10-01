@@ -192,7 +192,7 @@ host = "staging.example.com"     # Server IP or hostname (required)
 user = "deploy"                  # SSH username (required)
 port = 22                        # SSH port (default: 22)
 key = "~/.ssh/id_ed25519"       # SSH key (optional, uses default if empty)
-remote_path = "/var/www/app"     # Working directory on server (required)
+remote_path = "/var/www/app"     # Where `spyro ssh` starts and relative `spyro cp` paths resolve
 artisan = true                   # Enable Laravel artisan commands
 wordpress = false                # Enable WordPress/WP-CLI commands
 sudo = true                      # Allow sudo when needed
@@ -209,7 +209,7 @@ env_files = [".env"]             # Remote env files to scan for DB credentials
 | `user` | string | `deploy` | SSH username |
 | `port` | int | `22` | SSH port |
 | `key` | string | `""` | Path to SSH private key (uses system default if empty) |
-| `remote_path` | string | `/var/www` | Working directory on remote server |
+| `remote_path` | string | `/var/www` | Working directory on the server (also used by `artisan`, `run -C`, ...). `spyro ssh` starts here and relative remote paths in `spyro cp` resolve against it, but only when you set it in `spyro.toml`; `--home` uses your home directory instead |
 | `forwarded_ports` | list[int] | `[]` | Remote ports to tunnel to localhost. The local port is the same unless it is taken, then the next free one is used |
 | `artisan` | bool | `false` | Enable `spyro artisan` commands |
 | `wordpress` | bool | `false` | Enable `spyro wp` commands |
@@ -568,9 +568,13 @@ spyro artisan migrate -p staging --timeout 600      # or [defaults] command_time
 ### Interactive Shell
 
 ```bash
-# Open an interactive SSH session for a profile
+# Open an interactive SSH session for a profile.
+# It starts in the profile's remote_path (when spyro.toml sets one)
 spyro ssh -p staging
 spyro shell -p staging       # Alias for ssh
+
+# Start in your home directory (where plain ssh lands) instead
+spyro ssh -p staging --home  # --root is the same flag
 
 # Auto-detects profile if only one is configured
 spyro ssh
@@ -581,6 +585,8 @@ spyro ssh
 #   - Password or key-based auth — both handled automatically
 # Exit with Ctrl+D or type "exit"
 ```
+
+If `remote_path` does not exist on the server you still get a shell, in your home directory, with a notice. For a Capistrano layout set `remote_path` to the `current` symlink (e.g. `/var/www/app/current`) to land in the live release.
 
 **How it works:** Uses the same PTY engine as `spyro run` to inject credentials from the OS keychain during auth, then hands over to a raw terminal relay. Handles both password-based and key-based SSH authentication. After auth, credentials are zeroed from memory — the interactive session has no access to them.
 
@@ -657,6 +663,12 @@ spyro --install-completion
 spyro cp ./README.md :/var/www/app/README.md -p staging
 spyro upload ./README.md :/var/www/app/README.md -p staging   # alias
 
+# Relative remote paths start in the profile's remote_path (when spyro.toml sets one)
+spyro cp .env :.env -p staging                 # -> <remote_path>/.env
+spyro cp .env :storage/ -p staging             # -> <remote_path>/storage/
+spyro cp .env :.env -p staging --home          # -> ~/.env (your home directory; --root is the same flag)
+spyro cp :storage/logs/laravel.log ./laravel.log -p staging   # downloads resolve the same way
+
 # Download remote file to local
 spyro cp :/var/www/app/.env ./.env.remote -p staging
 
@@ -680,7 +692,7 @@ spyro cp ./config.php :/var/www/config.php --all --except ird-server,production
 
 **Path convention:**
 - Local paths: `/path/to/file`
-- Remote paths: `:` prefix → `:/remote/path`
+- Remote paths: `:` prefix → `:/remote/path` (absolute, used as given) or `:relative/path` (relative to the profile's `remote_path`, or to your home directory with `--home`; `~/x` is always relative to your home directory)
 - Profile: `-p name`, multiple `-p`, comma-separated, `--all`, or `--all --except`
 
 ### Environment

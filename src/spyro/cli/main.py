@@ -32,7 +32,6 @@ from .commands import (
     cmd_redis,
     cmd_run,
     cmd_script,
-    cmd_shell,
     cmd_ssh,
     cmd_status,
     cmd_supervisor,
@@ -147,7 +146,7 @@ main.add_command(cmd_db.commands["tunnel"], "db-tunnel")
 main.add_command(cmd_db.commands["shell"], "db-shell")
 main.add_command(cmd_auth, "auth")
 main.add_command(cmd_ssh, "ssh")
-main.add_command(cmd_shell, "shell")
+main.add_command(cmd_ssh, "shell")  # alias
 
 # New commands for 0.7.0
 main.add_command(cmd_config, "config")

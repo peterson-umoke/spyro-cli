@@ -60,6 +60,9 @@ class ProfileConfig:
     sudo_user: str = ""  # run app commands as this user (sudo -u), default root
     env_files: list[str] = field(default_factory=lambda: [".env"])
     extra: dict[str, Any] = field(default_factory=dict)
+    # True only when spyro.toml sets remote_path. `remote_path` itself defaults to
+    # /var/www, so `spyro ssh` / `spyro cp` start there only when you asked for it.
+    remote_path_set: bool = False
 
 
 @dataclass
@@ -250,6 +253,7 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
         key=raw.get("key", ""),
         db=_parse_db(raw.get("db")),
         remote_path=raw.get("remote_path", "/var/www"),
+        remote_path_set="remote_path" in raw,
         forwarded_ports=[int(x) for x in raw.get("forwarded_ports", [])],
         artisan=raw.get("artisan", False),
         wordpress=raw.get("wordpress", False),

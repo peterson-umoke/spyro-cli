@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import posixpath
 import shutil
 import socket
 import subprocess
@@ -319,6 +320,18 @@ def _get_timeout(config: "SpyroConfig", cli_timeout: float | None, default: floa
     return default
 
 
+def _shell_path(path: str) -> str:
+    """Quote *path* for a remote shell, keeping a leading ``~`` / ``~/`` expandable.
+
+    ``shlex.quote("~/app")`` would make the tilde literal and ``cd`` would fail.
+    """
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + safe_quote(path[2:])
+    return safe_quote(path)
+
+
 def _capistrano_cd(remote_path: str) -> str:
     """Build a ``cd`` fragment that enters the Capistrano ``current`` symlink if present.
 
@@ -328,10 +341,40 @@ def _capistrano_cd(remote_path: str) -> str:
 
     Falls back to just ``cd /var/www/app`` when no symlink exists.
     """
-    return (
-        f"cd {safe_quote(remote_path)}"
-        f" && [ -L current ] && cd current || cd {safe_quote(remote_path)}"
+    target = _shell_path(remote_path)
+    return f"cd {target} && [ -L current ] && cd current || cd {target}"
+
+
+def _shell_in_dir(path: str) -> str:
+    """Remote command that starts the account's login shell inside *path*.
+
+    A missing *path* does not end the session at a failed ``cd``: the shell
+    starts in the home directory and says so. The script runs under ``sh -c`` so
+    it parses the same whatever the account's login shell is (csh and fish reject
+    ``${SHELL:-...}``). ``-l`` makes it a login shell, like a plain ssh session.
+    """
+    notice = safe_quote(f"spyro: {path} not found on the server; starting in your home directory")
+    script = (
+        f"cd {_shell_path(path)} 2>/dev/null || echo {notice} >&2; "
+        'exec "${SHELL:-/bin/sh}" -l'
     )
+    return f"sh -c {safe_quote(script)}"
+
+
+def _resolve_remote(path: str, p: ProfileConfig, from_home: bool = False) -> str:
+    """The remote side of a ``cp`` argument, with the ``:`` / ``profile:`` marker removed.
+
+    Absolute (``/x``) and home (``~/x``) paths are left alone. A *relative* path
+    is relative to the profile's ``remote_path`` when the profile sets one;
+    with *from_home* (``--home``), or when it does not, it is relative to the
+    login user's home directory, which is where scp starts.
+    """
+    path = path.lstrip(":")
+    if ":" in path and not path.startswith("/"):  # legacy "profile:path"
+        path = path.split(":", 1)[1]
+    if path.startswith(("/", "~")) or from_home or not p.remote_path_set:
+        return path
+    return posixpath.join(p.remote_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +943,6 @@ def _run_sync_watch(
     Watchdog calls the handler from its own thread, which must not fork PTYs or
     print: it only queues paths. This (main) thread drains the queue.
     """
-    import posixpath
     import queue
     import time
 
@@ -1100,8 +1142,13 @@ def _copy_to_profile(
     profile_name: str,
     parents: bool = False,
     timeout: float = 120.0,
+    from_home: bool = False,
 ) -> int:
-    """Copy files to/from a single profile. Returns exit code."""
+    """Copy files to/from a single profile. Returns exit code.
+
+    Relative remote paths are relative to the profile's ``remote_path`` (when it
+    sets one), or to the login user's home directory with *from_home*.
+    """
     config = load_config()
     p = config.get_profile(profile_name)
     runner = PTYRunner()
@@ -1117,14 +1164,14 @@ def _copy_to_profile(
     if src_is_local:
         # Local -> remote (dest is on the remote host via profile)
         resolved_src = str(Path(src).expanduser().resolve())
-        remote_dest = dest[1:] if dest.startswith(":") else dest  # ":" only marks "remote"
+        remote_dest = _resolve_remote(dest, p, from_home)
         if parents:
             # Preserve source directory structure: app/Foo/Bar.php -> /remote/app/Foo/Bar.php
             remote_dest = remote_dest.rstrip("/") + "/" + src
-            remote_parent = str(Path(remote_dest).parent)
+            remote_parent = posixpath.dirname(remote_dest)
             # Create parent dirs on remote before scp
             mkdir_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-            mkdir_ssh.append(f"mkdir -p {safe_quote(remote_parent)}")
+            mkdir_ssh.append(f"mkdir -p {_shell_path(remote_parent)}")
             if runner.run(mkdir_ssh, password=ssh_pw, timeout=10) != 0:
                 console.print(f"[red]  [{profile_name}] Could not create {remote_parent} on the remote[/red]")
                 return 1
@@ -1137,11 +1184,13 @@ def _copy_to_profile(
             key=p.key,
             recursive=recursive,
         )
+        shown_src, shown_dest = src, remote_dest
     else:
         # Remote -> local (dest is a local path)
+        remote_src = _resolve_remote(src, p, from_home)
         resolved_dest = str(Path(dest).expanduser().resolve())
         scp_args = build_scp_args(
-            src=_scp_target(src, p.host, p.user),
+            src=_scp_target(remote_src, p.host, p.user),
             dest=resolved_dest,
             host=p.host,
             user=p.user,
@@ -1149,9 +1198,9 @@ def _copy_to_profile(
             key=p.key,
             recursive=recursive,
         )
+        shown_src, shown_dest = remote_src, dest
 
-    display_dest = dest.rstrip("/") + "/" + src if parents else dest
-    console.print(Text(f"[{profile_name}] Copying {src} -> {display_dest}...", style="cyan"))
+    console.print(Text(f"[{profile_name}] Copying {shown_src} -> {shown_dest}...", style="cyan"))
 
     exit_code = runner.run(
         scp_args,
@@ -1181,14 +1230,25 @@ def _copy_to_profile(
 @click.option("--all", "all_profiles", is_flag=True, help="Copy to all profiles")
 @click.option("--except", "except_profiles", default="", help="Comma-separated profiles to exclude when using --all")
 @click.option("--timeout", type=float, default=None, help="Per-profile transfer timeout in seconds (default: 120)")
-def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str, timeout: float | None) -> None:
+@click.option(
+    "--home", "--root", "from_home", is_flag=True,
+    help="Resolve relative remote paths from your home directory instead of the profile's remote_path",
+)
+def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str, timeout: float | None, from_home: bool) -> None:
     """Securely copy files with auto-sudo escalation.
+
+    A remote path is marked with a leading ':'. Absolute (/x) and home (~/x)
+    remote paths are used as given. A relative one (:.env, :storage/) starts in
+    the profile's remote_path when spyro.toml sets one; --home starts it in your
+    home directory instead.
 
     Supports copying to one or multiple profiles:
 
     \b
-      spyro cp file.txt /remote/ -p staging
-      spyro cp file.txt /remote/ --all
+      spyro cp .env :.env -p staging               # <remote_path>/.env
+      spyro cp .env :.env -p staging --home        # ~/.env
+      spyro cp file.txt /remote/ -p staging        # absolute: unchanged
+      spyro cp file.txt :sub/ --all
       spyro cp file.txt /remote/ --all --except ird-server,production
       spyro cp file.txt /remote/ -p staging -p dev
     """
@@ -1224,7 +1284,7 @@ def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[s
     resolved_timeout = _get_timeout(config, timeout, 120.0)
     results: dict[str, int] = {}
     for name in targets:
-        ec = _copy_to_profile(src, dest, recursive, name, parents=parents, timeout=resolved_timeout)
+        ec = _copy_to_profile(src, dest, recursive, name, parents=parents, timeout=resolved_timeout, from_home=from_home)
         results[name] = ec
 
     # Summary
@@ -2506,36 +2566,33 @@ def cmd_update(force: bool, check: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _interactive_ssh(profile: str) -> None:
-    """Open an interactive SSH session for the given profile."""
+def _interactive_ssh(profile: str, from_home: bool = False) -> None:
+    """Open an interactive SSH session for the given profile.
+
+    Starts in the profile's ``remote_path`` when it sets one; *from_home* starts
+    in the login user's home directory instead (what a plain ``ssh`` gives).
+    """
     config = load_config()
     p = config.get_profile(profile)
+    start = None if from_home or not p.remote_path_set else p.remote_path
 
-    runner = PTYRunner()
-
-    ssh_args = build_ssh_args(
-        host=p.host,
-        user=p.user,
-        port=p.port,
-        key=p.key,
-    )
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
     # Force PTY allocation for interactive session
     ssh_args.insert(1, "-t")
-    # Don't append a command — SSH opens an interactive shell
+    if start:
+        ssh_args.append(_shell_in_dir(start))
+    # No command otherwise: SSH opens the login shell in the home directory.
 
     from ..utils.keychain import prompt_for_credential
 
-    sudo_pw = prompt_for_credential(profile, p.user) if p.sudo else ""
     ssh_pw = prompt_for_credential(profile, p.user)
 
-    console.print(f"[cyan]Connecting to {p.host} ({profile})...[/cyan]")
+    where = f" in {start}" if start else ""
+    console.print(Text(f"Connecting to {p.host} ({profile}){where}...", style="cyan"))
 
-    exit_code = runner.interactive_run(
-        ssh_args,
-        password=ssh_pw,
-        sudo_password=sudo_pw,
-        timeout=30.0,
-    )
+    # No sudo password: a plain shell shows no sudo prompt during login, and
+    # anything you run later is typed by you, after the credentials are zeroed.
+    exit_code = PTYRunner().interactive_run(ssh_args, password=ssh_pw, timeout=30.0)
 
     if exit_code == 124:
         console.print("\n[red]Timed out while logging in (30s)[/red]")
@@ -2545,20 +2602,19 @@ def _interactive_ssh(profile: str) -> None:
 
 @click.command()
 @click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
-def cmd_ssh(profile: str | None) -> None:
-    """Open an interactive SSH session for a profile.\n
-    Uses keychain-stored credentials and handles auth automatically.
+@click.option(
+    "--home", "--root", "from_home", is_flag=True,
+    help="Start in your home directory (where ssh normally lands) instead of the profile's remote_path",
+)
+def cmd_ssh(profile: str | None, from_home: bool) -> None:
+    """Open an interactive shell on a profile's server.
+
+    Starts in the profile's remote_path (when spyro.toml sets one); use --home
+    to start in your home directory instead. Uses keychain-stored credentials
+    and handles auth automatically.
     """
     profile = resolve_profile(profile)
-    _interactive_ssh(profile)
-
-
-@click.command()
-@click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
-def cmd_shell(profile: str | None) -> None:
-    """Alias for spyro ssh — open an interactive remote shell."""
-    profile = resolve_profile(profile)
-    _interactive_ssh(profile)
+    _interactive_ssh(profile, from_home=from_home)
 
 
 # ---------------------------------------------------------------------------
