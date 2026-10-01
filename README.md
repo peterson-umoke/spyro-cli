@@ -458,6 +458,16 @@ spyro eval \"\\App\\Models\\User::first()->toArray()\" -p staging
 
 The `eval` command works by generating a temporary PHP script that boots Laravel via `bootstrap/app.php`, evaluates your expression directly with `php` CLI, and echoes the result. No PsySH, no quote-nesting nightmares, no swallowed output.
 
+`eval`, `script` and `tinker` are **PHP-only**: they upload a temporary PHP file and run it with `php`. `eval` and `tinker` need `artisan = true` on the profile. For a shell command, Python, Node or Docker use [`spyro run`](#remote-commands).
+
+**Script (run a local PHP file):**
+
+```bash
+spyro script fix_stuck_users.php -p staging
+```
+
+`script` runs the file with plain `php` from `remote_path`; it does **not** boot Laravel. Load the framework in the file yourself (`require 'vendor/autoload.php'`, then `bootstrap/app.php`), or use `spyro eval` for expressions. The remote exit status becomes spyro's exit status and the temporary file is always removed.
+
 ### Database
 
 ```bash
@@ -539,6 +549,21 @@ spyro apache restart -p staging
 
 ### Remote Commands
 
+`run` sends your command string to the server as-is, so anything installed there works (`php`, `python3`, `node`, `docker`, ...). It is the command to use for anything that is not PHP; `eval`, `script` and `tinker` only run PHP.
+
+- It starts in the SSH user's **home directory**. Add `-C` to enter the profile's `remote_path` first (its Capistrano `current` if present).
+- spyro never adds `sudo` to your command, so selecting a profile does not run it as root: write `sudo docker ps` yourself. `sudo = true` only allocates a tty and answers sudo's password prompt; the user must still be allowed to sudo on that server.
+- A tool must be installed and permitted for that user: Docker needs the user in the `docker` group or `sudo`.
+- The remote exit status is spyro's exit status; `--all` runs every profile, then exits with the first failure.
+
+```bash
+spyro run -C "php --ini" -p staging
+spyro run "python3 -c 'print(1+1)'" -p staging
+spyro run "sudo docker ps" -p staging-root
+```
+
+To run a local Python or Node file: `spyro cp job.py /tmp/job.py -p staging`, then `spyro run "python3 /tmp/job.py" -p staging`.
+
 ```bash
 # Run any command
 spyro run "df -h" -p staging
@@ -605,6 +630,15 @@ spyro config validate
 #   - Duplicate forwarded ports
 #   - SSH config Host matching
 ```
+
+```bash
+# Show every profile as spyro resolves it (spyro.toml + ~/.ssh/config).
+# Local only: connects to nothing, never prints passwords.
+spyro profiles
+spyro profiles -p staging --json
+```
+
+Check this before a `run`/`cp`: it shows the effective host, user, `remote_path` (and whether it is the `/var/www` default), sudo, and forwarded ports.
 
 ### Default Profile
 
@@ -701,6 +735,10 @@ spyro env push -p staging custom.env             # Upload custom file
 ```bash
 spyro logs laravel -p staging -n 100       # Last 100 lines
 spyro logs laravel -p staging -f           # Follow until Ctrl+C (no timeout)
+spyro logs laravel -p staging --level error  # that level and worse, with each entry's stack-trace lines
+spyro logs laravel -p staging -g 'user=42' -n 20   # extended regex, line by line; -n caps the matches
+spyro logs laravel -p staging --level error -g payment   # both: --grep then keeps only matching lines (stack frames drop out)
+spyro logs laravel -p staging -f --level warning   # filtered follow
 spyro logs nginx -p staging                # Nginx access log
 spyro logs nginx-error -p staging          # Nginx error log
 spyro logs apache -p staging               # Apache access log

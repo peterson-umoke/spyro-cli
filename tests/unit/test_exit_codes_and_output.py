@@ -251,6 +251,112 @@ class TestLogsLaravel:
         assert self._tail(project, tmp_path, {}) == "Log not found"
 
 
+class TestLogsLaravelFilters:
+    LOG = (
+        "[2026-10-01 10:00:00] production.INFO: boot ok\n"
+        "[2026-10-01 10:00:01] production.ERROR: payment failed user=42\n"
+        "#0 /app/Pay.php(10): charge()\n"
+        "#1 {main}\n"
+        "[2026-10-01 10:00:02] production.WARNING: slow query\n"
+        "[2026-10-01 10:00:03] production.CRITICAL: db down\n"
+        "[2026-10-01 10:00:04] production.INFO: user=42 logged in\n"
+    )
+
+    def _run(self, project, tmp_path, *args) -> str:
+        logs = tmp_path / "srv" / "plain" / "storage" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "laravel.log").write_text(self.LOG)
+        with patch.object(commands, "_run_svc_cmd") as svc:
+            result = invoke("logs", "laravel", "-p", "plain", *args)
+        assert result.exit_code == 0, result.output
+        return subprocess.run(
+            ["sh", "-c", svc.call_args.args[1]], capture_output=True, text=True
+        ).stdout
+
+    def test_level_keeps_that_level_and_worse_with_their_stack_traces(self, project, tmp_path):
+        out = self._run(project, tmp_path, "--level", "error")
+        assert "payment failed" in out and "#1 {main}" in out and "db down" in out
+        assert "boot ok" not in out and "slow query" not in out
+
+    def test_grep_is_a_regex_over_whole_lines(self, project, tmp_path):
+        out = self._run(project, tmp_path, "--grep", "user=4[0-9]")
+        assert out.splitlines() == [
+            "[2026-10-01 10:00:01] production.ERROR: payment failed user=42",
+            "[2026-10-01 10:00:04] production.INFO: user=42 logged in",
+        ]
+
+    def test_n_limits_matches_not_the_scanned_window(self, project, tmp_path):
+        out = self._run(project, tmp_path, "--level", "error", "-n", "1")
+        assert out.splitlines() == ["[2026-10-01 10:00:03] production.CRITICAL: db down"]
+
+    def test_level_and_grep_combine(self, project, tmp_path):
+        out = self._run(project, tmp_path, "--level", "error", "--grep", "payment")
+        assert out.splitlines() == [
+            "[2026-10-01 10:00:01] production.ERROR: payment failed user=42",
+        ]
+
+    def test_a_quote_in_the_pattern_cannot_break_out(self, project, tmp_path):
+        out = self._run(project, tmp_path, "--grep", "x'; echo PWNED; '")
+        assert "PWNED" not in out
+
+    def test_grep_keeps_backslashes_in_the_pattern(self, project, tmp_path):
+        out = self._run(project, tmp_path, "--grep", r"10:00:0[0-9]\] production\.CRITICAL")
+        assert out.splitlines() == ["[2026-10-01 10:00:03] production.CRITICAL: db down"]
+
+    def test_follow_with_filters_has_no_timeout(self, project):
+        with patch.object(commands, "_run_svc_cmd") as svc:
+            invoke("logs", "laravel", "-p", "plain", "-f", "--level", "error")
+        assert svc.call_args.kwargs["timeout"] is None
+
+    def test_unknown_level_is_rejected(self, project):
+        assert invoke("logs", "laravel", "-p", "plain", "--level", "loud").exit_code == 2
+
+
+class TestProfiles:
+    TOML = (
+        '[profiles.alpha]\nhost = "a.example.com"\nuser = "u"\nremote_path = "/srv/a"\n'
+        'sudo = true\nsudo_user = "www"\nartisan = true\nforwarded_ports = [3306]\n'
+        'key = "~/.ssh/a_key"\n[profiles.alpha.db]\nname = "app"\npassword = "DBSECRET"\n'
+        '[profiles.beta]\nhost = "b.example.com"\n'
+    )
+
+    def _setup(self, project):
+        (project / "spyro.toml").write_text(self.TOML)
+
+    def test_lists_every_profile_with_resolved_settings_and_no_secrets(self, project):
+        self._setup(project)
+        with patch.object(commands, "PTYRunner") as runner:
+            result = invoke("profiles")
+        assert result.exit_code == 0, result.output
+        runner.assert_not_called()
+        for text in ("alpha", "beta", "/srv/a", "yes (www)"):
+            assert text in result.output, text
+        assert "DBSECRET" not in result.output
+
+    def test_json_is_machine_readable_and_omits_passwords(self, project):
+        self._setup(project)
+        result = invoke("profiles", "--json")
+        data = json.loads(result.stdout)
+        by_name = {d["name"]: d for d in data}
+        assert list(by_name) == ["alpha", "beta"]
+        a = by_name["alpha"]
+        assert (a["host"], a["user"], a["remote_path"], a["sudo"], a["sudo_user"]) == (
+            "a.example.com", "u", "/srv/a", True, "www",
+        )
+        assert a["forwarded_ports"] == [3306] and a["artisan"] is True
+        assert "DBSECRET" not in result.stdout
+        assert "password" not in a.get("db", {})
+        assert by_name["beta"]["remote_path_set"] is False
+
+    def test_profile_filter(self, project):
+        self._setup(project)
+        data = json.loads(invoke("profiles", "-p", "beta", "--json").stdout)
+        assert [d["name"] for d in data] == ["beta"]
+
+    def test_unknown_profile_fails(self, project):
+        self._setup(project)
+        assert invoke("profiles", "-p", "nope").exit_code != 0
+
 # ---------------------------------------------------------------------------
 # nginx status needs root to read certificates
 # ---------------------------------------------------------------------------

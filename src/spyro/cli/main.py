@@ -26,6 +26,7 @@ from .commands import (
     cmd_php,
     cmd_pin,
     cmd_pins,
+    cmd_profiles,
     cmd_ps,
     cmd_pull_env,
     cmd_redis,
@@ -140,6 +141,7 @@ main.add_command(cmd_ssh, "ssh")
 # New commands for 0.7.0
 main.add_command(cmd_config, "config")
 main.add_command(cmd_ps, "ps")
+main.add_command(cmd_profiles, "profiles")
 main.add_command(cmd_env, "env")
 # Register cmd_pull_env as env pull subcommand
 cmd_env.add_command(cmd_pull_env, "pull")

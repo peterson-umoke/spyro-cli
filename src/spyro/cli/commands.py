@@ -731,7 +731,21 @@ def cmd_pull_env(dest: str, profile: str) -> None:
 @click.option("--chdir", "-C", is_flag=True, help="cd to remote_path before running command")
 @click.argument("command")
 def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdir: bool, command: str) -> None:
-    """Execute a command on remote server(s)."""
+    """Execute a shell command on remote server(s).
+
+    The command runs as given by the SSH user's shell, so anything installed
+    on the server works (``php``, ``python3``, ``node``, ``docker``, ...).
+    It starts in the SSH home directory; ``-C`` first enters ``remote_path``
+    (or its Capistrano ``current``). spyro never adds ``sudo`` to the command:
+    write it yourself. ``sudo = true`` only allocates a tty and answers sudo's
+    password prompt. The remote exit status is spyro's exit status.
+
+    Examples:
+
+      spyro run 'python3 --version' -p staging
+
+      spyro run -C 'php --ini' -p staging
+    """
     config = load_config()
 
     if run_all:
@@ -1889,7 +1903,9 @@ def build_eval_php(expression: str, json_output: bool = False, no_aliases: bool 
 @click.option("--no-escalate", is_flag=True, help="Don't use sudo")
 @click.option("--profile", "-p", required=True, help="Profile name")
 def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: bool, profile: str) -> None:
-    """Evaluate a PHP expression on the remote Laravel server.
+    """Evaluate a PHP expression on the remote Laravel server (PHP only).
+
+    For shell commands, Python, Node or Docker use ``spyro run``.
 
     Boots Laravel via bootstrap/app.php and evaluates the expression directly
     with php CLI (no PsySH). By default, registers PsySH-style short aliases
@@ -2122,20 +2138,68 @@ def cmd_logs(ctx: click.Context) -> None:
         console.print("\n[yellow]Use: spyro logs supervisor <profile> [-f][/yellow]")
 
 
+_LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
+_LOG_ENTRY = "^[[][0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]"  # no backslashes: awk -v would eat them
+
+
+def _laravel_log_command(
+    log_dir: str, lines: int, follow: bool, grep: str | None, level: str | None
+) -> str:
+    """Shell snippet that picks the newest laravel*.log and shows it, optionally filtered.
+
+    Daily/stack channels write laravel-YYYY-MM-DD.log; laravel.log may sit empty
+    beside them. ``--level`` keeps whole entries (stack-trace lines follow their
+    header). Filters run over the entire file and ``lines`` caps the matches; when
+    following, they run on the stream after the last ``lines`` lines.
+    """
+    select = f'f=$(ls -t {log_dir}/laravel*.log 2>/dev/null | head -1); '
+    filters: list[str] = []
+    if level:
+        wanted = "|".join(x.upper() for x in _LOG_LEVELS[_LOG_LEVELS.index(level):])
+        awk = (
+            f"awk -v re={safe_quote(f'[.]({wanted})[:]')} "
+            f"-v start={safe_quote(_LOG_ENTRY)} "
+            "'$0 ~ start { keep = ($0 ~ re) } keep { print; fflush() }'"
+        )
+        filters.append(awk)
+    if grep:
+        # awk reads the pattern from the environment: -v would eat backslashes, and
+        # grep --line-buffered is GNU-only. fflush() keeps -f streaming.
+        filters.append(f"PAT={safe_quote(grep)} awk '$0 ~ ENVIRON[\"PAT\"] {{ print; fflush() }}'")
+    n = int(lines)
+    if follow:
+        stream = f'tail -n {n} -f "$f"'
+        body = " | ".join([stream, *filters])
+    elif filters:
+        body = " | ".join(['cat "$f"', *filters, f"tail -n {n}"])
+    else:
+        body = f'tail -n {n} "$f"'
+    return select + f'if [ -n "$f" ]; then {body}; else echo \'Log not found\'; fi'
+
+
 @cmd_logs.command()
 @click.option("--profile", "-p", required=True, help="Profile name")
-@click.option("--lines", "-n", default=50, help="Number of lines")
+@click.option("--lines", "-n", default=50, help="Number of lines (matches when filtering)")
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
-def laravel(profile: str, lines: int, follow: bool) -> None:
-    """Tail the Laravel log file."""
+@click.option("--grep", "-g", "grep_pattern", default=None, help="Only lines matching this extended regex (awk ERE)")
+@click.option(
+    "--level", "-l", type=click.Choice(_LOG_LEVELS, case_sensitive=False), default=None,
+    help="Only entries at this level or worse (with their stack traces)",
+)
+def laravel(profile: str, lines: int, follow: bool, grep_pattern: str | None, level: str | None) -> None:
+    """Tail the newest Laravel log, optionally filtered by level and regex.
+
+    Examples:
+
+      spyro logs laravel -p staging --level error
+
+      spyro logs laravel -p staging -g 'user=42' -n 100
+    """
     config = load_config()
     p = config.get_profile(profile)
     log_dir = safe_quote(f"{p.remote_path}/storage/logs")
-    tail_flag = " -f" if follow else ""
-    # daily/stack channels write laravel-YYYY-MM-DD.log; laravel.log may sit empty beside them
-    newest = f'f=$(ls -t {log_dir}/laravel*.log 2>/dev/null | head -1); '
-    tail = f'if [ -n "$f" ]; then tail -n {int(lines)}{tail_flag} "$f"; else echo \'Log not found\'; fi'
-    _run_svc_cmd(profile, newest + tail, timeout=None if follow else 15)
+    cmd = _laravel_log_command(log_dir, lines, follow, grep_pattern, level.lower() if level else None)
+    _run_svc_cmd(profile, cmd, timeout=None if follow else 15)
 
 
 @cmd_logs.command()
@@ -2592,6 +2656,61 @@ def cmd_ssh(profile: str | None, from_home: bool) -> None:
     profile = resolve_profile(profile)
     _interactive_ssh(profile, from_home=from_home)
 
+
+# ---------------------------------------------------------------------------
+# spyro profiles — what each profile resolves to (local only, no network)
+# ---------------------------------------------------------------------------
+
+
+def _profile_summary(p: ProfileConfig) -> dict[str, object]:
+    """Resolved, secret-free view of a profile (the db password is never included)."""
+    return {
+        "name": p.name,
+        "host": p.host,
+        "user": p.user,
+        "port": p.port,
+        "key": p.key,
+        "remote_path": p.remote_path,
+        "remote_path_set": p.remote_path_set,
+        "artisan": p.artisan,
+        "wordpress": p.wordpress,
+        "sudo": p.sudo,
+        "sudo_user": p.sudo_user,
+        "forwarded_ports": p.forwarded_ports,
+        "db": {"driver": p.db.driver, "name": p.db.name, "host": p.db.host, "port": p.db.port},
+    }
+
+
+@click.command(name="profiles")
+@click.option("--profile", "-p", default=None, help="Show only this profile")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def cmd_profiles(profile: str | None, json_output: bool) -> None:
+    """Show every profile as spyro resolves it (spyro.toml plus ~/.ssh/config).
+
+    Local only: nothing connects to a server. Passwords are never shown.
+    """
+    config = load_config()
+    names = [profile] if profile else config.profile_names
+    rows = [_profile_summary(config.get_profile(n)) for n in names]
+    if json_output:
+        _emit_json(rows)
+        return
+
+    table = Table(title="Spyro Profiles")
+    for col in ("Profile", "Target", "Remote path", "Sudo", "Artisan", "Ports"):
+        table.add_column(col, overflow="fold")
+    for r in rows:
+        sudo = "no" if not r["sudo"] else (f"yes ({r['sudo_user']})" if r["sudo_user"] else "yes")
+        path = r["remote_path"] if r["remote_path_set"] else f"{r['remote_path']} (default)"
+        table.add_row(
+            escape(str(r["name"])),
+            escape(f"{r['user']}@{r['host']}:{r['port']}"),
+            escape(str(path)),
+            sudo,
+            "yes" if r["artisan"] else "no",
+            escape(",".join(str(x) for x in r["forwarded_ports"])) or "-",  # type: ignore[attr-defined]
+        )
+    console.print(table)
 
 # ---------------------------------------------------------------------------
 # spyro config — Configuration management
