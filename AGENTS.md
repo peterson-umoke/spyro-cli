@@ -7,6 +7,20 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 - Never add Co-Authored-By or any other attribution trailers to commit messages.
 - Never add commit message trailers of any kind unless the user explicitly asks for them.
 
+## Versioning (binding for every agent and human)
+
+Format `MAJOR.MINOR.PATCH`, defined by [Semantic Versioning 2.0.0](https://semver.org) (the industry standard):
+
+| Change | Bump | Example |
+|---|---|---|
+| Bug fix, docs, internal refactor, no user-visible behaviour change | PATCH | `1.2.3` → `1.2.4` |
+| Backwards-compatible new command, flag or feature | MINOR, PATCH resets to 0 | `1.2.4` → `1.3.0` |
+| Breaking change: removed/renamed command or flag, changed exit codes or `--json` shape, `spyro.toml` incompatibility | MAJOR, MINOR and PATCH reset to 0 | `1.3.0` → `2.0.0` |
+
+**Spyro-specific rule (NOT part of SemVer): the minor number never exceeds 99.** Once the version is `MAJOR.99.PATCH`, the next release is `(MAJOR+1).0.0`, never `MAJOR.100.0` (e.g. `1.99.0` → `2.0.0`, `1.99.4` → `2.0.0`). Strict SemVer raises MAJOR only for breaking changes, so a rollover release may be non-breaking; say so in its notes. Consequence: no patch releases inside `X.99`, so a hotfix there ships as the next major; finish hotfixes while the minor is still below 99. History: `0.9.1` → `1.0.0` was made under an earlier cap of 9; the cap is now 99.
+
+Decide the bump from what a user's scripts or config would notice, not from diff size. Files to bump and release steps: "Self-update / releases" in `CLAUDE.md`.
+
 ## Build & Development Commands
 
 - **Install dev dependencies**: `uv sync --all-extras` (pytest, pip-audit and watchdog are extras; plain `uv sync` removes them)

@@ -42,6 +42,8 @@ CI (`.github/workflows/tests.yml`) runs the suite on Linux + macOS, Python 3.11 
 
 **Self-update / releases.** `main` registers `notify_update` with `ctx.call_on_close` (skipped for `-q`/`update`): stderr only, tty only, cached 24h (failures 1h). `spyro update` reinstalls `git+https://github.com/peterson-umoke/spyro-cli@v<latest tag>`, so a release needs the version bumped in **both** `pyproject.toml` and `src/spyro/__init__.py` (and `uv lock` for `uv.lock`), a `vX.Y.Z: summary` commit, and a matching `vX.Y.Z` tag pushed to GitHub (a GitHub release is optional; the updater falls back to tags).
 
+**Versioning.** Binding rules (SemVer 2.0.0 plus the Spyro-specific minor cap of 99, rollover to the next major) live in `AGENTS.md` under "Versioning"; do not restate them here. Bump `pyproject.toml`, `src/spyro/__init__.py` and `uv.lock` together, as described above.
+
 **AI skills** (`skills.py`, `spyro install ai-skills`). `generate()` builds one `SKILL.md` per top-level command from the live Click tree (`cmd.get_help` recursively, width 100) plus the hand-written `NOTES[name]` gotcha paragraph (every command MUST have a note — a test enforces it) and a `spyro` overview with the safety rules. Generated files carry `MARKER`; `install()` only overwrites files with the marker unless `force`. `detect_targets(root)` picks `<root>/<agent>/skills` for every agent dir that exists (`.agents`, `.claude`, `.codex`, `.cursor`, `.omp/agent`, `.gemini`), else `.agents/skills`. The checked-in `skills/` directory must match `generate()` (drift test); regenerate with `uv run spyro install ai-skills --dest skills` after changing any command's help/options or a note.
 
 ## Testing notes
