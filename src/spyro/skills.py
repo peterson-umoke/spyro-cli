@@ -30,7 +30,7 @@ NOTES: dict[str, str] = {
     "cp": (
         "Remote side: `:relative` resolves against the profile's `remote_path`; `/abs` and `~/x` are used as given "
         "(no colon). `--home` resolves relative paths against the SSH home instead. "
-        "Use `-r` for directories, `--parents` to create missing remote dirs. "
+        "Use `-r` for directories, `--parents` to create missing remote dirs. On `sudo = true` profiles, local-to-remote copies check destination permissions; protected targets are staged and installed with root sudo after a three-second Ctrl-C window. Existing destination ownership and mode are retained; new files are root-owned. "
         "Prefer `-p <profile>` over `--all`; `--all` also hits production profiles."
     ),
     "db": (
@@ -79,8 +79,8 @@ NOTES: dict[str, str] = {
     "run": (
         "Runs the command string as-is as the SSH user. Starts in the SSH HOME; pass `-C` to start in "
         "`remote_path` (Capistrano `current/` aware): without `-C`, relative paths and `php artisan` miss the app. "
-        "spyro never adds `sudo`; write it yourself, and only on a `sudo = true` profile (that flag only "
-        "allocates a tty and answers the sudo password prompt). The remote exit status is spyro's; `--all` runs "
+        "spyro never adds `sudo`; write it yourself. On a `sudo = true` profile, an actual sudo command gets "
+        "a tty and sudo-password handling. The remote exit status is spyro's; `--all` runs "
         "every profile (including production) and exits with the first failure, so prefer `-p`. "
         "Default timeout 60s (`--timeout`). Anything installed remotely works: php, python3, docker, node."
     ),

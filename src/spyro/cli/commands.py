@@ -6,7 +6,10 @@ import json
 import logging
 import os
 import posixpath
+import shlex
 import shutil
+import time
+import uuid
 import socket
 import subprocess
 import sys
@@ -737,8 +740,8 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
     on the server works (``php``, ``python3``, ``node``, ``docker``, ...).
     It starts in the SSH home directory; ``-C`` first enters ``remote_path``
     (or its Capistrano ``current``). spyro never adds ``sudo`` to the command:
-    write it yourself. ``sudo = true`` only allocates a tty and answers sudo's
-    password prompt. The remote exit status is spyro's exit status.
+    write it yourself. On ``sudo = true`` profiles, an explicit sudo command gets
+    a tty and automatic sudo-password handling. The remote exit status is spyro's exit status.
 
     Examples:
 
@@ -767,7 +770,7 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
         remote_cmd = f"{_capistrano_cd(p.remote_path)} && {command}" if chdir else command
         ec = _run_svc_cmd(
             name, remote_cmd, timeout=60.0, cli_timeout=timeout,
-            escalate=p.sudo, exit_on_error=False,
+            escalate=p.sudo and _command_invokes_sudo(remote_cmd), exit_on_error=False,
         )
         failed = failed or ec  # every profile still runs; the first failure is the exit status
     _exit_with(failed)
@@ -1113,6 +1116,121 @@ def _is_local_path(path: str) -> bool:
     return True
 
 
+def _command_invokes_sudo(command: str) -> bool:
+    """Return whether sudo appears as a shell command, not merely as argument text."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        expect_command = True
+        for token in lexer:
+            if token in {";", "&", "&&", "|", "||", "(", ")"}:
+                expect_command = True
+            elif expect_command:
+                if "=" in token and token.split("=", 1)[0].isidentifier():
+                    continue
+                if token in {"env", "command", "exec", "nohup"}:
+                    continue
+                if token == "sudo":
+                    return True
+                expect_command = False
+    except ValueError:
+        return False
+    return False
+
+
+def _remote_copy_needs_sudo(
+    remote_dest: str, source_name: str, p: "ProfileConfig", runner: PTYRunner, ssh_pw: str,
+    source_is_target: bool = False,
+) -> bool:
+    """Check remote write permission without attempting the copy."""
+    if source_is_target:
+        command = f"target={_shell_path(remote_dest)}; "
+    else:
+        target = f"{_shell_path(remote_dest).rstrip('/')}/{safe_quote(source_name)}"
+        command = (
+            f"if [ -d {_shell_path(remote_dest)} ]; then target={target}; "
+            f"else target={_shell_path(remote_dest)}; fi; "
+        )
+    command += (
+        'parent=$(dirname -- "$target"); '
+        'if [ -e "$target" ]; then '
+        '[ -w "$target" ] && [ -w "$parent" ]; '
+        'else [ -w "$parent" ]; fi; '
+        'if [ $? -eq 0 ]; then exit 0; else exit 42; fi'
+    )
+    args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    args.append(command)
+    result = runner.run(args, password=ssh_pw, timeout=10)
+    if result == 42:
+        return True
+    if result == 124:
+        raise click.ClickException("Remote permission check timed out after 10s")
+    if result != 0:
+        raise click.ClickException(f"Remote permission check failed (exit code: {result})")
+    return False
+
+
+def _confirm_sudo_copy() -> bool:
+    console.print(
+        "[yellow]Protected remote destination; Spyro will copy via sudo in 3 seconds. "
+        "Press Ctrl-C to cancel.[/yellow]"
+    )
+    try:
+        time.sleep(3)
+    except KeyboardInterrupt:
+        console.print("[yellow]Automatic sudo copy cancelled.[/yellow]")
+        return False
+    return True
+
+
+def _sudo_copy_to_remote(
+    src: str, remote_dest: str, recursive: bool, profile_name: str,
+    p: "ProfileConfig", runner: PTYRunner, ssh_pw: str, sudo_pw: str, timeout: float,
+    parents: bool = False,
+) -> int:
+    """Stage with SCP as the SSH user, then install at the target using root."""
+    from ..core.pty_engine import _scp_target
+
+    stage = f"/tmp/spyro-cp-{os.getpid()}-{uuid.uuid4().hex}"
+    stage_source = posixpath.join(stage, posixpath.basename(src.rstrip("/")))
+    ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    ssh_args.append(f"mkdir -m 700 -- {safe_quote(stage)}")
+    if runner.run(ssh_args, password=ssh_pw, timeout=10) != 0:
+        console.print(f"[red]  [{profile_name}] Could not create secure staging directory[/red]")
+        return 1
+
+    scp_args = build_scp_args(
+        src=src,
+        dest=_scp_target(stage + "/", p.host, p.user),
+        host=p.host,
+        user=p.user,
+        port=p.port,
+        key=p.key,
+        recursive=recursive,
+    )
+    if runner.run(
+        scp_args, password=ssh_pw,
+        on_output=lambda line: _remote(line, f"  [{profile_name}] "), timeout=timeout,
+    ) != 0:
+        cleanup = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        cleanup.append(f"rm -rf -- {safe_quote(stage)}")
+        runner.run(cleanup, password=ssh_pw, timeout=10)
+        return 1
+
+    mkdir = f"sudo mkdir -p -- {safe_quote(posixpath.dirname(remote_dest))} && " if parents else ""
+    install = (
+        f"{mkdir}sudo cp -R -- {safe_quote(stage_source)} {safe_quote(remote_dest)}; "
+        f"result=$?; rm -rf -- {safe_quote(stage)}; exit $result"
+    )
+    sudo_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    sudo_args.insert(1, "-t")
+    sudo_args.append(install)
+    return runner.run(
+        sudo_args, password=ssh_pw, sudo_password=sudo_pw,
+        on_output=lambda line: _remote(line, f"  [{profile_name}] "), timeout=timeout,
+    )
+
+
 def _copy_to_profile(
     src: str,
     dest: str,
@@ -1124,47 +1242,65 @@ def _copy_to_profile(
 ) -> int:
     """Copy files to/from a single profile. Returns exit code.
 
-    Relative remote paths are relative to the profile's ``remote_path`` (when it
-    sets one), or to the login user's home directory with *from_home*.
+    Relative remote paths are relative to the profile's remote_path (when it
+    sets one), or to the login user's home directory with from_home.
     """
     config = load_config()
     p = config.get_profile(profile_name)
     runner = PTYRunner()
-
     src_is_local = _is_local_path(src)
 
     from ..utils.keychain import prompt_for_credential
+    from ..core.pty_engine import _scp_target
 
     ssh_pw = prompt_for_credential(profile_name, p.user)
 
-    from ..core.pty_engine import _scp_target
-
     if src_is_local:
-        # Local -> remote (dest is on the remote host via profile)
         resolved_src = str(Path(src).expanduser().resolve())
         remote_dest = _resolve_remote(dest, p, from_home)
         if parents:
-            # Preserve source directory structure: app/Foo/Bar.php -> /remote/app/Foo/Bar.php
             remote_dest = remote_dest.rstrip("/") + "/" + src
-            remote_parent = posixpath.dirname(remote_dest)
-            # Create parent dirs on remote before scp
-            mkdir_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-            mkdir_ssh.append(f"mkdir -p {_shell_path(remote_parent)}")
-            if runner.run(mkdir_ssh, password=ssh_pw, timeout=10) != 0:
-                console.print(f"[red]  [{profile_name}] Could not create {remote_parent} on the remote[/red]")
-                return 1
-        scp_args = build_scp_args(
-            src=resolved_src,
-            dest=_scp_target(remote_dest, p.host, p.user),
-            host=p.host,
-            user=p.user,
-            port=p.port,
-            key=p.key,
-            recursive=recursive,
+
+        needs_sudo = p.sudo and _remote_copy_needs_sudo(
+            remote_dest, posixpath.basename(resolved_src.rstrip("/")), p, runner, ssh_pw,
+            source_is_target=parents,
         )
         shown_src, shown_dest = src, remote_dest
+        console.print(Text(f"[{profile_name}] Copying {shown_src} -> {shown_dest}...", style="cyan"))
+        if needs_sudo:
+            if not _confirm_sudo_copy():
+                return 130
+            sudo_pw = prompt_for_credential(profile_name, p.user)
+            exit_code = _sudo_copy_to_remote(
+                resolved_src, remote_dest, recursive, profile_name, p,
+                runner, ssh_pw, sudo_pw, timeout, parents=parents,
+            )
+            shown_src, shown_dest = src, remote_dest
+        else:
+            if parents:
+                remote_parent = posixpath.dirname(remote_dest)
+                mkdir_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+                mkdir_ssh.append(f"mkdir -p {_shell_path(remote_parent)}")
+                if runner.run(mkdir_ssh, password=ssh_pw, timeout=10) != 0:
+                    console.print(f"[red]  [{profile_name}] Could not create {remote_parent} on the remote[/red]")
+                    return 1
+            scp_args = build_scp_args(
+                src=resolved_src,
+                dest=_scp_target(remote_dest, p.host, p.user),
+                host=p.host,
+                user=p.user,
+                port=p.port,
+                key=p.key,
+                recursive=recursive,
+            )
+            shown_src, shown_dest = src, remote_dest
+            exit_code = runner.run(
+                scp_args,
+                password=ssh_pw,
+                on_output=lambda line: _remote(line, f"  [{profile_name}] "),
+                timeout=timeout,
+            )
     else:
-        # Remote -> local (dest is a local path)
         remote_src = _resolve_remote(src, p, from_home)
         resolved_dest = str(Path(dest).expanduser().resolve())
         scp_args = build_scp_args(
@@ -1177,15 +1313,13 @@ def _copy_to_profile(
             recursive=recursive,
         )
         shown_src, shown_dest = remote_src, dest
-
-    console.print(Text(f"[{profile_name}] Copying {shown_src} -> {shown_dest}...", style="cyan"))
-
-    exit_code = runner.run(
-        scp_args,
-        password=ssh_pw,
-        on_output=lambda line: _remote(line, f"  [{profile_name}] "),
-        timeout=timeout,
-    )
+        console.print(Text(f"[{profile_name}] Copying {shown_src} -> {shown_dest}...", style="cyan"))
+        exit_code = runner.run(
+            scp_args,
+            password=ssh_pw,
+            on_output=lambda line: _remote(line, f"  [{profile_name}] "),
+            timeout=timeout,
+        )
 
     if exit_code == 0:
         console.print(Text(f"  [{profile_name}] Copy complete", style="green"))
@@ -1195,7 +1329,6 @@ def _copy_to_profile(
             f"raise the limit with --timeout", style="red"))
     else:
         console.print(Text(f"  [{profile_name}] Copy failed (exit code: {exit_code})", style="red"))
-
     return exit_code
 
 
@@ -1214,6 +1347,11 @@ def _copy_to_profile(
 )
 def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str, timeout: float | None, from_home: bool) -> None:
     """Securely copy files with auto-sudo escalation.
+
+    Local-to-remote copies on sudo-enabled profiles check destination permissions.
+    Protected paths are announced, wait three seconds for Ctrl-C cancellation, then
+    stage with SCP and install with root sudo (not sudo_user). Existing destination
+    ownership and mode are retained; newly created files are root-owned.
 
     A remote path is marked with a leading ':'. Absolute (/x) and home (~/x)
     remote paths are used as given. A relative one (:.env, :storage/) starts in

@@ -58,6 +58,8 @@ spyro logs laravel -p staging -f
 # Push files
 spyro cp .env :/var/www/app/.env -p staging
 
+# Protected destinations on sudo profiles trigger an announced 3s Ctrl-C window
+
 # One command to stop everything
 spyro down
 ```
@@ -727,7 +729,7 @@ spyro cp ./config.php :/var/www/config.php --all
 spyro cp ./config.php :/var/www/config.php --all --except ird-server,production
 ```
 
-`--timeout N` sets the per-profile transfer limit (default 120s). `--parents` works with the `:/remote/path` form.
+`--timeout N` sets the per-profile transfer limit (default 120s). `--parents` works with the `:/remote/path` form. On profiles with `sudo = true`, local-to-remote copies preflight destination permissions. Protected destinations are announced, wait three seconds for Ctrl-C cancellation, then transfer through a temporary path and install with root `sudo`. Overwrites retain the destination owner and mode; newly created files are root-owned. Downloads do not use this escalation path.
 
 **Path convention:**
 - Local paths: `/path/to/file`
