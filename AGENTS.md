@@ -19,7 +19,7 @@ Format `MAJOR.MINOR.PATCH`, defined by [Semantic Versioning 2.0.0](https://semve
 
 **Spyro-specific rule (NOT part of SemVer): the minor number never exceeds 99.** Once the version is `MAJOR.99.PATCH`, the next release is `(MAJOR+1).0.0`, never `MAJOR.100.0` (e.g. `1.99.0` → `2.0.0`, `1.99.4` → `2.0.0`). Strict SemVer raises MAJOR only for breaking changes, so a rollover release may be non-breaking; say so in its notes. Consequence: no patch releases inside `X.99`, so a hotfix there ships as the next major; finish hotfixes while the minor is still below 99. History: `0.9.1` → `1.0.0` was made under an earlier cap of 9; the cap is now 99.
 
-Decide the bump from what a user's scripts or config would notice, not from diff size. Files to bump and release steps: "Self-update / releases" in `CLAUDE.md`.
+Decide the bump from what a user's scripts or config would notice, not from diff size. Files to bump and release steps: "Self-update / releases" in `CLAUDE.md`. "Release" means the whole chain, done without asking: bump the version files, `uv lock`, commit, tag, push `main` and the tag, then `gh release create vX.Y.Z --latest` with notes. A tag alone is not a release.
 
 ## Build & Development Commands
 
