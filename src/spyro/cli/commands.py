@@ -2712,6 +2712,10 @@ def cmd_update(force: bool, check: bool) -> None:
         pip_or_uv = [pip, "install", "--upgrade", install_url]
         label = "pip"
 
+    # Resolve every lazy import before the install: it replaces rich/spyro files
+    # under this running process, so a later lazy import loads mismatched files.
+    from ..utils.paths import spyro_home
+
     try:
         install = subprocess.run(
             pip_or_uv,
@@ -2720,11 +2724,10 @@ def cmd_update(force: bool, check: bool) -> None:
             timeout=120,
         )
         if install.returncode != 0:
-            console.print(f"[red]Installation failed:[/red]")
-            console.print(f"  {install.stderr.strip()}")
+            click.echo("Installation failed:", err=True)
+            click.echo(f"  {install.stderr.strip()}", err=True)
             return
         # Invalidate cache after successful update
-        from ..utils.paths import spyro_home
         cache_path = spyro_home() / "version_check"
         try:
             cache_path.unlink()
@@ -2732,10 +2735,12 @@ def cmd_update(force: bool, check: bool) -> None:
             pass
         global _CHECK_CACHE
         _CHECK_CACHE = None
-        console.print(f"[green]✓ spyro updated to v{latest_tag}[/green]")
-        console.print(f"  (via {label} — you may need to restart your shell)")
+        # Plain echo, not rich: the install just swapped rich's files under us
+        # (rich lazy-loads unicode tables -> ModuleNotFoundError).
+        click.echo(f"✓ spyro updated to v{latest_tag}")
+        click.echo(f"  (via {label} — you may need to restart your shell)")
     except subprocess.TimeoutExpired:
-        console.print("[red]Installation timed out[/red]")
+        click.echo("Installation timed out", err=True)
         return
 
 
