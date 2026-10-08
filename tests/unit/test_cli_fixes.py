@@ -128,16 +128,16 @@ def test_cp_parents_with_colon_prefixed_dest_does_not_create_a_dir_named_colon(p
     with patch.object(commands, "PTYRunner", runner_cls):
         result = invoke("cp", "app/Foo.php", ":/var/www/app", "--parents", "-p", "a")
     assert result.exit_code == 0, result.output
-    mkdir_cmd = runner_cls.return_value.run.call_args_list[0].args[0][-1]
-    assert mkdir_cmd == "mkdir -p /var/www/app/app"
-    scp_dest = runner_cls.return_value.run.call_args_list[1].args[0][-1]
-    assert scp_dest == "u@h.example.com:/var/www/app/app/Foo.php"
+    calls = [call.args[0] for call in runner_cls.return_value.run.call_args_list]
+    assert any(args[-1] == "mkdir -p /var/www/app/app" for args in calls)
+    scp_call = next(args for args in calls if args[0] == "scp")
+    assert scp_call[-1] == "u@h.example.com:/var/www/app/app/Foo.php"
 
 
 def test_cp_failure_exits_nonzero_and_timeout_is_configurable(project):
     (project / "f").write_text("x")
     runner_cls = MagicMock()
-    runner_cls.return_value.run.return_value = 124
+    runner_cls.return_value.run.side_effect = [0, 124]
     with patch.object(commands, "PTYRunner", runner_cls):
         result = invoke("cp", "f", "/tmp/f", "-p", "a", "--timeout", "500")
     assert result.exit_code == 1

@@ -11,7 +11,7 @@ Securely copy files with auto-sudo escalation.
 
 ## Before you run it
 
-Remote side: `:relative` resolves against the profile's `remote_path`; `/abs` and `~/x` are used as given (no colon). `--home` resolves relative paths against the SSH home instead. Use `-r` for directories, `--parents` to create missing remote dirs. Prefer `-p <profile>` over `--all`; `--all` also hits production profiles.
+Remote side: `:relative` resolves against the profile's `remote_path`; `/abs` and `~/x` are used as given (no colon). `--home` resolves relative paths against the SSH home instead. Use `-r` for directories, `--parents` to create missing remote dirs. On `sudo = true` profiles, local-to-remote copies check destination permissions; protected targets are staged and installed with root sudo after a three-second Ctrl-C window. Existing destination ownership and mode are retained; new files are root-owned. Prefer `-p <profile>` over `--all`; `--all` also hits production profiles.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -23,6 +23,11 @@ Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has t
 Usage: spyro cp [OPTIONS] SRC DEST
 
   Securely copy files with auto-sudo escalation.
+
+  Local-to-remote copies on sudo-enabled profiles check destination permissions. Protected paths are
+  announced, wait three seconds for Ctrl-C cancellation, then stage with SCP and install with root
+  sudo (not sudo_user). Existing destination ownership and mode are retained; newly created files
+  are root-owned.
 
   A remote path is marked with a leading ':'. Absolute (/x) and home (~/x) remote paths are used as
   given. A relative one (:.env, :storage/) starts in the profile's remote_path when spyro.toml sets
