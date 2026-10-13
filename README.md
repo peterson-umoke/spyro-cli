@@ -749,6 +749,20 @@ spyro env diff -p staging                        # Unified diff of keys; values 
 # Push local .env to remote
 spyro env push -p staging                        # Uploads .env
 spyro env push -p staging custom.env             # Upload custom file
+
+# Edit single keys; values never go on the command line or to the screen
+spyro env keys -p prod                           # Key names and line numbers
+spyro env has -p prod MAIL_PASSWORD              # Exit 0 (set/empty) or 1 (missing)
+spyro env set -p prod MAIL_PASSWORD              # Hidden prompt, asked twice
+op read op://vault/stripe | spyro env set -p prod STRIPE_SECRET --stdin -y
+spyro env set -p prod APP_KEY --generate laravel-key --dry-run   # Redacted diff only
+spyro env unset -p prod OLD_KEY                  # Delete the line; alias: remove
+spyro env hide -p prod DEBUGBAR_ENABLED          # Comment it out (# KEY=...)
+spyro env unhide -p prod DEBUGBAR_ENABLED        # Uncomment it again (--line N if several)
+spyro env backups -p prod                        # Backups kept next to the file (last 10)
+spyro env restore -p prod [ID]                   # Roll back (newest by default)
+# Laravel profiles (artisan = true): every write then runs config:cache (if cached),
+# horizon:terminate (if installed), queue:restart and octane:reload (if installed); --no-reload skips it
 ```
 
 ### Logs

@@ -21,6 +21,8 @@ SSH tunneling and remote-command CLI driven by a project `spyro.toml` of profile
    anything against a production profile unless the user explicitly asked for that profile in this conversation.
 3. **Secrets stay on the server.** Never print `.env` contents, `env pull` output, passwords or tokens.
    `env diff` is masked for this reason. Passwords come from the OS keychain or `SPYRO_PASSWORD[_<PROFILE>]`.
+   To change one key use `env set KEY --stdin`/`--generate` (or `unset`/`hide`/`unhide`), never
+   `env pull` + edit + `env push`, and never put a value on the command line.
 4. **Pick the right executor:** shell/Python/Docker → `spyro run` (`-C` for the app dir); Laravel expression
    → `spyro eval`; Artisan → `spyro artisan`; local PHP file → `spyro script`; interactive → `spyro ssh`/`tinker`.
 5. **Exit codes are real.** A failing remote command fails spyro; check it instead of parsing output.

@@ -11,7 +11,7 @@ Manage remote environment files.
 
 ## Before you run it
 
-`env diff` never prints values (every value is `***`), only which keys differ. `env pull` writes the remote .env to a local file: never cat or paste its contents into a chat. `env push` overwrites the remote .env; the local file must exist.
+`env diff` never prints values (every value is `***`), only which keys differ. `env pull` writes the remote .env to a local file: never cat or paste its contents into a chat. `env push` overwrites the remote .env; the local file must exist. To change one key use `env set` (update or add), `env unset` (delete), `env hide`/`env unhide` (comment out / back in); commented lines are never treated as values. Never put a value on the command line: pipe it with `--stdin`, use `--from-local-env NAME` or `--generate`; without a terminal they need `--yes`, and `--dry-run` previews a redacted diff. Writes are atomic, refuse if the file changed since it was read, and keep a backup (`env backups`, `env restore`). A duplicated key is refused unless `--all`. `env keys` and `env has` read key names only. On `artisan = true` profiles each write also runs `config:cache` (if cached), `horizon:terminate`, `queue:restart` and `octane:reload`; pass `--no-reload` only when the user wants to batch several edits, then reload once with `spyro artisan`.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -24,16 +24,40 @@ Usage: spyro env [OPTIONS] COMMAND [ARGS]...
 
   Manage remote environment files.
 
-  Subcommands:   pull    Download .env from remote   diff    Compare local and remote .env files
-  push    Upload local .env to remote
+  Values are never printed: `keys`/`has` show key names, edits show a redacted diff. On `artisan =
+  true` profiles every write is followed by config:cache (when the config is cached),
+  horizon:terminate (when installed), queue:restart and octane:reload (when installed), so the app
+  picks it up; --no-reload skips that.
 
 Options:
   --help  Show this message and exit.
 
 Commands:
-  diff  Compare local .env with remote .env.
-  pull  Pull remote environment config to a local file.
-  push  Push local .env file to remote server.
+  backups  List the backups spyro keeps next to the env file (newest first).
+  diff     Compare local .env with remote .env.
+  has      Exit 0 if KEY is set (prints `KEY: set` or `KEY: empty`), 1 if it is not.
+  hide     Comment KEY(s) out (`# KEY=...`) so `unhide` can bring them back.
+  keys     List the keys in the remote env file (names and line numbers only).
+  pull     Pull remote environment config to a local file.
+  push     Push local .env file to remote server.
+  remove   Delete KEY(s) from the remote env file.
+  restore  Roll the env file back to a backup (default: the newest).
+  set      Update KEY, or add it if it is not set.
+  unhide   Uncomment a hidden `# KEY=...` line.
+  unset    Delete KEY(s) from the remote env file.
+```
+
+### `spyro env backups`
+
+```text
+Usage: spyro env backups [OPTIONS]
+
+  List the backups spyro keeps next to the env file (newest first).
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --help              Show this message and exit.
 ```
 
 ### `spyro env diff`
@@ -45,6 +69,53 @@ Usage: spyro env diff [OPTIONS]
 
 Options:
   -p, --profile TEXT  Profile name  [required]
+  --help              Show this message and exit.
+```
+
+### `spyro env has`
+
+```text
+Usage: spyro env has [OPTIONS] KEY
+
+  Exit 0 if KEY is set (prints `KEY: set` or `KEY: empty`), 1 if it is not.
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --help              Show this message and exit.
+```
+
+### `spyro env hide`
+
+```text
+Usage: spyro env hide [OPTIONS] KEYS...
+
+  Comment KEY(s) out (`# KEY=...`) so `unhide` can bring them back. Already hidden is a no-op.
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --dry-run           Show the redacted diff, write nothing
+  -y, --yes           Do not ask for confirmation (required without a terminal)
+  --json              Machine-readable result (values still hidden)
+  --all               Edit every occurrence of a duplicated key
+  --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
+  --help              Show this message and exit.
+```
+
+### `spyro env keys`
+
+```text
+Usage: spyro env keys [OPTIONS]
+
+  List the keys in the remote env file (names and line numbers only).
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --json              Machine-readable output
   --help              Show this message and exit.
 ```
 
@@ -70,5 +141,115 @@ Usage: spyro env push [OPTIONS] [SOURCE]
 
 Options:
   -p, --profile TEXT  Profile name  [required]
+  --help              Show this message and exit.
+```
+
+### `spyro env remove`
+
+```text
+Usage: spyro env remove [OPTIONS] KEYS...
+
+  Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead.
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --dry-run           Show the redacted diff, write nothing
+  -y, --yes           Do not ask for confirmation (required without a terminal)
+  --json              Machine-readable result (values still hidden)
+  --all               Edit every occurrence of a duplicated key
+  --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
+  --help              Show this message and exit.
+```
+
+### `spyro env restore`
+
+```text
+Usage: spyro env restore [OPTIONS] [BACKUP_ID]
+
+  Roll the env file back to a backup (default: the newest). The current file is backed up first.
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --dry-run           Show the redacted diff, write nothing
+  -y, --yes           Do not ask for confirmation (required without a terminal)
+  --no-reload         Laravel: skip the config:cache / worker restart after restoring
+  --help              Show this message and exit.
+```
+
+### `spyro env set`
+
+```text
+Usage: spyro env set [OPTIONS] KEY
+
+  Update KEY, or add it if it is not set. The value never goes on the command line.
+
+  Only active lines are changed; a commented-out `# KEY=` is left alone and a new KEY goes right
+  after it (else at the end of the file, or after --after).
+
+    spyro env set -p prod MAIL_PASSWORD                 # hidden prompt, asked twice
+    op read op://vault/stripe | spyro env set -p prod STRIPE_SECRET --stdin -y
+    spyro env set -p prod APP_KEY --generate laravel-key --dry-run
+
+Options:
+  -p, --profile TEXT     Profile name  [required]
+  --file TEXT            Env file (must be in env_files)  [default: .env]
+  --dry-run              Show the redacted diff, write nothing
+  -y, --yes              Do not ask for confirmation (required without a terminal)
+  --json                 Machine-readable result (values still hidden)
+  --all                  Edit every occurrence of a duplicated key
+  --force                Edit even if the file has parse errors
+  --no-reload            Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                         octane:reload
+  --stdin                Read the value from stdin (one trailing newline dropped)
+  --from-file FILE       Read the value from a file
+  --from-local-env NAME  Take the value from a local environment variable
+  --generate SPEC        Generate a random value: N[:hex|base64|alnum] (N bytes; N chars for alnum)
+                         or laravel-key
+  --after KEY            Place a new key after this one
+  --help                 Show this message and exit.
+```
+
+### `spyro env unhide`
+
+```text
+Usage: spyro env unhide [OPTIONS] KEY
+
+  Uncomment a hidden `# KEY=...` line. Refused while KEY is set (it would be duplicated).
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --dry-run           Show the redacted diff, write nothing
+  -y, --yes           Do not ask for confirmation (required without a terminal)
+  --json              Machine-readable result (values still hidden)
+  --all               Edit every occurrence of a duplicated key
+  --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
+  --line INTEGER      Which commented-out KEY to restore when there are several
+  --help              Show this message and exit.
+```
+
+### `spyro env unset`
+
+```text
+Usage: spyro env unset [OPTIONS] KEYS...
+
+  Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead.
+
+Options:
+  -p, --profile TEXT  Profile name  [required]
+  --file TEXT         Env file (must be in env_files)  [default: .env]
+  --dry-run           Show the redacted diff, write nothing
+  -y, --yes           Do not ask for confirmation (required without a terminal)
+  --json              Machine-readable result (values still hidden)
+  --all               Edit every occurrence of a duplicated key
+  --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
   --help              Show this message and exit.
 ```

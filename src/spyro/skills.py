@@ -47,7 +47,16 @@ NOTES: dict[str, str] = {
     "env": (
         "`env diff` never prints values (every value is `***`), only which keys differ. "
         "`env pull` writes the remote .env to a local file: never cat or paste its contents into a chat. "
-        "`env push` overwrites the remote .env; the local file must exist."
+        "`env push` overwrites the remote .env; the local file must exist. "
+        "To change one key use `env set` (update or add), `env unset` (delete), `env hide`/`env unhide` "
+        "(comment out / back in); commented lines are never treated as values. "
+        "Never put a value on the command line: "
+        "pipe it with `--stdin`, use `--from-local-env NAME` or `--generate`; without a terminal they need `--yes`, "
+        "and `--dry-run` previews a redacted diff. Writes are atomic, refuse if the file changed since it was read, "
+        "and keep a backup (`env backups`, `env restore`). A duplicated key is refused unless `--all`. "
+        "`env keys` and `env has` read key names only. On `artisan = true` profiles each write also runs "
+        "`config:cache` (if cached), `horizon:terminate`, `queue:restart` and `octane:reload`; pass `--no-reload` "
+        "only when the user wants to batch several edits, then reload once with `spyro artisan`."
     ),
     "eval": (
         "PHP only. Boots Laravel (`bootstrap/app.php`) and evaluates one expression; needs `artisan = true`. "
@@ -119,6 +128,8 @@ OVERVIEW_RULES = """\
    anything against a production profile unless the user explicitly asked for that profile in this conversation.
 3. **Secrets stay on the server.** Never print `.env` contents, `env pull` output, passwords or tokens.
    `env diff` is masked for this reason. Passwords come from the OS keychain or `SPYRO_PASSWORD[_<PROFILE>]`.
+   To change one key use `env set KEY --stdin`/`--generate` (or `unset`/`hide`/`unhide`), never
+   `env pull` + edit + `env push`, and never put a value on the command line.
 4. **Pick the right executor:** shell/Python/Docker → `spyro run` (`-C` for the app dir); Laravel expression
    → `spyro eval`; Artisan → `spyro artisan`; local PHP file → `spyro script`; interactive → `spyro ssh`/`tinker`.
 5. **Exit codes are real.** A failing remote command fails spyro; check it instead of parsing output.
