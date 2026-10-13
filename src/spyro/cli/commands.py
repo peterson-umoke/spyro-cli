@@ -3121,10 +3121,7 @@ def cmd_ps(profile: str | None, grep: str, json_output: bool) -> None:
 def cmd_env() -> None:
     """Manage remote environment files.
 
-    Subcommands:
-      pull    Download .env from remote
-      diff    Compare local and remote .env files
-      push    Upload local .env to remote
+    Values are never printed: `keys`/`has` show key names, edits show a redacted diff.
     """
 
 
@@ -3222,3 +3219,473 @@ def push(profile: str, source: str) -> None:
     else:
         raise click.ClickException(f"Push failed (exit code: {ec})")
 
+
+
+# ---------------------------------------------------------------------------
+# spyro env keys/has/set/add/replace/unset/backups/restore: key-level editing.
+# Values never reach argv, stdout or logs: content travels by file (scp) and
+# base64 (fetch), every diff is redacted.
+# ---------------------------------------------------------------------------
+
+# Prints the resolved path, W/R (writable by the SSH user), then the file as base64:
+# the PTY strips escapes and CRLF, so plain `cat` is not byte-exact.
+_ENV_READ = (
+    'real=$(readlink -f -- "$1") && [ -f "$real" ] || { echo "spyro: no such file: $1" >&2; exit 2; }; '
+    'printf "SPYRO-REAL %s\\n" "$real"; '
+    'if [ -w "$real" ] && [ -w "$(dirname -- "$real")" ]; then echo SPYRO-W; else echo SPYRO-R; fi; '
+    'base64 <"$real"'
+)
+
+# Compare-and-swap install: back up, write a temp file in the same dir, rename over.
+_ENV_WRITE = r'''set -eu
+real=$1 staged=$2 expect=$3 want=$4 ts=$5 keep=$6
+trap 'rm -f "$staged" "${tmp:-}"' EXIT
+h() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d" " -f1; }
+exec 9<"$real"
+if command -v flock >/dev/null 2>&1; then flock -w 10 9 || { echo SPYRO-LOCKED; exit 5; }; fi
+[ "$(h <"$real")" = "$expect" ] || { echo SPYRO-CONFLICT; exit 3; }
+[ "$(h <"$staged")" = "$want" ] || { echo SPYRO-CORRUPT; exit 4; }
+bak="$real.spyro-bak.$ts"; [ -e "$bak" ] && bak="$bak-$$"
+cp -p "$real" "$bak"
+tmp=$(mktemp "$(dirname "$real")/.env.spyro.XXXXXX")
+cp -p "$real" "$tmp"
+cat "$staged" >"$tmp"
+mv -f "$tmp" "$real"
+ls -1 "$real".spyro-bak.* | sort -r | tail -n +$((keep+1)) | while IFS= read -r f; do rm -f -- "$f"; done
+'''
+
+_ENV_KEEP_BACKUPS = 10
+
+
+def _env_path(p: "ProfileConfig", file: str) -> str:
+    if file not in p.env_files:
+        raise click.UsageError(f"--file {file} is not in env_files for this profile ({', '.join(p.env_files)})")
+    return f"{p.remote_path}/{file}"
+
+
+def _env_read(p: "ProfileConfig", path: str, ssh_pw: str) -> tuple[str, bool, bytes]:
+    """``(resolved path, writable by the SSH user, exact bytes)`` of a remote file."""
+    import base64
+    import re
+
+    lines: list[str] = []
+    args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    args.append(f"sh -c {safe_quote(_ENV_READ)} sh {safe_quote(path)}")
+    ec = PTYRunner().run(args, password=ssh_pw, on_output=lines.append, timeout=30)
+    real = next((l[len("SPYRO-REAL "):] for l in lines if l.startswith("SPYRO-REAL ")), None)
+    if ec != 0 or real is None:
+        for line in lines:
+            _remote(line, "  ")
+        raise click.ClickException(f"Could not read {path} (exit code: {ec})")
+    start = lines.index(f"SPYRO-REAL {real}") + 2
+    writable = lines[start - 1] == "SPYRO-W"
+    b64 = "".join(l for l in lines[start:] if re.fullmatch(r"[A-Za-z0-9+/=]+", l))
+    return real, writable, base64.b64decode(b64)
+
+
+def _env_write(
+    p: "ProfileConfig", profile: str, real: str, old: bytes, new: bytes, writable: bool, ssh_pw: str,
+) -> None:
+    """Atomically replace *real* with *new*, only if it still holds *old*."""
+    import hashlib
+    import tempfile
+    from datetime import datetime, timezone
+    from ..core.pty_engine import _scp_target
+
+    if not writable and not p.sudo:
+        raise click.ClickException(f"{real} is not writable by {p.user}; set sudo = true for this profile")
+    runner = PTYRunner()
+    staged = f".spyro-env-{uuid.uuid4().hex}"  # in the SSH user's home; mode 0600 from the local file
+    fd, local = tempfile.mkstemp(prefix="spyro-env-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new)
+        scp = build_scp_args(src=local, dest=_scp_target(staged, p.host, p.user),
+                             host=p.host, user=p.user, port=p.port, key=p.key, recursive=False)
+        if runner.run(scp, password=ssh_pw, timeout=60) != 0:
+            raise click.ClickException("Upload failed; the remote file was not changed")
+    finally:
+        os.unlink(local)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rest = " ".join(safe_quote(a) for a in (
+        hashlib.sha256(old).hexdigest(), hashlib.sha256(new).hexdigest(), ts, str(_ENV_KEEP_BACKUPS),
+    ))
+    # $HOME expands in the login shell, before any sudo
+    inner = f'sh -c {safe_quote(_ENV_WRITE)} sh {safe_quote(real)} "$HOME"/{staged} {rest}'
+    args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    sudo_pw = ""
+    if not writable:
+        from ..utils.keychain import prompt_for_credential
+        args.insert(1, "-t")
+        inner = "sudo " + inner
+        sudo_pw = prompt_for_credential(profile, p.user)
+    args.append(inner)
+    out: list[str] = []
+    ec = runner.run(args, password=ssh_pw, sudo_password=sudo_pw, on_output=out.append, timeout=60)
+    if ec == 3:
+        raise click.ClickException(f"{real} changed since it was read; nothing written. Run the command again.")
+    if ec != 0:
+        for line in out:
+            _remote(line, "  ")
+        raise click.ClickException(f"Write failed (exit code: {ec}); {real} was not changed")
+
+
+def _env_redacted_diff(old: str, new: str) -> list[str]:
+    import difflib
+
+    return [l.rstrip("\n") for l in difflib.unified_diff(
+        [l + "\n" for l in redact_env(old, new, "old")],
+        [l + "\n" for l in redact_env(new, old, "new")],
+        "before (values hidden)", "after (values hidden)", n=1,
+    )]
+
+
+def _env_apply(
+    profile: str, file: str, edit: Callable[[list], list[dict]], *,
+    dry_run: bool, yes: bool, as_json: bool, force: bool,
+) -> None:
+    """Fetch, edit in memory, validate, show a redacted diff, confirm, write."""
+    from ..utils import envedit
+    from ..utils.keychain import prompt_for_credential
+
+    p = load_config().get_profile(profile)
+    path = _env_path(p, file)
+    ssh_pw = prompt_for_credential(profile, p.user)
+    real, writable, old_b = _env_read(p, path, ssh_pw)
+    try:
+        old = old_b.decode("utf-8")
+    except UnicodeDecodeError:
+        raise click.ClickException(f"{real} is not UTF-8 text") from None
+    doc = envedit.parse(old)
+    if (bad := envedit.problems(doc)) and not force:
+        raise click.ClickException(f"{real} does not parse ({'; '.join(bad)}); fix it first or pass --force")
+    changes = edit(doc)
+    new = envedit.serialize(doc)
+    if new and not new.endswith("\n"):
+        new += "\r\n" if "\r\n" in new else "\n"
+
+    # Read back: no new parse errors or duplicates, every touched key holds its intended value
+    after = envedit.parse(new)
+    if len(envedit.problems(after)) > len(envedit.problems(doc)):
+        raise click.ClickException("Edit would produce an unparseable file; nothing written")
+    for c in changes:
+        hits = envedit.find(after, c["key"])
+        if "value" in c and (len(hits) != c.get("count", 1)
+                             or any(envedit.decode(envedit.raw_value(after[i])) != c["value"] for i in hits)):
+            raise click.ClickException(f"{c['key']} would not read back as intended; nothing written")
+        if c["action"] == "unhidden" and len(hits) != 1:
+            raise click.ClickException(f"{c['key']} would not be set exactly once; nothing written")
+        if c["action"] in ("removed", "hidden") and hits:
+            raise click.ClickException(f"{c['key']} would still be set; nothing written")
+
+    summary = [{"key": c["key"], "action": c["action"]} for c in changes]
+    if new == old:
+        if as_json:
+            _emit_json({"file": real, "changes": summary, "written": False})
+        else:
+            console.print("[green]No change[/green]")
+        return
+    diff = _env_redacted_diff(old, new)
+    if not as_json:
+        for line in diff:
+            style = "green" if line[:1] == "+" else "red" if line[:1] == "-" else "cyan" if line[:2] == "@@" else ""
+            console.print(Text(line, style=style), soft_wrap=True)
+    written = False
+    if not dry_run:
+        if not yes:
+            if not sys.stdin.isatty():
+                raise click.UsageError("Not a terminal: pass --yes to write, or --dry-run to preview")
+            if not click.confirm(f"Write {real} on {p.host}?", default=False):
+                raise SystemExit(1)
+        _env_write(p, profile, real, old_b, new.encode("utf-8"), writable, ssh_pw)
+        written = True
+    if as_json:
+        _emit_json({"file": real, "changes": summary, "diff": diff, "written": written})
+    elif written:
+        console.print(f"[green]✓ {real} updated (backup kept next to it; `spyro env restore -p {profile}`)[/green]")
+
+
+def _env_value(stdin: bool, from_file: str | None, from_local_env: str | None, gen: str | None) -> str:
+    """The new value from exactly one non-argv source."""
+    from ..utils import envedit
+
+    given = [x for x in (stdin, from_file, from_local_env, gen) if x]
+    if len(given) > 1:
+        raise click.UsageError("Use only one of --stdin, --from-file, --from-local-env, --generate")
+    if stdin:
+        v = sys.stdin.read()
+        return v[:-1] if v.endswith("\n") else v
+    if from_file:
+        v = Path(from_file).expanduser().read_text(encoding="utf-8")
+        return v[:-1] if v.endswith("\n") else v
+    if from_local_env:
+        if from_local_env not in os.environ:
+            raise click.UsageError(f"Local environment variable {from_local_env} is not set")
+        return os.environ[from_local_env]
+    if gen:
+        try:
+            return envedit.generate(gen)
+        except ValueError as e:
+            raise click.UsageError(f"--generate: {e}") from None
+    if not sys.stdin.isatty():
+        raise click.UsageError("No value: use --stdin, --from-file, --from-local-env or --generate")
+    return click.prompt("Value", hide_input=True, confirmation_prompt=True, default="", show_default=False)
+
+
+def _env_one(doc: list, key: str, all_: bool) -> list[int]:
+    from ..utils import envedit
+
+    hits = envedit.find(doc, key)
+    if len(hits) > 1 and not all_:
+        lines = ", ".join(str(doc[i].line) for i in hits)
+        raise click.ClickException(
+            f"{key} is defined {len(hits)} times (lines {lines}); the last one wins. Pass --all to edit every one."
+        )
+    return hits
+
+
+def _env_write_options(f):
+    for opt in reversed([
+        click.option("--profile", "-p", required=True, help="Profile name"),
+        click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)"),
+        click.option("--dry-run", is_flag=True, help="Show the redacted diff, write nothing"),
+        click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (required without a terminal)"),
+        click.option("--json", "as_json", is_flag=True, help="Machine-readable result (values still hidden)"),
+        click.option("--all", "all_", is_flag=True, help="Edit every occurrence of a duplicated key"),
+        click.option("--force", is_flag=True, help="Edit even if the file has parse errors"),
+    ]):
+        f = opt(f)
+    return f
+
+
+def _env_value_options(f):
+    for opt in reversed([
+        click.option("--stdin", is_flag=True, help="Read the value from stdin (one trailing newline dropped)"),
+        click.option("--from-file", type=click.Path(exists=True, dir_okay=False), help="Read the value from a file"),
+        click.option("--from-local-env", metavar="NAME", help="Take the value from a local environment variable"),
+        click.option("--generate", "gen", metavar="SPEC",
+                     help="Generate a random value: N[:hex|base64|alnum] (N bytes; N chars for alnum) or laravel-key"),
+        click.option("--after", metavar="KEY", help="Place a new key after this one"),
+    ]):
+        f = opt(f)
+    return f
+
+
+def _env_key(key: str) -> str:
+    import re
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", key):
+        raise click.UsageError(f"Invalid key name: {key!r} (values are never arguments; see --stdin)")
+    return key
+
+
+@cmd_env.command("set")
+@_env_write_options
+@_env_value_options
+@click.argument("key")
+def env_set(profile, file, dry_run, yes, as_json, all_, force, stdin, from_file, from_local_env, gen, after, key):
+    """Update KEY, or add it if it is not set. The value never goes on the command line.
+
+    Only active lines are changed; a commented-out `# KEY=` is left alone and a
+    new KEY goes right after it (else at the end of the file, or after --after).
+
+    \b
+      spyro env set -p prod MAIL_PASSWORD                 # hidden prompt, asked twice
+      op read op://vault/stripe | spyro env set -p prod STRIPE_SECRET --stdin -y
+      spyro env set -p prod APP_KEY --generate laravel-key --dry-run
+    """
+    from ..utils import envedit
+
+    key = _env_key(key)
+    value = _env_value(stdin, from_file, from_local_env, gen)
+
+    def edit(doc):
+        hits = _env_one(doc, key, all_)
+        enc = envedit.encode(value)
+        for i in hits:
+            envedit.set_value(doc, i, enc)
+        if not hits:
+            try:
+                envedit.insert(doc, key, enc, after)
+            except KeyError:
+                raise click.ClickException(f"--after {after}: no such key") from None
+        return [{"key": key, "action": "replaced" if hits else "added", "value": value, "count": max(len(hits), 1)}]
+
+    _env_apply(profile, file, edit, dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+
+
+def _env_drop(action: str, keys: tuple[str, ...], all_: bool):
+    """Edit that removes (``removed``) or comments out (``hidden``) each key's active line(s)."""
+    from ..utils import envedit
+
+    keys = [_env_key(k) for k in keys]
+
+    def edit(doc):
+        changes = []
+        for key in keys:
+            hits = _env_one(doc, key, all_)
+            if not hits and action == "hidden" and envedit.find_hidden(doc, key):
+                changes.append({"key": key, "action": "already hidden"})
+                continue
+            if not hits:
+                raise click.ClickException(f"{key} is not set")
+            for i in reversed(hits):
+                (envedit.remove if action == "removed" else envedit.hide)(doc, i)
+            changes.append({"key": key, "action": action})
+        return changes
+
+    return edit
+
+
+@cmd_env.command("unset")
+@_env_write_options
+@click.argument("keys", nargs=-1, required=True)
+def env_unset(profile, file, dry_run, yes, as_json, all_, force, keys):
+    """Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead."""
+    _env_apply(profile, file, _env_drop("removed", keys, all_), dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+
+
+cmd_env.add_command(env_unset, "remove")
+
+
+@cmd_env.command("hide")
+@_env_write_options
+@click.argument("keys", nargs=-1, required=True)
+def env_hide(profile, file, dry_run, yes, as_json, all_, force, keys):
+    """Comment KEY(s) out (`# KEY=...`) so `unhide` can bring them back. Already hidden is a no-op."""
+    _env_apply(profile, file, _env_drop("hidden", keys, all_), dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+
+
+@cmd_env.command("unhide")
+@_env_write_options
+@click.option("--line", type=int, help="Which commented-out KEY to restore when there are several")
+@click.argument("key")
+def env_unhide(profile, file, dry_run, yes, as_json, all_, force, line, key):
+    """Uncomment a hidden `# KEY=...` line. Refused while KEY is set (it would be duplicated)."""
+    from ..utils import envedit
+
+    key = _env_key(key)
+
+    def edit(doc):
+        if active := envedit.find(doc, key):
+            raise click.ClickException(
+                f"{key} is already set (line {doc[active[-1]].line}); `env unset` it first or `env set` it"
+            )
+        hidden = envedit.find_hidden(doc, key)
+        if line is not None:
+            hidden = [i for i in hidden if doc[i].line == line]
+        if not hidden:
+            raise click.ClickException(f"No commented-out {key}" + (f" on line {line}" if line else ""))
+        if len(hidden) > 1:
+            lines = ", ".join(str(doc[i].line) for i in hidden)
+            raise click.ClickException(f"{key} is commented out {len(hidden)} times (lines {lines}); pick one with --line")
+        envedit.unhide(doc, hidden[0])
+        return [{"key": key, "action": "unhidden"}]
+
+    _env_apply(profile, file, edit, dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+
+
+def _env_load(profile: str, file: str):
+    from ..utils import envedit
+    from ..utils.keychain import prompt_for_credential
+
+    p = load_config().get_profile(profile)
+    real, _, data = _env_read(p, _env_path(p, file), prompt_for_credential(profile, p.user))
+    return envedit.parse(data.decode("utf-8", "replace"))
+
+
+@cmd_env.command("keys")
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+def env_keys(profile, file, as_json):
+    """List the keys in the remote env file (names and line numbers only)."""
+    found = [{"line": e.line, "key": e.key} for e in _env_load(profile, file) if e.key]
+    if as_json:
+        _emit_json(found)
+        return
+    for k in found:
+        _remote(f"{k['line']:>4}  {k['key']}")
+
+
+@cmd_env.command("has")
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
+@click.argument("key")
+def env_has(profile, file, key):
+    """Exit 0 if KEY is set (prints `KEY: set` or `KEY: empty`), 1 if it is not."""
+    from ..utils import envedit
+
+    doc = _env_load(profile, file)
+    hits = envedit.find(doc, _env_key(key))
+    if not hits:
+        raise SystemExit(1)
+    empty = envedit.decode(envedit.raw_value(doc[hits[-1]])) == ""
+    _remote(f"{key}: {'empty' if empty else 'set'}")
+
+
+@cmd_env.command("backups")
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
+def env_backups(profile, file):
+    """List the backups spyro keeps next to the env file (newest first)."""
+    from ..utils.keychain import prompt_for_credential
+
+    p = load_config().get_profile(profile)
+    args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    script = (
+        'real=$(readlink -f -- "$1") || exit 2; for f in "$real".spyro-bak.*; do [ -e "$f" ] || continue; '
+        'printf "%s %s\\n" "${f##*.spyro-bak.}" "$(wc -c <"$f" | tr -d " ")"; done | sort -r'
+    )
+    args.append(f"sh -c {safe_quote(script)} sh {safe_quote(_env_path(p, file))}")
+    out: list[str] = []
+    ec = PTYRunner().run(args, password=prompt_for_credential(profile, p.user), on_output=out.append, timeout=30)
+    if ec != 0:
+        raise click.ClickException(f"Could not list backups (exit code: {ec})")
+    if not out:
+        console.print("[dim]No backups[/dim]")
+    for line in out:
+        bid, _, size = line.partition(" ")
+        _remote(f"{bid}  {size} bytes")
+
+
+@cmd_env.command("restore")
+@click.option("--profile", "-p", required=True, help="Profile name")
+@click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
+@click.option("--dry-run", is_flag=True, help="Show the redacted diff, write nothing")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (required without a terminal)")
+@click.argument("backup_id", required=False)
+def env_restore(profile, file, dry_run, yes, backup_id):
+    """Roll the env file back to a backup (default: the newest). The current file is backed up first."""
+    import re
+    from ..utils.keychain import prompt_for_credential
+
+    p = load_config().get_profile(profile)
+    ssh_pw = prompt_for_credential(profile, p.user)
+    real, writable, old = _env_read(p, _env_path(p, file), ssh_pw)
+    if backup_id is None:
+        out: list[str] = []
+        args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        args.append(f"ls -1 -- {safe_quote(real)}.spyro-bak.* 2>/dev/null | sort -r | head -n 1")
+        PTYRunner().run(args, password=ssh_pw, on_output=out.append, timeout=30)
+        if not out or ".spyro-bak." not in out[0]:
+            raise click.ClickException("No backups")
+        backup_id = out[0].rsplit(".spyro-bak.", 1)[1]
+    if not re.fullmatch(r"[0-9TZ-]+", backup_id):
+        raise click.UsageError(f"Invalid backup id: {backup_id}")
+    _, _, data = _env_read(p, f"{real}.spyro-bak.{backup_id}", ssh_pw)
+    for line in _env_redacted_diff(old.decode("utf-8", "replace"), data.decode("utf-8", "replace")):
+        _remote(line)
+    if data == old:
+        console.print("[green]Already identical[/green]")
+        return
+    if dry_run:
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            raise click.UsageError("Not a terminal: pass --yes to restore")
+        if not click.confirm(f"Restore {real} from {backup_id}?", default=False):
+            raise SystemExit(1)
+    _env_write(p, profile, real, old, data, writable, ssh_pw)
+    console.print(f"[green]✓ {real} restored from {backup_id}[/green]")
