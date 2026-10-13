@@ -761,6 +761,8 @@ spyro env hide -p prod DEBUGBAR_ENABLED          # Comment it out (# KEY=...)
 spyro env unhide -p prod DEBUGBAR_ENABLED        # Uncomment it again (--line N if several)
 spyro env backups -p prod                        # Backups kept next to the file (last 10)
 spyro env restore -p prod [ID]                   # Roll back (newest by default)
+# Laravel profiles (artisan = true): every write then runs config:cache (if cached),
+# horizon:terminate (if installed), queue:restart and octane:reload (if installed); --no-reload skips it
 ```
 
 ### Logs

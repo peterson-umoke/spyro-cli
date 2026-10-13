@@ -3122,6 +3122,9 @@ def cmd_env() -> None:
     """Manage remote environment files.
 
     Values are never printed: `keys`/`has` show key names, edits show a redacted diff.
+    On `artisan = true` profiles every write is followed by config:cache (when the
+    config is cached), horizon:terminate (when installed), queue:restart and
+    octane:reload (when installed), so the app picks it up; --no-reload skips that.
     """
 
 
@@ -3341,9 +3344,43 @@ def _env_redacted_diff(old: str, new: str) -> list[str]:
     )]
 
 
+def _env_reload(p: "ProfileConfig", profile: str, ssh_pw: str) -> None:
+    """Make Laravel pick up the new .env: rebuild a cached config, restart workers gracefully.
+
+    Cached config (bootstrap/cache/config.php) means .env is never read; queue/Horizon/Octane
+    workers keep the old values until they restart (Supervisor brings them back).
+    """
+    sp = _sudo_prefix(p)
+    art = f"{sp}php artisan"
+    script = (
+        f"{_capistrano_cd(p.remote_path)} || exit 1; "
+        f"if [ -f bootstrap/cache/config.php ]; then echo '> config:cache'; {art} config:cache || exit 1; fi; "
+        f"if [ -d vendor/laravel/horizon ]; then echo '> horizon:terminate'; {art} horizon:terminate || exit 1; fi; "
+        f"echo '> queue:restart'; {art} queue:restart || exit 1; "
+        f"if [ -d vendor/laravel/octane ]; then echo '> octane:reload'; {art} octane:reload || true; fi"
+    )
+    args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    sudo_pw = ""
+    if sp:
+        from ..utils.keychain import prompt_for_credential
+        args.insert(1, "-t")
+        sudo_pw = prompt_for_credential(profile, p.user)
+    args.append(script)
+    err_console.print("[cyan]Reloading Laravel so the change is picked up...[/cyan]")
+    ec = PTYRunner().run(
+        args, password=ssh_pw, sudo_password=sudo_pw,
+        on_output=lambda line: err_console.print(Text("  " + line), soft_wrap=True), timeout=120,
+    )
+    if ec != 0:
+        raise click.ClickException(
+            f"The env file was written, but the Laravel reload failed (exit code: {ec}). "
+            f"Run it by hand: spyro artisan config:cache / queue:restart -p {profile}"
+        )
+
+
 def _env_apply(
     profile: str, file: str, edit: Callable[[list], list[dict]], *,
-    dry_run: bool, yes: bool, as_json: bool, force: bool,
+    dry_run: bool, yes: bool, as_json: bool, force: bool, no_reload: bool = False,
 ) -> None:
     """Fetch, edit in memory, validate, show a redacted diff, confirm, write."""
     from ..utils import envedit
@@ -3400,6 +3437,8 @@ def _env_apply(
                 raise SystemExit(1)
         _env_write(p, profile, real, old_b, new.encode("utf-8"), writable, ssh_pw)
         written = True
+        if p.artisan and not no_reload:
+            _env_reload(p, profile, ssh_pw)
     if as_json:
         _emit_json({"file": real, "changes": summary, "diff": diff, "written": written})
     elif written:
@@ -3454,6 +3493,8 @@ def _env_write_options(f):
         click.option("--json", "as_json", is_flag=True, help="Machine-readable result (values still hidden)"),
         click.option("--all", "all_", is_flag=True, help="Edit every occurrence of a duplicated key"),
         click.option("--force", is_flag=True, help="Edit even if the file has parse errors"),
+        click.option("--no-reload", is_flag=True,
+                     help="Laravel: skip config:cache (when cached), horizon:terminate, queue:restart, octane:reload"),
     ]):
         f = opt(f)
     return f
@@ -3484,7 +3525,7 @@ def _env_key(key: str) -> str:
 @_env_write_options
 @_env_value_options
 @click.argument("key")
-def env_set(profile, file, dry_run, yes, as_json, all_, force, stdin, from_file, from_local_env, gen, after, key):
+def env_set(profile, file, dry_run, yes, as_json, all_, force, no_reload, stdin, from_file, from_local_env, gen, after, key):
     """Update KEY, or add it if it is not set. The value never goes on the command line.
 
     Only active lines are changed; a commented-out `# KEY=` is left alone and a
@@ -3512,7 +3553,7 @@ def env_set(profile, file, dry_run, yes, as_json, all_, force, stdin, from_file,
                 raise click.ClickException(f"--after {after}: no such key") from None
         return [{"key": key, "action": "replaced" if hits else "added", "value": value, "count": max(len(hits), 1)}]
 
-    _env_apply(profile, file, edit, dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+    _env_apply(profile, file, edit, dry_run=dry_run, yes=yes, as_json=as_json, force=force, no_reload=no_reload)
 
 
 def _env_drop(action: str, keys: tuple[str, ...], all_: bool):
@@ -3541,9 +3582,10 @@ def _env_drop(action: str, keys: tuple[str, ...], all_: bool):
 @cmd_env.command("unset")
 @_env_write_options
 @click.argument("keys", nargs=-1, required=True)
-def env_unset(profile, file, dry_run, yes, as_json, all_, force, keys):
+def env_unset(profile, file, dry_run, yes, as_json, all_, force, no_reload, keys):
     """Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead."""
-    _env_apply(profile, file, _env_drop("removed", keys, all_), dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+    _env_apply(profile, file, _env_drop("removed", keys, all_),
+               dry_run=dry_run, yes=yes, as_json=as_json, force=force, no_reload=no_reload)
 
 
 cmd_env.add_command(env_unset, "remove")
@@ -3552,16 +3594,17 @@ cmd_env.add_command(env_unset, "remove")
 @cmd_env.command("hide")
 @_env_write_options
 @click.argument("keys", nargs=-1, required=True)
-def env_hide(profile, file, dry_run, yes, as_json, all_, force, keys):
+def env_hide(profile, file, dry_run, yes, as_json, all_, force, no_reload, keys):
     """Comment KEY(s) out (`# KEY=...`) so `unhide` can bring them back. Already hidden is a no-op."""
-    _env_apply(profile, file, _env_drop("hidden", keys, all_), dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+    _env_apply(profile, file, _env_drop("hidden", keys, all_),
+               dry_run=dry_run, yes=yes, as_json=as_json, force=force, no_reload=no_reload)
 
 
 @cmd_env.command("unhide")
 @_env_write_options
 @click.option("--line", type=int, help="Which commented-out KEY to restore when there are several")
 @click.argument("key")
-def env_unhide(profile, file, dry_run, yes, as_json, all_, force, line, key):
+def env_unhide(profile, file, dry_run, yes, as_json, all_, force, no_reload, line, key):
     """Uncomment a hidden `# KEY=...` line. Refused while KEY is set (it would be duplicated)."""
     from ..utils import envedit
 
@@ -3583,7 +3626,7 @@ def env_unhide(profile, file, dry_run, yes, as_json, all_, force, line, key):
         envedit.unhide(doc, hidden[0])
         return [{"key": key, "action": "unhidden"}]
 
-    _env_apply(profile, file, edit, dry_run=dry_run, yes=yes, as_json=as_json, force=force)
+    _env_apply(profile, file, edit, dry_run=dry_run, yes=yes, as_json=as_json, force=force, no_reload=no_reload)
 
 
 def _env_load(profile: str, file: str):
@@ -3655,8 +3698,9 @@ def env_backups(profile, file):
 @click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
 @click.option("--dry-run", is_flag=True, help="Show the redacted diff, write nothing")
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (required without a terminal)")
+@click.option("--no-reload", is_flag=True, help="Laravel: skip the config:cache / worker restart after restoring")
 @click.argument("backup_id", required=False)
-def env_restore(profile, file, dry_run, yes, backup_id):
+def env_restore(profile, file, dry_run, yes, no_reload, backup_id):
     """Roll the env file back to a backup (default: the newest). The current file is backed up first."""
     import re
     from ..utils.keychain import prompt_for_credential
@@ -3689,3 +3733,5 @@ def env_restore(profile, file, dry_run, yes, backup_id):
             raise SystemExit(1)
     _env_write(p, profile, real, old, data, writable, ssh_pw)
     console.print(f"[green]✓ {real} restored from {backup_id}[/green]")
+    if p.artisan and not no_reload:
+        _env_reload(p, profile, ssh_pw)

@@ -11,7 +11,7 @@ Manage remote environment files.
 
 ## Before you run it
 
-`env diff` never prints values (every value is `***`), only which keys differ. `env pull` writes the remote .env to a local file: never cat or paste its contents into a chat. `env push` overwrites the remote .env; the local file must exist. To change one key use `env set` (update or add), `env unset` (delete), `env hide`/`env unhide` (comment out / back in); commented lines are never treated as values. Never put a value on the command line: pipe it with `--stdin`, use `--from-local-env NAME` or `--generate`; without a terminal they need `--yes`, and `--dry-run` previews a redacted diff. Writes are atomic, refuse if the file changed since it was read, and keep a backup (`env backups`, `env restore`). A duplicated key is refused unless `--all`. `env keys` and `env has` read key names only.
+`env diff` never prints values (every value is `***`), only which keys differ. `env pull` writes the remote .env to a local file: never cat or paste its contents into a chat. `env push` overwrites the remote .env; the local file must exist. To change one key use `env set` (update or add), `env unset` (delete), `env hide`/`env unhide` (comment out / back in); commented lines are never treated as values. Never put a value on the command line: pipe it with `--stdin`, use `--from-local-env NAME` or `--generate`; without a terminal they need `--yes`, and `--dry-run` previews a redacted diff. Writes are atomic, refuse if the file changed since it was read, and keep a backup (`env backups`, `env restore`). A duplicated key is refused unless `--all`. `env keys` and `env has` read key names only. On `artisan = true` profiles each write also runs `config:cache` (if cached), `horizon:terminate`, `queue:restart` and `octane:reload`; pass `--no-reload` only when the user wants to batch several edits, then reload once with `spyro artisan`.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -24,7 +24,10 @@ Usage: spyro env [OPTIONS] COMMAND [ARGS]...
 
   Manage remote environment files.
 
-  Values are never printed: `keys`/`has` show key names, edits show a redacted diff.
+  Values are never printed: `keys`/`has` show key names, edits show a redacted diff. On `artisan =
+  true` profiles every write is followed by config:cache (when the config is cached),
+  horizon:terminate (when installed), queue:restart and octane:reload (when installed), so the app
+  picks it up; --no-reload skips that.
 
 Options:
   --help  Show this message and exit.
@@ -97,6 +100,8 @@ Options:
   --json              Machine-readable result (values still hidden)
   --all               Edit every occurrence of a duplicated key
   --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
   --help              Show this message and exit.
 ```
 
@@ -154,6 +159,8 @@ Options:
   --json              Machine-readable result (values still hidden)
   --all               Edit every occurrence of a duplicated key
   --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
   --help              Show this message and exit.
 ```
 
@@ -169,6 +176,7 @@ Options:
   --file TEXT         Env file (must be in env_files)  [default: .env]
   --dry-run           Show the redacted diff, write nothing
   -y, --yes           Do not ask for confirmation (required without a terminal)
+  --no-reload         Laravel: skip the config:cache / worker restart after restoring
   --help              Show this message and exit.
 ```
 
@@ -194,6 +202,8 @@ Options:
   --json                 Machine-readable result (values still hidden)
   --all                  Edit every occurrence of a duplicated key
   --force                Edit even if the file has parse errors
+  --no-reload            Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                         octane:reload
   --stdin                Read the value from stdin (one trailing newline dropped)
   --from-file FILE       Read the value from a file
   --from-local-env NAME  Take the value from a local environment variable
@@ -218,6 +228,8 @@ Options:
   --json              Machine-readable result (values still hidden)
   --all               Edit every occurrence of a duplicated key
   --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
   --line INTEGER      Which commented-out KEY to restore when there are several
   --help              Show this message and exit.
 ```
@@ -237,5 +249,7 @@ Options:
   --json              Machine-readable result (values still hidden)
   --all               Edit every occurrence of a duplicated key
   --force             Edit even if the file has parse errors
+  --no-reload         Laravel: skip config:cache (when cached), horizon:terminate, queue:restart,
+                      octane:reload
   --help              Show this message and exit.
 ```

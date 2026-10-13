@@ -209,3 +209,25 @@ def test_concurrent_edit_is_refused(server, monkeypatch):
     r = run("set", "-p", "prod", "X", "--stdin", "-y", input="1")
     assert r.exit_code != 0 and "changed since it was read" in r.output
     assert real.read_bytes().decode() == "SOMEONE=else\n"
+
+
+def test_laravel_profile_reloads_after_write(server, tmp_path):
+    """Cached config is rebuilt and workers restarted, or the app never sees the edit."""
+    app, real, _ = server
+    toml = tmp_path / "spyro.toml"
+    toml.write_text(toml.read_text() + "artisan = true\n")
+    (app / "bootstrap" / "cache").mkdir(parents=True)
+    (app / "bootstrap" / "cache" / "config.php").write_text("<?php return [];")
+    (app / "vendor" / "laravel" / "horizon").mkdir(parents=True)
+    calls = tmp_path / "php.log"
+    php = tmp_path / "bin" / "php"
+    php.write_text(f'#!/bin/sh\necho "$PWD $*" >>{calls}\n')
+    php.chmod(0o755)
+
+    assert run("set", "-p", "prod", "X", "--stdin", "-y", "--no-reload", input="1").exit_code == 0
+    assert not calls.exists()
+    r = run("set", "-p", "prod", "X", "--stdin", "-y", input="2")
+    assert r.exit_code == 0, r.output
+    assert calls.read_text().splitlines() == [
+        f"{app} artisan config:cache", f"{app} artisan horizon:terminate", f"{app} artisan queue:restart",
+    ]

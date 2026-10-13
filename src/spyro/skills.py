@@ -54,7 +54,9 @@ NOTES: dict[str, str] = {
         "pipe it with `--stdin`, use `--from-local-env NAME` or `--generate`; without a terminal they need `--yes`, "
         "and `--dry-run` previews a redacted diff. Writes are atomic, refuse if the file changed since it was read, "
         "and keep a backup (`env backups`, `env restore`). A duplicated key is refused unless `--all`. "
-        "`env keys` and `env has` read key names only."
+        "`env keys` and `env has` read key names only. On `artisan = true` profiles each write also runs "
+        "`config:cache` (if cached), `horizon:terminate`, `queue:restart` and `octane:reload`; pass `--no-reload` "
+        "only when the user wants to batch several edits, then reload once with `spyro artisan`."
     ),
     "eval": (
         "PHP only. Boots Laravel (`bootstrap/app.php`) and evaluates one expression; needs `artisan = true`. "
