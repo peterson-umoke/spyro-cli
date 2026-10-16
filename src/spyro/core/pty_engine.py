@@ -655,7 +655,7 @@ def build_ssh_args(
         args.extend(["-p", str(port)])
 
     if key:
-        args.extend(["-i", key])
+        args.extend(["-i", key, "-o", "IdentitiesOnly=yes"])
 
     if extra_args:
         args.extend(extra_args)
@@ -695,7 +695,7 @@ def build_scp_args(
         args.extend(["-P", str(port)])
 
     if key:
-        args.extend(["-i", key])
+        args.extend(["-i", key, "-o", "IdentitiesOnly=yes"])
 
     if recursive:
         args.append("-r")

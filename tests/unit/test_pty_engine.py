@@ -355,3 +355,15 @@ class TestInteractiveInput:
             data += chunk
         assert ec == 0
         assert b"ANSWER:hello" in data
+
+
+def test_key_pins_identities_only():
+    """-i alone still offers agent keys first; IdentitiesOnly stops 'Too many authentication failures'."""
+    from spyro.core.pty_engine import build_scp_args, build_ssh_args
+
+    ssh = build_ssh_args(host="h", user="u", key="~/k")
+    scp = build_scp_args("a", "b", host="h", key="~/k")
+    for args in (ssh, scp):
+        assert args[args.index("-i") + 1] == "~/k"
+        assert "IdentitiesOnly=yes" in args
+    assert "IdentitiesOnly=yes" not in build_ssh_args(host="h", user="u")

@@ -161,7 +161,7 @@ class TunnelManager:
         if profile.port != 22:
             ssh_args.extend(["-p", str(profile.port)])
         if profile.key:
-            ssh_args.extend(["-i", profile.key])
+            ssh_args.extend(["-i", profile.key, "-o", "IdentitiesOnly=yes"])
         ssh_args.extend(fwd_args)
 
         target = f"{profile.user}@{profile.host}"
