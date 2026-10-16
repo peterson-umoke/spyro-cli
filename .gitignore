@@ -38,3 +38,4 @@ coverage.xml
 # Project-specific
 spyro.toml
 .env.remote
+.serena/
