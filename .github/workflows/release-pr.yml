@@ -1,0 +1,43 @@
+name: release-pr
+
+# Manual: Actions -> release-pr -> Run workflow. Opens a PR that bumps the version
+# files and drafts notes from commits since the last tag. Edit the PR body, then
+# merge: release-draft.yml creates a draft release; publishing it ships the version.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (auto reads Conventional Commits)
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUMP: ${{ inputs.bump }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      - name: Bump version and draft notes
+        run: |
+          v=$(python3 scripts/release.py "$BUMP" --notes "$RUNNER_TEMP/notes.md")
+          uv lock
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Open release PR
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "release/v$VERSION"
+          git commit -am "v$VERSION: release"
+          git push origin "release/v$VERSION"
+          gh pr create --base main --head "release/v$VERSION" \
+            --title "v$VERSION: release" --body-file "$RUNNER_TEMP/notes.md"

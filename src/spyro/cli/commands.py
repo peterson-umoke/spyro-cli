@@ -2530,53 +2530,39 @@ _CHECK_CACHE = None  # (needs_update, latest_tag) cached per process
 
 
 def _fetch_latest_version(timeout: float = 15) -> str | None:
-    """Fetch the latest semver tag from GitHub.
+    """Fetch the latest published GitHub *release* (not a bare tag).
 
-    Returns the version string (e.g. "0.8.7") or None on failure.
+    Returns the version string (e.g. "0.8.7") or None on failure. Drafts and
+    prereleases are never "latest", so unpublished work cannot reach users.
     """
     import json
     import urllib.request
-    import urllib.error
-
-    GITHUB_API = "https://api.github.com/repos/peterson-umoke/spyro-cli"
 
     try:
         req = urllib.request.Request(
-            f"{GITHUB_API}/releases/latest",
+            "https://api.github.com/repos/peterson-umoke/spyro-cli/releases/latest",
             headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            release = json.loads(resp.read().decode())
-        latest_tag = release.get("tag_name", "").lstrip("v")
-        if latest_tag:
-            return latest_tag
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            # No releases yet — fall back to listing tags
-            try:
-                tag_req = urllib.request.Request(
-                    f"{GITHUB_API}/tags?per_page=10",
-                    headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
-                )
-                with urllib.request.urlopen(tag_req, timeout=timeout) as resp:
-                    tags = json.loads(resp.read().decode())
-                if not tags:
-                    return None
-                versions = []
-                for t in tags:
-                    raw = t.get("name", "").lstrip("v")
-                    parts = raw.split(".")
-                    if len(parts) == 3 and all(p.isdigit() for p in parts):
-                        versions.append(raw)
-                if versions:
-                    versions.sort(key=lambda v: tuple(int(x) for x in v.split(".")))
-                    return versions[-1]
-            except Exception:
-                return None
-        return None
+            return json.loads(resp.read().decode()).get("tag_name", "").lstrip("v") or None
     except Exception:
         return None
-    return None
+
+
+def _fetch_release_notes(tag: str, timeout: float = 5) -> str:
+    """Return the GitHub release body for v*tag*, or "" when unavailable."""
+    import json
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/peterson-umoke/spyro-cli/releases/tags/v{tag}",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "spyro-cli"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return (json.loads(resp.read().decode()).get("body") or "").strip()
+    except Exception:
+        return ""
 
 
 def _compare_versions(current: str, latest: str) -> bool:
@@ -2691,6 +2677,12 @@ def cmd_update(force: bool, check: bool) -> None:
         if not force:
             return
         console.print("[yellow]   --force: reinstalling anyway...[/yellow]\n")
+
+    if needs_update:
+        notes = _fetch_release_notes(latest_tag)
+        if notes:
+            console.print("\n[bold]What's new[/bold]")
+            console.print(Text(notes))  # Text: release notes may contain [brackets]
 
     if check:
         if needs_update:
