@@ -40,11 +40,10 @@ Commands:
   keys     List the keys in the remote env file (names and line numbers only).
   pull     Pull remote environment config to a local file.
   push     Push local .env file to remote server.
-  remove   Delete KEY(s) from the remote env file.
   restore  Roll the env file back to a backup (default: the newest).
   set      Update KEY, or add it if it is not set.
   unhide   Uncomment a hidden `# KEY=...` line.
-  unset    Delete KEY(s) from the remote env file.
+  unset    Delete KEY(s) from the remote env file (`hide` comments them out instead).
 ```
 
 ### `spyro env backups`
@@ -55,7 +54,7 @@ Usage: spyro env backups [OPTIONS]
   List the backups spyro keeps next to the env file (newest first).
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --file TEXT         Env file (must be in env_files)  [default: .env]
   --help              Show this message and exit.
 ```
@@ -68,7 +67,7 @@ Usage: spyro env diff [OPTIONS]
   Compare local .env with remote .env.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -80,7 +79,7 @@ Usage: spyro env has [OPTIONS] KEY
   Exit 0 if KEY is set (prints `KEY: set` or `KEY: empty`), 1 if it is not.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --file TEXT         Env file (must be in env_files)  [default: .env]
   --help              Show this message and exit.
 ```
@@ -113,7 +112,7 @@ Usage: spyro env keys [OPTIONS]
   List the keys in the remote env file (names and line numbers only).
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --file TEXT         Env file (must be in env_files)  [default: .env]
   --json              Machine-readable output
   --help              Show this message and exit.
@@ -128,7 +127,7 @@ Usage: spyro env pull [OPTIONS]
 
 Options:
   --dest TEXT         Output file path
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -140,7 +139,7 @@ Usage: spyro env push [OPTIONS] [SOURCE]
   Push local .env file to remote server.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -149,7 +148,7 @@ Options:
 ```text
 Usage: spyro env remove [OPTIONS] KEYS...
 
-  Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead.
+  Delete KEY(s) from the remote env file (`hide` comments them out instead).
 
 Options:
   -p, --profile TEXT  Profile name  [required]
@@ -172,7 +171,7 @@ Usage: spyro env restore [OPTIONS] [BACKUP_ID]
   Roll the env file back to a backup (default: the newest). The current file is backed up first.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --file TEXT         Env file (must be in env_files)  [default: .env]
   --dry-run           Show the redacted diff, write nothing
   -y, --yes           Do not ask for confirmation (required without a terminal)
@@ -239,7 +238,7 @@ Options:
 ```text
 Usage: spyro env unset [OPTIONS] KEYS...
 
-  Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead.
+  Delete KEY(s) from the remote env file (`hide` comments them out instead).
 
 Options:
   -p, --profile TEXT  Profile name  [required]

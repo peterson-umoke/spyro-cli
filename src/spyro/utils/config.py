@@ -58,6 +58,7 @@ class ProfileConfig:
     wp_cli_path: str = ""  # custom path to wp-cli (default: auto-detect)
     sudo: bool = False  # whether sudo is available
     sudo_user: str = ""  # run app commands as this user (sudo -u), default root
+    su: bool = False  # escalate with `su` + the root password instead of sudo (implies sudo)
     env_files: list[str] = field(default_factory=lambda: [".env"])
     extra: dict[str, Any] = field(default_factory=dict)
     # True only when spyro.toml sets remote_path. `remote_path` itself defaults to
@@ -258,7 +259,8 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
         artisan=raw.get("artisan", False),
         wordpress=raw.get("wordpress", False),
         wp_cli_path=raw.get("wp_cli_path", ""),
-        sudo=raw.get("sudo", False),
+        sudo=bool(raw.get("sudo", False) or raw.get("su", False)),
+        su=bool(raw.get("su", False)),
         sudo_user=raw.get("sudo_user", ""),
         env_files=raw.get("env_files", [".env"]),
         extra={
@@ -278,6 +280,7 @@ def _parse_profile(name: str, raw: dict[str, Any]) -> ProfileConfig:
                 "wp_cli_path",
                 "sudo",
                 "sudo_user",
+                "su",
                 "env_files",
             }
         },
@@ -410,6 +413,8 @@ remote_path = "/var/www/app"
 artisan = true
 sudo = true
 # sudo_user = "www-data"   # run artisan/tinker/wp as this user instead of root
+# su = true                # no sudo on the server: become root with `su` and the root password
+#                          # (store it with: spyro auth set -p staging --su)
 # Remote ports to tunnel to localhost (spyro up); the local port is the same
 # unless it is taken, in which case the next free one is used.
 forwarded_ports = [3306, 6379]

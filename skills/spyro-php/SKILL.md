@@ -43,7 +43,7 @@ Usage: spyro php extensions [OPTIONS]
   List PHP extensions.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   -f, --filter TEXT   Filter extensions (grep pattern)
   --help              Show this message and exit.
 ```
@@ -56,7 +56,7 @@ Usage: spyro php fpm-status [OPTIONS]
   Show PHP-FPM status (pools, processes).
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -68,7 +68,7 @@ Usage: spyro php info [OPTIONS]
   Show PHP configuration.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   -o, --option TEXT   Specific ini option (e.g. memory_limit)
   --help              Show this message and exit.
 ```
@@ -81,7 +81,7 @@ Usage: spyro php restart [OPTIONS]
   Restart PHP-FPM.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --timeout FLOAT     Timeout in seconds (default: 30)
   --help              Show this message and exit.
 ```
@@ -94,6 +94,6 @@ Usage: spyro php version [OPTIONS]
   Show PHP version.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

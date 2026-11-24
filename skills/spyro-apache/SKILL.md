@@ -43,7 +43,7 @@ Usage: spyro apache modules [OPTIONS]
   List loaded Apache modules.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -55,7 +55,7 @@ Usage: spyro apache restart [OPTIONS]
   Restart Apache.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --timeout FLOAT     Timeout in seconds (default: 30)
   --help              Show this message and exit.
 ```
@@ -68,7 +68,7 @@ Usage: spyro apache sites [OPTIONS]
   List enabled Apache virtual hosts.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -80,7 +80,7 @@ Usage: spyro apache status [OPTIONS]
   Show Apache server status.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -92,6 +92,6 @@ Usage: spyro apache version [OPTIONS]
   Show Apache version.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

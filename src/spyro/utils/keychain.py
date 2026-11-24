@@ -25,10 +25,21 @@ log = logging.getLogger("spyro.keychain")
 SERVICE_NAME = "spyro-cli"
 
 
-def _env_credential(profile: str) -> Optional[str]:
-    """Password from ``SPYRO_PASSWORD_<PROFILE>`` (non-word chars -> ``_``) or ``SPYRO_PASSWORD``."""
-    name = "SPYRO_PASSWORD_" + re.sub(r"\W", "_", profile).upper()
-    return os.environ.get(name) or os.environ.get("SPYRO_PASSWORD") or None
+# "Username" under which a profile's root password (``su = true``) is stored. It is
+# not a login name, so it can never collide with the SSH user's own entry.
+SU_ACCOUNT = "su:root"
+
+
+def _env_credential(profile: str, username: str = "") -> Optional[str]:
+    """Password from ``SPYRO_PASSWORD_<PROFILE>`` (non-word chars -> ``_``) or ``SPYRO_PASSWORD``.
+
+    The root password of a ``su = true`` profile has its own pair,
+    ``SPYRO_SU_PASSWORD_<PROFILE>`` / ``SPYRO_SU_PASSWORD``: it must never fall
+    back to the SSH password.
+    """
+    base = "SPYRO_SU_PASSWORD" if username == SU_ACCOUNT else "SPYRO_PASSWORD"
+    name = f"{base}_" + re.sub(r"\W", "_", profile).upper()
+    return os.environ.get(name) or os.environ.get(base) or None
 
 
 def _can_prompt() -> bool:
@@ -102,7 +113,7 @@ def get_credential(
     Returns:
         The password if found, None otherwise.
     """
-    env_pw = _env_credential(profile)
+    env_pw = _env_credential(profile, username)
     if env_pw:
         return env_pw
 

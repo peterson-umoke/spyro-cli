@@ -11,7 +11,7 @@ Run Laravel Artisan commands on the remote host.
 
 ## Before you run it
 
-Runs `php artisan <args>` inside `remote_path` (its Capistrano `current/` when present). On a `sudo = true` profile it runs as `sudo_user` (or root); `--no-escalate` runs as the SSH user. Needs `artisan = true` on the profile. Pass artisan flags after the command: `spyro artisan migrate --force -p staging`. The remote exit status is spyro's exit status.
+Runs `php artisan <args>` inside `remote_path` (its Capistrano `current/` when present). On a `sudo = true` profile it runs as `sudo_user` (or root); `--no-escalate` runs as the SSH user. Needs `artisan = true` on the profile. Pass artisan flags after the command: `spyro artisan migrate --force -p staging`. It always runs with `--no-interaction`: a command that would ask a question fails or takes its default instead of hanging. The remote exit status is spyro's exit status.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -25,7 +25,7 @@ Usage: spyro artisan [OPTIONS] [CMD_ARGS]...
   Run Laravel Artisan commands on the remote host.
 
 Options:
-  --no-escalate       Don't use sudo
+  --no-escalate       Run as the SSH user (no sudo or su)
   --timeout FLOAT     Command timeout in seconds (default: 60)
   -p, --profile TEXT  Profile name (auto-detects if only one exists)
   --help              Show this message and exit.

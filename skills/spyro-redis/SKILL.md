@@ -42,7 +42,7 @@ Usage: spyro redis cli [OPTIONS] COMMAND...
   Run an arbitrary redis-cli command.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -54,7 +54,7 @@ Usage: spyro redis info [OPTIONS]
   Show Redis server info.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   -s, --section TEXT  Info section (server, stats, keyspace, etc.)
   --help              Show this message and exit.
 ```
@@ -67,7 +67,7 @@ Usage: spyro redis ping [OPTIONS]
   Ping Redis server.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -79,6 +79,6 @@ Usage: spyro redis stats [OPTIONS]
   Show Redis key metrics (connections, commands, keyspace).
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

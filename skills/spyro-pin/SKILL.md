@@ -11,7 +11,7 @@ Pin a local directory for automatic sync to remote server.
 
 ## Before you run it
 
-Registers a local directory for `spyro sync`; `-f` picks the exclusion rules (laravel, wordpress, node, python).
+Registers a local directory for `spyro sync`; `-f` picks the exclusion rules (laravel, wordpress, node, python). The directory and the profile must exist; pinning the same directory and profile again replaces the pin. `--mkdir` creates the remote folder now (as the SSH user) and saves no pin if that fails.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -24,9 +24,14 @@ Usage: spyro pin [OPTIONS] LOCAL_PATH REMOTE_PATH
 
   Pin a local directory for automatic sync to remote server.
 
+  `spyro sync` creates missing remote folders as files are uploaded; --mkdir creates the pinned
+  folder straight away, so a wrong path or a permission problem shows up now instead of on the first
+  save.
+
 Options:
-  -p, --profile TEXT    Profile name  [required]
+  -p, --profile TEXT    Profile name (optional with one profile or a [defaults] profile)
   -f, --framework TEXT  Framework: auto, laravel, wordpress, node, python, or empty
   -e, --exclude TEXT    Additional glob patterns to exclude
+  --mkdir               Create the remote folder now if it does not exist
   --help                Show this message and exit.
 ```

@@ -19,18 +19,20 @@ NOTES: dict[str, str] = {
         "Runs `php artisan <args>` inside `remote_path` (its Capistrano `current/` when present). "
         "On a `sudo = true` profile it runs as `sudo_user` (or root); `--no-escalate` runs as the SSH user. "
         "Needs `artisan = true` on the profile. Pass artisan flags after the command: "
-        "`spyro artisan migrate --force -p staging`. The remote exit status is spyro's exit status."
+        "`spyro artisan migrate --force -p staging`. It always runs with `--no-interaction`: a command that would "
+        "ask a question fails or takes its default instead of hanging. The remote exit status is spyro's exit status."
     ),
     "auth": (
         "Passwords live only in the OS keychain (service `spyro-cli`), never in spyro.toml. "
-        "Non-interactive runs use `SPYRO_PASSWORD` or `SPYRO_PASSWORD_<PROFILE>` (upper-case) instead."
+        "Non-interactive runs use `SPYRO_PASSWORD` or `SPYRO_PASSWORD_<PROFILE>` (upper-case) instead. "
+        "A `su = true` profile also has a root password: `--su` selects it (`SPYRO_SU_PASSWORD[_<PROFILE>]`)."
     ),
     "caddy": "Service group for Caddy hosts (`status`, `version`, `restart`). `restart` needs a profile with `sudo = true`.",
     "config": "`config validate` checks spyro.toml offline. To see what a profile resolves to, use `spyro profiles`.",
     "cp": (
         "Remote side: `:relative` resolves against the profile's `remote_path`; `/abs` and `~/x` are used as given "
         "(no colon). `--home` resolves relative paths against the SSH home instead. "
-        "Use `-r` for directories, `--parents` to create missing remote dirs. On `sudo = true` profiles, local-to-remote copies check destination permissions; protected targets are staged and installed with root sudo after a three-second Ctrl-C window. Existing destination ownership and mode are retained; new files are root-owned. "
+        "Use `-r` for directories, `--mkdir` to create a missing destination folder (`--parents` re-creates the source's relative path under DEST instead). On `sudo = true` profiles, local-to-remote copies check destination permissions; protected targets are staged and installed with root sudo after a three-second Ctrl-C window. Existing destination ownership and mode are retained; new files are root-owned. "
         "Prefer `-p <profile>` over `--all`; `--all` also hits production profiles."
     ),
     "db": (
@@ -71,25 +73,30 @@ NOTES: dict[str, str] = {
         "`--level X` keeps entries at X or worse with their stack-trace lines; `-g` is an awk extended regex "
         "(no GNU `\\b`/`\\d`) applied line by line; with both, grep runs after level, so non-matching stack lines "
         "drop out. `-n` caps matches when filtering; filtered runs scan the whole newest file. "
-        "`-f` streams with no timeout. Other subcommands tail nginx/apache/php logs; `logs supervisor <profile>` "
-        "is spyro's own local tunnel log."
+        "`-f` streams with no timeout. Other subcommands tail nginx/apache/php logs (with sudo on `sudo = true` "
+        "profiles: those files are usually root-only); `logs tunnel <profile>` is spyro's own local tunnel log."
     ),
     "nginx": "`nginx status` runs `nginx -t` (sudo on `sudo = true` profiles); `restart`/`reload` need sudo.",
     "php": "`php version/extensions/fpm-status/info/restart`. `info -o memory_limit` greps `php -i`; for `php --ini` use `spyro run`.",
-    "pin": "Registers a local directory for `spyro sync`; `-f` picks the exclusion rules (laravel, wordpress, node, python).",
+    "pin": (
+        "Registers a local directory for `spyro sync`; `-f` picks the exclusion rules (laravel, wordpress, node, python). "
+        "The directory and the profile must exist; pinning the same directory and profile again replaces the pin. "
+        "`--mkdir` creates the remote folder now (as the SSH user) and saves no pin if that fails."
+    ),
     "pins": "Lists pinned directories. Read-only.",
     "profiles": (
         "Local only, no network, never prints passwords. Run this FIRST to learn each profile's host, user, "
         "`remote_path` (`(default)` means spyro.toml did not set it), sudo and forwarded ports. "
         "Never guess remote paths. `--json` for scripting."
     ),
-    "ps": "Uses a plain `ssh` (no keychain password injection): needs key/agent auth or a live ControlMaster.",
+    "ps": "Lists remote processes; `--grep` filters (the grep itself is not listed). Works with key auth or a stored password.",
     "redis": "`redis-cli` wrappers: `ping`, `info [-s section]`, `stats`, and `cli <args>` for anything else (that one can write; be careful with FLUSHALL etc.).",
     "run": (
         "Runs the command string as-is as the SSH user. Starts in the SSH HOME; pass `-C` to start in "
         "`remote_path` (Capistrano `current/` aware): without `-C`, relative paths and `php artisan` miss the app. "
         "spyro never adds `sudo`; write it yourself. On a `sudo = true` profile, an actual sudo command gets "
-        "a tty and sudo-password handling. The remote exit status is spyro's; `--all` runs "
+        "a tty and sudo-password handling; on a `su = true` profile (no sudo on the server) the whole command "
+        "then runs in a root shell via `su`, still written as `sudo <cmd>`. The remote exit status is spyro's; `--all` runs "
         "every profile (including production) and exits with the first failure, so prefer `-p`. "
         "Default timeout 60s (`--timeout`). Anything installed remotely works: php, python3, docker, node."
     ),
@@ -104,15 +111,30 @@ NOTES: dict[str, str] = {
         "`status/start/stop/restart/tail` for supervisord programs (e.g. `horizon`). "
         "Needs a `sudo = true` profile; a plain app user gets exit 1 ('does not have sudo access')."
     ),
-    "sync": "Uploads pinned directories (`spyro pin`) when files change; `--dry-run` first. Secrets/caches are excluded by framework rules.",
+    "sync": (
+        "Uploads pinned directories (`spyro pin`) when files change; `--dry-run` first. Secrets/caches are excluded by "
+        "framework rules. By default it only uploads files that change while it is running and never deletes: `--initial` first "
+        "uploads every non-excluded file, `--delete` also removes the remote file when one is deleted locally "
+        "(files only, never excluded ones). It writes as "
+        "the SSH user, with no sudo: the remote directory must be writable by that user. Missing remote folders are created."
+    ),
     "tinker": (
-        "`php artisan tinker`: interactive (needs a tty), `-e` one expression via PsySH, `-f` feeds a file. "
+        "`php artisan tinker`: interactive (needs a tty), `-e` one expression via PsySH, `-f` runs a file "
+        "(a file starting with `<?php` is required as a script; bare lines are fed to PsySH). `--timeout` raises the 120s limit. "
         "For scripted one-shots prefer `spyro eval` (reliable quoting, `--json`)."
     ),
-    "unpin": "Removes a pinned directory from sync. Local only.",
+    "unpin": "Removes a pinned directory from sync. Local only. Errors if that directory is not pinned for that profile (`spyro pins`).",
     "up": "Starts tunnels for the given profile (or EVERY profile with `forwarded_ports` when omitted). Always pass the profile.",
     "update": "Self-update from GitHub tags; `--check` only reports. Needs `git` and `uv` on PATH.",
-    "wp": "WP-CLI wrapper for `wordpress = true` profiles; runs in `remote_path` with the same sudo rules as `artisan`.",
+    "wp": (
+        "WP-CLI wrapper for `wordpress = true` profiles; works like `artisan`: runs in `remote_path`, same sudo rules, "
+        "`-p` optional with one profile, `--timeout`. WP-CLI flags pass through as written "
+        "(`spyro wp plugin list --status=active -p staging`). If WP-CLI is missing on the server spyro installs it "
+        "(`/usr/local/bin/wp` with sudo, else `~/.local/bin/wp`); that needs curl or wget and internet on the server, "
+        "otherwise set `wp_cli_path`. WP-CLI refuses to run as root, so a `sudo = true` "
+        "profile needs `sudo_user` (the site owner, e.g. `www-data`), `--no-escalate`, or an explicit `--allow-root`. "
+        "`wp shell` is interactive and will time out: use `spyro ssh`."
+    ),
 }
 
 OVERVIEW_RULES = """\
@@ -120,8 +142,8 @@ OVERVIEW_RULES = """\
 
 1. **Read before acting.** Run `spyro profiles` (local, safe) to learn each profile's host, user and
    `remote_path`. Never guess remote paths; never assume `-C`/`remote_path` when `profiles` shows `(default)`.
-2. **Name the profile on remote commands** with `-p <name>` (`up`/`down`/`logs supervisor` take it as an
-   argument; `artisan`/`ssh`/`ps` fall back to `[defaults].profile` or the sole profile). Local commands
+2. **Name the profile on remote commands** with `-p <name>` (`up`/`down`/`logs tunnel` take it as an
+   argument; without `-p`, single-profile commands fall back to `[defaults].profile` or the sole profile). Local commands
    (`profiles`, `status`, `init`, `install`, `update`, `pins`, `config`, `auth`) need no profile; `profiles -p`
    is an optional output filter. Avoid `--all`,
    bare `up`/`down`, and `doctor`: they touch every profile in `spyro.toml`, including production. Never run
@@ -134,7 +156,8 @@ OVERVIEW_RULES = """\
    → `spyro eval`; Artisan → `spyro artisan`; local PHP file → `spyro script`; interactive → `spyro ssh`/`tinker`.
 5. **Exit codes are real.** A failing remote command fails spyro; check it instead of parsing output.
 6. **`sudo` is never added for you** by `run`; app commands (`artisan`, `eval`, `script`, `wp`, `tinker`)
-   escalate only on `sudo = true` profiles (`--no-escalate` disables).
+   escalate only on `sudo = true` profiles (`--no-escalate` disables). A `su = true` profile escalates
+   with `su` and a separate root password (`spyro auth set -p <profile> --su`); commands are written the same.
 """
 
 

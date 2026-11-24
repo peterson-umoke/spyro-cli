@@ -11,7 +11,7 @@ Securely copy files with auto-sudo escalation.
 
 ## Before you run it
 
-Remote side: `:relative` resolves against the profile's `remote_path`; `/abs` and `~/x` are used as given (no colon). `--home` resolves relative paths against the SSH home instead. Use `-r` for directories, `--parents` to create missing remote dirs. On `sudo = true` profiles, local-to-remote copies check destination permissions; protected targets are staged and installed with root sudo after a three-second Ctrl-C window. Existing destination ownership and mode are retained; new files are root-owned. Prefer `-p <profile>` over `--all`; `--all` also hits production profiles.
+Remote side: `:relative` resolves against the profile's `remote_path`; `/abs` and `~/x` are used as given (no colon). `--home` resolves relative paths against the SSH home instead. Use `-r` for directories, `--mkdir` to create a missing destination folder (`--parents` re-creates the source's relative path under DEST instead). On `sudo = true` profiles, local-to-remote copies check destination permissions; protected targets are staged and installed with root sudo after a three-second Ctrl-C window. Existing destination ownership and mode are retained; new files are root-owned. Prefer `-p <profile>` over `--all`; `--all` also hits production profiles.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -39,12 +39,14 @@ Usage: spyro cp [OPTIONS] SRC DEST
     spyro cp .env :.env -p staging --home        # ~/.env
     spyro cp file.txt /remote/ -p staging        # absolute: unchanged
     spyro cp file.txt :sub/ --all
+    spyro cp app.conf /etc/myapp/conf.d/ --mkdir -p staging   # folder is created
     spyro cp file.txt /remote/ --all --except ird-server,production
     spyro cp file.txt /remote/ -p staging -p dev
 
 Options:
   -r, --recursive     Copy directories
-  --parents           Create parent directories on remote
+  --mkdir             Create the remote destination folder if it does not exist
+  --parents           Re-create SRC's relative path under DEST (like `cp --parents`)
   -p, --profile TEXT  Profile name (can be used multiple times)
   --all               Copy to all profiles
   --except TEXT       Comma-separated profiles to exclude when using --all

@@ -11,7 +11,7 @@ Run Laravel Tinker interactively or with --eval/--file.
 
 ## Before you run it
 
-`php artisan tinker`: interactive (needs a tty), `-e` one expression via PsySH, `-f` feeds a file. For scripted one-shots prefer `spyro eval` (reliable quoting, `--json`).
+`php artisan tinker`: interactive (needs a tty), `-e` one expression via PsySH, `-f` runs a file (a file starting with `<?php` is required as a script; bare lines are fed to PsySH). `--timeout` raises the 120s limit. For scripted one-shots prefer `spyro eval` (reliable quoting, `--json`).
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -31,7 +31,8 @@ Usage: spyro tinker [OPTIONS]
 Options:
   -e, --eval TEXT     Evaluate expression and exit
   -f, --file PATH     Run PHP file
-  --no-escalate       Don't use sudo
-  -p, --profile TEXT  Profile name  [required]
+  --no-escalate       Run as the SSH user (no sudo or su)
+  --timeout FLOAT     Command timeout in seconds (default: 120)
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
