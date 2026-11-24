@@ -42,7 +42,7 @@ Usage: spyro nginx restart [OPTIONS]
   Restart Nginx.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --timeout FLOAT     Timeout in seconds (default: 30)
   --help              Show this message and exit.
 ```
@@ -55,7 +55,7 @@ Usage: spyro nginx sites [OPTIONS]
   List enabled Nginx site configs.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -67,7 +67,7 @@ Usage: spyro nginx status [OPTIONS]
   Show Nginx server status.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -79,6 +79,6 @@ Usage: spyro nginx version [OPTIONS]
   Show Nginx version.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

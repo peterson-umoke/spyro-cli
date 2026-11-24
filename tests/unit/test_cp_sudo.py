@@ -15,6 +15,7 @@ def _profile(*, sudo: bool = True) -> MagicMock:
         port=22,
         key="",
         sudo=sudo,
+        su=False,
         remote_path="/srv/app",
     )
 
@@ -122,3 +123,28 @@ def test_run_enables_sudo_prompt_only_for_explicit_sudo_command() -> None:
     assert explicit.exit_code == 0, explicit.output
     assert run_remote.call_args_list[0].kwargs["escalate"] is False
     assert run_remote.call_args_list[1].kwargs["escalate"] is True
+
+
+def test_cp_mkdir_creates_the_destination_folder_as_the_ssh_user(tmp_path: Path) -> None:
+    # A missing folder in a writable place is not "protected": no sudo, just mkdir -p.
+    source = tmp_path / "config.php"
+    source.write_text("content")
+    config = MagicMock()
+    config.get_profile.return_value = _profile()
+    runner = MagicMock()
+    runner.run.side_effect = [0, 0, 0]  # permission check, mkdir, scp
+
+    with (
+        patch("spyro.cli.commands.load_config", return_value=config),
+        patch("spyro.cli.commands.PTYRunner", return_value=runner),
+        patch("spyro.cli.commands.time.sleep") as delay,
+        patch("spyro.utils.keychain.prompt_for_credential", return_value="secret"),
+    ):
+        result = CliRunner().invoke(cmd_cp, [str(source), "/srv/app/new/dir/", "--mkdir", "-p", "staging"])
+
+    assert result.exit_code == 0, result.output
+    commands = [call.args[0] for call in runner.run.call_args_list]
+    assert "while [ ! -e \"$parent\" ]" in commands[0][-1]  # judged by the nearest existing folder
+    assert commands[1][-1] == "mkdir -p /srv/app/new/dir"
+    assert commands[2][0] == "scp"
+    delay.assert_not_called()

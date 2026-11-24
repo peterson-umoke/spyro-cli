@@ -57,7 +57,7 @@ Options:
   -z, --gzip          Compress with gzip
   -d, --no-data       Schema only, no data
   -w, --where TEXT    WHERE clause for row filter
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -70,7 +70,7 @@ Usage: spyro db list-databases [OPTIONS]
 
 Options:
   --port INTEGER      Override local port
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -83,7 +83,7 @@ Usage: spyro db ping [OPTIONS]
 
 Options:
   --port INTEGER      Override local port
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -96,7 +96,7 @@ Usage: spyro db query [OPTIONS] QUERY
 
 Options:
   --port INTEGER      Override local port
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -109,7 +109,7 @@ Usage: spyro db shell [OPTIONS]
 
 Options:
   --no-tunnel         Skip tunnel management
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -122,6 +122,6 @@ Usage: spyro db tunnel [OPTIONS]
 
 Options:
   --port INTEGER      Override local port
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

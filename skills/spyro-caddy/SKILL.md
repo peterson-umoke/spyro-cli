@@ -41,7 +41,7 @@ Usage: spyro caddy restart [OPTIONS]
   Restart Caddy.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --timeout FLOAT     Timeout in seconds (default: 30)
   --help              Show this message and exit.
 ```
@@ -54,7 +54,7 @@ Usage: spyro caddy status [OPTIONS]
   Show Caddy server status.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -66,6 +66,6 @@ Usage: spyro caddy version [OPTIONS]
   Show Caddy version.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

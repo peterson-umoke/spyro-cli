@@ -11,7 +11,7 @@ Remove a pinned sync directory.
 
 ## Before you run it
 
-Removes a pinned directory from sync. Local only.
+Removes a pinned directory from sync. Local only. Errors if that directory is not pinned for that profile (`spyro pins`).
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -25,6 +25,6 @@ Usage: spyro unpin [OPTIONS] LOCAL_PATH
   Remove a pinned sync directory.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

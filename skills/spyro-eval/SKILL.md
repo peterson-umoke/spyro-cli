@@ -43,7 +43,8 @@ Usage: spyro eval [OPTIONS] EXPRESSION
 Options:
   --json              Output as JSON
   --no-aliases        Skip PsySH-style short aliases (require full namespaces)
-  --no-escalate       Don't use sudo
-  -p, --profile TEXT  Profile name  [required]
+  --no-escalate       Run as the SSH user (no sudo or su)
+  --timeout FLOAT     Command timeout in seconds (default: 120)
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```

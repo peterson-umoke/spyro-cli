@@ -199,6 +199,7 @@ artisan = true                   # Enable Laravel artisan commands
 wordpress = false                # Enable WordPress/WP-CLI commands
 sudo = true                      # Allow sudo when needed
 sudo_user = "www-data"           # Run artisan/tinker/wp as this user (default: root)
+# su = true                      # No sudo on the server: become root with `su` and the root password
 forwarded_ports = [3306, 6379]   # Remote ports to tunnel to localhost
 env_files = [".env"]             # Remote env files to scan for DB credentials
 ```
@@ -217,6 +218,7 @@ env_files = [".env"]             # Remote env files to scan for DB credentials
 | `wordpress` | bool | `false` | Enable `spyro wp` commands |
 | `sudo` | bool | `false` | Enable sudo escalation for commands |
 | `sudo_user` | string | `""` | Run app commands (`artisan`, `tinker`, `eval`, `script`, `wp`) as this user via `sudo -u`. Default is root, which leaves root-owned files in `storage/` that the web server can no longer write |
+| `su` | bool | `false` | For servers where root cannot log in over SSH and there is no sudo: escalate with `su` and the root password instead. Implies `sudo = true`. See [Servers without sudo](#servers-without-sudo-su--true) |
 | `env_files` | list[str] | `[".env"]` | Remote env files to scan for DB credentials |
 
 ### Database configuration
@@ -304,6 +306,12 @@ spyro run "uptime" --all             # read-only commands can fan out to every p
 ```
 
 ### WordPress profile
+
+`spyro wp` works like `spyro artisan`: everything after `wp` goes to WP-CLI as written (`spyro wp plugin list --status=active -p wordpress`), `-p` is optional when there is one profile, and `--timeout` raises the 60s limit.
+
+WP-CLI does not have to be installed on the server. Spyro looks in `/usr/local/bin/wp`, `~/.local/bin/wp`, then the `PATH`; if it is not there it downloads the official build and installs it, to `/usr/local/bin/wp` when the profile uses sudo (so `sudo_user` can run it) or to `~/.local/bin/wp` when it does not (shared hosting, no root needed). Later runs find it there. The server needs `curl` or `wget` and internet access; otherwise install it yourself and set `wp_cli_path`. On hosting panels where `php` is not on the SSH `PATH` (cPanel `ea-php`, CloudLinux/hPanel `alt-php`, LiteSpeed/CyberPanel `lsphp`, Plesk), the newest PHP found in those locations is used.
+
+WP-CLI refuses to run as root. On a `sudo = true` profile set `sudo_user` to the user that owns the site (usually `www-data`), or pass `--no-escalate`, or add `--allow-root` yourself.
 
 ```toml
 [profiles.wordpress]
@@ -729,7 +737,7 @@ spyro cp ./config.php :/var/www/config.php --all
 spyro cp ./config.php :/var/www/config.php --all --except ird-server,production
 ```
 
-`--timeout N` sets the per-profile transfer limit (default 120s). `--parents` works with the `:/remote/path` form. On profiles with `sudo = true`, local-to-remote copies preflight destination permissions. Protected destinations are announced, wait three seconds for Ctrl-C cancellation, then transfer through a temporary path and install with root `sudo`. Overwrites retain the destination owner and mode; newly created files are root-owned. Downloads do not use this escalation path.
+`--timeout N` sets the per-profile transfer limit (default 120s). `--mkdir` creates the destination folder when it does not exist (DEST itself when it ends in `/`, otherwise its parent), with sudo when the location needs it. `--parents` instead re-creates the source's relative path under DEST, and works with the `:/remote/path` form. On profiles with `sudo = true`, local-to-remote copies preflight destination permissions. Protected destinations are announced, wait three seconds for Ctrl-C cancellation, then transfer through a temporary path and install with root `sudo`. Overwrites retain the destination owner and mode; newly created files are root-owned. Downloads do not use this escalation path.
 
 **Path convention:**
 - Local paths: `/path/to/file`
@@ -778,7 +786,7 @@ spyro logs nginx -p staging                # Nginx access log
 spyro logs nginx-error -p staging          # Nginx error log
 spyro logs apache -p staging               # Apache access log
 spyro logs php -p staging                  # PHP-FPM error log
-spyro logs supervisor staging              # Spyro's own tunnel log for a profile
+spyro logs tunnel staging                  # Spyro's own tunnel log for a profile
 ```
 
 ### Diagnostics
@@ -882,7 +890,7 @@ alias sdoc='spyro doctor'
 
 ```bash
 spyro status                    # What's running?
-spyro logs supervisor staging    # Tunnel log
+spyro logs tunnel staging        # Tunnel log
 spyro doctor                    # Full audit
 ssh deploy@staging.example.com  # Raw SSH fallback
 ```
@@ -921,6 +929,28 @@ If a profile has `sudo = false` and you run a command that needs sudo:
 ```
 
 Clear error, no cryptic failures.
+
+### Servers without sudo (`su = true`)
+
+Some servers refuse root logins over SSH and have no sudo: you log in as a normal user, then `su` to root with the root password. Describe that with `su = true`:
+
+```toml
+[profiles.legacy]
+host = "legacy.example.com"
+user = "peter"
+su = true
+```
+
+```bash
+spyro auth set -p legacy         # peter's SSH password (skip if you use a key)
+spyro auth set -p legacy --su    # the root password, stored separately
+spyro run "sudo systemctl restart nginx" -p legacy
+spyro nginx restart -p legacy
+```
+
+Everything that escalates on a `sudo = true` profile works the same way here (`artisan`, `eval`, `wp`, the service groups, protected `cp` destinations, `env set`). The difference is how root is reached: Spyro logs in as the SSH user, runs the **whole command** in a root shell opened with `su`, and answers su's prompt with the root password. Inside that shell `sudo <cmd>` just runs `<cmd>`, so sudo does not need to be installed; keep writing `sudo` in `spyro run` to say "this needs root". `sudo_user` still works and switches user with `runuser`. `spyro ssh` is unchanged: it opens the SSH user's shell, type `su -` yourself.
+
+The root password never falls back to the SSH password. Without a keychain, set `SPYRO_SU_PASSWORD_<PROFILE>` or `SPYRO_SU_PASSWORD`. Root's shell must be POSIX (`sh`, `bash`, `zsh`).
 
 ### Config file location
 
@@ -989,6 +1019,8 @@ The PTY engine (`src/spyro/core/pty_engine.py`) spawns native `ssh`/`scp` in a p
 | npm | `npm` binary, version |
 
 ### Smart Sync
+
+`spyro sync` uploads a pinned directory's files as they change, and creates missing remote folders as it goes. `spyro pin ... --mkdir` creates the pinned remote folder straight away, so a wrong path or a permission problem shows up when you pin. By default sync only uploads files that change while it is running and never deletes anything: `spyro sync --initial` first uploads every file that is not excluded, and `--delete` also removes the remote file when you delete one locally (single files only, never excluded ones such as `.env`). Sync writes as the SSH user (no sudo).
 
 The sync system (`spyro pin` / `spyro sync`) excludes sensitive files by default:
 

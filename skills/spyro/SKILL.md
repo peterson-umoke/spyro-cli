@@ -13,8 +13,8 @@ SSH tunneling and remote-command CLI driven by a project `spyro.toml` of profile
 
 1. **Read before acting.** Run `spyro profiles` (local, safe) to learn each profile's host, user and
    `remote_path`. Never guess remote paths; never assume `-C`/`remote_path` when `profiles` shows `(default)`.
-2. **Name the profile on remote commands** with `-p <name>` (`up`/`down`/`logs supervisor` take it as an
-   argument; `artisan`/`ssh`/`ps` fall back to `[defaults].profile` or the sole profile). Local commands
+2. **Name the profile on remote commands** with `-p <name>` (`up`/`down`/`logs tunnel` take it as an
+   argument; without `-p`, single-profile commands fall back to `[defaults].profile` or the sole profile). Local commands
    (`profiles`, `status`, `init`, `install`, `update`, `pins`, `config`, `auth`) need no profile; `profiles -p`
    is an optional output filter. Avoid `--all`,
    bare `up`/`down`, and `doctor`: they touch every profile in `spyro.toml`, including production. Never run
@@ -27,7 +27,8 @@ SSH tunneling and remote-command CLI driven by a project `spyro.toml` of profile
    → `spyro eval`; Artisan → `spyro artisan`; local PHP file → `spyro script`; interactive → `spyro ssh`/`tinker`.
 5. **Exit codes are real.** A failing remote command fails spyro; check it instead of parsing output.
 6. **`sudo` is never added for you** by `run`; app commands (`artisan`, `eval`, `script`, `wp`, `tinker`)
-   escalate only on `sudo = true` profiles (`--no-escalate` disables).
+   escalate only on `sudo = true` profiles (`--no-escalate` disables). A `su = true` profile escalates
+   with `su` and a separate root password (`spyro auth set -p <profile> --su`); commands are written the same.
 
 ## Commands
 

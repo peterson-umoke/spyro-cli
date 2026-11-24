@@ -44,7 +44,7 @@ from ..core.sync import (
     detect_framework, should_exclude, filter_files,
     FRAMEWORK_EXCLUSIONS, SENSITIVE_PATTERNS,
 )
-from ..core.pty_engine import PTYRunner, build_scp_args, build_ssh_args
+from ..core.pty_engine import PTYRunner, build_scp_args, build_ssh_args, su_command
 from ..supervisor.state import (
     all_tunnels,
     get_tunnel,
@@ -94,6 +94,31 @@ def _exit_with(ec: int) -> None:
         raise SystemExit(ec)
 
 
+def _profile_option(f: Callable) -> Callable:
+    """``-p/--profile`` for single-profile commands: optional when spyro.toml has one
+    profile or sets ``[defaults] profile`` (the rule ``artisan`` always had)."""
+    return click.option(
+        "--profile", "-p", default=None,
+        callback=lambda ctx, param, value: value or resolve_profile(None),
+        help="Profile name (optional with one profile or a [defaults] profile)",
+    )(f)
+
+
+def _open_master(p: "ProfileConfig", profile: str) -> None:
+    """Log in once with the stored password, so the plain ``ssh`` calls that follow
+    (``doctor``, ``ps``, service and WordPress detection: they cannot answer a
+    password prompt) reuse that connection for ControlPersist seconds.
+
+    Nothing stored means key or agent auth: nothing to do, and never a prompt.
+    """
+    from ..utils.keychain import get_credential
+
+    password = get_credential(profile, p.user)
+    if password:
+        args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+        PTYRunner().run(args + ["-o", "ConnectTimeout=5", "true"], password=password, timeout=15)
+
+
 def _sudo_prefix(p: "ProfileConfig", no_escalate: bool = False) -> str:
     """``sudo `` (or ``sudo -u <sudo_user> ``) for app commands, ``""`` when not escalating.
 
@@ -103,6 +128,21 @@ def _sudo_prefix(p: "ProfileConfig", no_escalate: bool = False) -> str:
     if no_escalate or not p.sudo:
         return ""
     return f"sudo -u {safe_quote(p.sudo_user)} " if p.sudo_user else "sudo "
+
+
+def _escalated(p: "ProfileConfig", profile: str, cmd: str) -> tuple[str, dict[str, object]]:
+    """The remote command and PTYRunner credential kwargs for a *cmd* that uses sudo.
+
+    sudo profiles: *cmd* as written; sudo's prompt gets the SSH user's password.
+    ``su = true`` profiles (no root login, no sudo): the whole *cmd* runs in a
+    root shell opened with ``su``, whose prompt gets the separately stored root
+    password. Every caller needs a remote tty (``ssh -t``).
+    """
+    from ..utils.keychain import SU_ACCOUNT, prompt_for_credential
+
+    if p.su:
+        return su_command(cmd), {"sudo_password": prompt_for_credential(profile, SU_ACCOUNT), "su": True}
+    return cmd, {"sudo_password": prompt_for_credential(profile, p.user)}
 
 
 def _tunnel_for(config: SpyroConfig, profile_name: str):
@@ -408,7 +448,7 @@ def _detect_wordpress(ssh_args: list[str], remote_path: str) -> dict[str, bool]:
         ("wp_config", f"test -f {remote_path}/wp-config.php"),
         ("wp_content", f"test -d {remote_path}/wp-content"),
         ("wp_includes", f"test -d {remote_path}/wp-includes"),
-        ("wp_cli", "which wp || test -f /usr/local/bin/wp || test -f /usr/bin/wp"),
+        ("wp_cli", 'which wp || test -f /usr/local/bin/wp || test -f /usr/bin/wp || test -f "$HOME/.local/bin/wp"'),
     ]
 
     for key, check_cmd in checks:
@@ -420,26 +460,6 @@ def _detect_wordpress(ssh_args: list[str], remote_path: str) -> dict[str, bool]:
             pass
 
     return indicators
-
-
-def _find_wp_cli(ssh_args: list[str], wp_cli_path: str = "") -> str:
-    """Find WP-CLI on the remote server."""
-    if wp_cli_path:
-        return wp_cli_path
-
-    candidates = ["wp", "/usr/local/bin/wp", "/usr/bin/wp", "~/bin/wp", "wp-cli.phar"]
-
-    for candidate in candidates:
-        cmd = ssh_args + [f"which {candidate} 2>/dev/null || test -x {candidate}"]
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=5)
-            if result.returncode == 0:
-                output = result.stdout.decode().strip()
-                return output if output else candidate
-        except Exception:
-            pass
-
-    return "wp"
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +489,7 @@ def cmd_doctor(json_output: bool) -> None:
         console.print("[bold]1. SSH connectivity[/bold]")
     config = load_config()
     for name, profile in config.profiles.items():
+        _open_master(profile, name)
         ssh_args = build_ssh_args(
             host=profile.host,
             user=profile.user,
@@ -508,6 +529,7 @@ def cmd_doctor(json_output: bool) -> None:
     if not json_output:
         console.print("\n[bold]2. Remote path validity[/bold]")
     for name, profile in config.profiles.items():
+        _open_master(profile, name)
         ssh_args = build_ssh_args(
             host=profile.host,
             user=profile.user,
@@ -543,6 +565,7 @@ def cmd_doctor(json_output: bool) -> None:
             console.print("\n[bold]   Deployment structure[/bold]")
         for name in artisan_names:
             p = config.profiles[name]
+            _open_master(p, name)
             ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
             # Check if remote_path/current is a symlink
             check_cmd = f"test -L {safe_quote(p.remote_path)}/current"
@@ -582,17 +605,16 @@ def cmd_doctor(json_output: bool) -> None:
     for name, profile in config.profiles.items():
         if not profile.artisan:
             continue
+        _open_master(profile, name)
         ssh_args = build_ssh_args(
             host=profile.host,
             user=profile.user,
             port=profile.port,
             key=profile.key,
         )
-        check_cmd = (
-            f"cd {safe_quote(profile.remote_path)}"
-            f" && ([ -L current ] && cd current)"
-            f" && test -f artisan"
-        )
+        # Found on a real server: the old check required a Capistrano `current`
+        # symlink, so a plain Laravel directory was reported as "Artisan not found".
+        check_cmd = f"{_capistrano_cd(profile.remote_path)} && test -f artisan"
         ssh_args.extend([check_cmd])
 
         try:
@@ -622,6 +644,7 @@ def cmd_doctor(json_output: bool) -> None:
             console.print("\n[bold]5. WordPress detection[/bold]")
         for name in wp_profiles:
             profile = config.profiles[name]
+            _open_master(profile, name)
             ssh_args = build_ssh_args(
                 host=profile.host,
                 user=profile.user,
@@ -651,6 +674,7 @@ def cmd_doctor(json_output: bool) -> None:
         if not json_output:
             console.print(f"\n  [cyan]{name}[/cyan] ({profile.host})")
         try:
+            _open_master(profile, name)
             services = detect_all_services(
                 host=profile.host,
                 user=profile.user,
@@ -697,7 +721,7 @@ def cmd_doctor(json_output: bool) -> None:
 
 @click.command()
 @click.option("--dest", default=".env.remote", help="Output file path")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def cmd_pull_env(dest: str, profile: str) -> None:
     """Pull remote environment config to a local file."""
     config = load_config()
@@ -783,7 +807,7 @@ def cmd_run(run_all: bool, profile: tuple[str, ...], timeout: float | None, chdi
 
 @click.command(context_settings={"ignore_unknown_options": True})
 @click.argument("cmd_args", nargs=-1)
-@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
+@click.option("--no-escalate", is_flag=True, help="Run as the SSH user (no sudo or su)")
 @click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 60)")
 @click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
 def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | None, profile: str | None) -> None:
@@ -800,7 +824,9 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | N
 
     artisan_cmd = (
         f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}"
-        f"php artisan {' '.join(safe_quote(a) for a in cmd_args)}"
+        # Found on a real server: a mistyped command made Laravel ask "Did you
+        # mean...?" on the remote tty and spyro sat there until the timeout.
+        f"php artisan --no-interaction {' '.join(safe_quote(a) for a in cmd_args)}"
     )
     _run_svc_cmd(
         profile, artisan_cmd, timeout=60.0, cli_timeout=timeout,
@@ -816,15 +842,21 @@ def cmd_artisan(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | N
 @click.command()
 @click.argument("local_path")
 @click.argument("remote_path")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--framework", "-f", default="auto", help="Framework: auto, laravel, wordpress, node, python, or empty")
 @click.option("--exclude", "-e", multiple=True, help="Additional glob patterns to exclude")
-def cmd_pin(local_path: str, remote_path: str, profile: str, framework: str, exclude: tuple[str, ...]) -> None:
-    """Pin a local directory for automatic sync to remote server."""
+@click.option("--mkdir", is_flag=True, help="Create the remote folder now if it does not exist")
+def cmd_pin(local_path: str, remote_path: str, profile: str, framework: str, exclude: tuple[str, ...], mkdir: bool) -> None:
+    """Pin a local directory for automatic sync to remote server.
+
+    `spyro sync` creates missing remote folders as files are uploaded; --mkdir
+    creates the pinned folder straight away, so a wrong path or a permission
+    problem shows up now instead of on the first save.
+    """
     local = Path(local_path).resolve()
-    if not local.exists():
-        console.print(f"[red]Local path does not exist: {local}[/red]")
-        return
+    if not local.is_dir():
+        raise click.ClickException(f"Local path is not a directory: {local}")
+    load_config().get_profile(profile)  # a pin for a misspelt profile would never sync
 
     detected = ""
     if framework == "auto":
@@ -847,6 +879,9 @@ def cmd_pin(local_path: str, remote_path: str, profile: str, framework: str, exc
     console.print(f"  Excluded files: {len(exclude_files)} patterns")
     console.print(f"  Excluded dirs: {len(exclude_dirs)} patterns")
 
+    if mkdir:
+        # Fails (and saves no pin) when the SSH user may not create it.
+        _run_svc_cmd(profile, f"mkdir -p {safe_quote(remote_path)}", timeout=15.0, escalate=False)
     add_pin(pin)
     console.print("[green]Pin saved. Use 'spyro sync' to start watching.[/green]")
 
@@ -858,10 +893,12 @@ def cmd_pin(local_path: str, remote_path: str, profile: str, framework: str, exc
 
 @click.command()
 @click.argument("local_path")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def cmd_unpin(local_path: str, profile: str) -> None:
     """Remove a pinned sync directory."""
     local = str(Path(local_path).resolve())
+    if not any(pin.local_path == local and pin.profile == profile for pin in load_pins()):
+        raise click.ClickException(f"No pin for {local} on profile '{profile}'. See: spyro pins")
     remaining = remove_pin(local, profile)
     console.print(f"[green]Removed pin for {local} ({profile})[/green]")
     if remaining:
@@ -920,8 +957,13 @@ def _run_sync_watch(
     pins: list[SyncPin],
     dry_run: bool = False,
     stop: "threading.Event | None" = None,
+    initial: bool = False,
+    delete: bool = False,
 ) -> None:
     """Watch directory pins with watchdog and upload changed files.
+
+    *initial* first uploads every file that is not excluded; *delete* also
+    removes the remote copy of a file that is deleted locally.
 
     Watchdog calls the handler from its own thread, which must not fork PTYs or
     print: it only queues paths. This (main) thread drains the queue.
@@ -934,7 +976,7 @@ def _run_sync_watch(
         from watchdog.observers import Observer
     except ImportError:
         console.print("[red]watchdog not installed. Run: pip install watchdog[/red]")
-        return
+        raise SystemExit(1)
 
     config = load_config()
     p = config.get_profile(profile)
@@ -981,6 +1023,12 @@ def _run_sync_watch(
 
         def on_moved(self, event: object) -> None:
             self._queue(event.dest_path, event.is_directory)  # type: ignore[attr-defined]
+            if delete:  # the old name is gone
+                self._queue(event.src_path, event.is_directory)  # type: ignore[attr-defined]
+
+        def on_deleted(self, event: object) -> None:
+            if delete:
+                self._queue(event.src_path, event.is_directory)  # type: ignore[attr-defined]
 
     observer = Observer()
     for pin in pins:
@@ -1004,19 +1052,33 @@ def _run_sync_watch(
             if dry_run:
                 console.print(Text(f"  Skipped (excluded): {rel}", style="dim"))
             return
-        if not src.is_file():  # deleted or replaced before we got to it
+        remote_file = f"{pin.remote_path.rstrip('/')}/{rel.as_posix()}"
+        if not src.exists() and not src.is_symlink():
+            # Gone locally. Excluded files never get here, so a remote .env is safe.
+            if not delete:
+                return
+            if dry_run:
+                console.print(Text(f"  Would delete: {rel}", style="yellow"))
+                return
+            rm = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+            rm.append(f"rm -f -- {safe_quote(remote_file)}")  # files only: never a directory tree
+            ok = runner.run(rm, password=ssh_pw, timeout=15.0) == 0
+            console.print(Text(f"  {'Deleted' if ok else 'Failed to delete'}: {rel}", style="yellow" if ok else "red"))
+            return
+        if not src.is_file():  # a directory, or replaced before we got to it
             return
         if dry_run:
             console.print(Text(f"  Would sync: {rel}", style="green"))
             return
 
-        remote_file = f"{pin.remote_path.rstrip('/')}/{rel.as_posix()}"
         remote_dir = posixpath.dirname(remote_file)
         if remote_dir not in made_dirs:
             mkdir = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
             mkdir.append(f"mkdir -p {safe_quote(remote_dir)}")
-            if runner.run(mkdir, password=ssh_pw, timeout=15.0) != 0:
-                console.print(Text(f"  Failed: {rel} (cannot create {remote_dir})", style="red"))
+            why: list[str] = []
+            if runner.run(mkdir, password=ssh_pw, on_output=why.append, timeout=15.0) != 0:
+                reason = " ".join(w.strip() for w in why if w.strip())
+                console.print(Text(f"  Failed: {rel} (cannot create {remote_dir}{': ' + reason if reason else ''})", style="red"))
                 return
             made_dirs.add(remote_dir)
 
@@ -1030,7 +1092,22 @@ def _run_sync_watch(
         else:
             console.print(Text(f"  Failed: {rel} (exit code {ec})", style="red"))
 
-    observer.start()
+    observer.start()  # before the initial pass, so a save made during it is not missed
+    if initial:
+        # ponytail: one scp per file; fine for a theme or an app's source, slow for
+        # thousands of files (use `spyro cp -r` for those, or add rsync here).
+        console.print("[cyan]Uploading existing files...[/cyan]")
+        for pin in pins:
+            base = Path(pin.local_path)
+            exclude_files, exclude_dirs = pin.get_all_excludes()
+            for root, dirs, files in os.walk(base):
+                # prune excluded directories instead of walking node_modules/, vendor/, .git/
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if not should_exclude(Path(root, d, "_"), base, set(), exclude_dirs, pin.include_patterns)
+                )
+                for name in sorted(files):
+                    upload(Path(root, name), pin)
     console.print("\n[cyan]Syncing... (Ctrl+C to stop)[/cyan]\n")
     # Trailing-edge debounce: a file is uploaded once it has been quiet for
     # SETTLE seconds, so a formatter rewriting it right after a save is picked
@@ -1056,25 +1133,95 @@ def _run_sync_watch(
 
 
 @click.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--dry-run", is_flag=True, help="Show what would be synced without uploading")
-def cmd_sync(profile: str, dry_run: bool) -> None:
-    """Watch pinned directories and auto-sync to remote server."""
+@click.option("--initial", is_flag=True, help="First upload every file that is not excluded, then watch")
+@click.option("--delete", is_flag=True, help="Also delete the remote file when a file is deleted locally")
+def cmd_sync(profile: str, dry_run: bool, initial: bool, delete: bool) -> None:
+    """Watch pinned directories and auto-sync to remote server.
+
+    By default only files that change while it runs are uploaded, and nothing
+    is ever deleted on the server. Excluded files (.env, wp-config.php, ...)
+    are never uploaded or deleted.
+    """
     all_pins = load_pins()
     pins = [pin for pin in all_pins if pin.profile == profile]
-    _run_sync_watch(profile, pins, dry_run=dry_run)
+    _run_sync_watch(profile, pins, dry_run=dry_run, initial=initial, delete=delete)
 
 # ---------------------------------------------------------------------------
 # spyro wp
 # ---------------------------------------------------------------------------
 
 
-@click.command()
+_WP_PHAR_URL = "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"  # the official build
+
+
+def _wp_lookup(system_wide: bool) -> str:
+    """Shell that sets ``"$@"`` to the WP-CLI invocation on the server, installing WP-CLI when missing.
+
+    Runs in the same SSH session as the command (a separate lookup would be a
+    plain ssh that cannot answer a password prompt). The two places spyro
+    installs to are checked first, then PATH (as the SSH user: sudo's
+    secure_path often lacks /usr/local/bin). Unlike artisan, WP-CLI is not part
+    of the project, so a server may well not have it: it is then downloaded and
+    installed to /usr/local/bin/wp (*system_wide*: the profile escalates, and
+    sudo_user must be able to run it) or to ~/.local/bin/wp (no root needed:
+    shared hosting).
+
+    Hosting panels keep PHP out of a non-login shell's PATH (cPanel ea-php,
+    CloudLinux/hPanel alt-php, LiteSpeed/CyberPanel lsphp, Plesk); the newest
+    one found is then used to run WP-CLI explicitly.
+    """
+    install = (
+        'sudo cp "$tmp" /usr/local/bin/wp && sudo chmod 755 /usr/local/bin/wp && wp=/usr/local/bin/wp' if system_wide else
+        'mkdir -p "$HOME/.local/bin" && cp "$tmp" "$HOME/.local/bin/wp" && chmod 755 "$HOME/.local/bin/wp" '
+        '&& wp=$HOME/.local/bin/wp'
+    )
+    # Found on a real server: with sudo_user, a copy in the SSH user's home is
+    # one the site user cannot read ("Could not open input file").
+    skip_home = 'case $c in "$HOME"/*) continue;; esac; ' if system_wide else ""
+    return f"""{{
+wp=; php=$(command -v php); set --
+for c in /usr/local/bin/wp "$HOME/.local/bin/wp" "$(command -v wp)" /usr/bin/wp "$HOME/bin/wp"; do
+  {skip_home}if [ -n "$c" ] && [ -x "$c" ]; then wp=$c; break; fi
+done
+if [ -z "$php" ]; then
+  for c in /usr/local/bin/php /opt/plesk/php/*/bin/php /usr/local/lsws/lsphp*/bin/php /opt/alt/php[0-9]*/usr/bin/php /opt/cpanel/ea-php*/root/usr/bin/php; do
+    if [ -x "$c" ]; then php=$c; fi
+  done
+  if [ -z "$php" ]; then echo "spyro: PHP was not found on this server; WP-CLI needs it."; exit 127; fi
+  set -- "$php"
+fi
+if [ -z "$wp" ]; then
+  echo "spyro: WP-CLI is not installed on this server; installing it..."
+  tmp=$(mktemp) && {{ curl -fsSL -o "$tmp" {_WP_PHAR_URL} || wget -qO "$tmp" {_WP_PHAR_URL}; }} \
+    && "$php" "$tmp" cli version --allow-root >/dev/null && {install}
+  rm -f "$tmp"
+  if [ -n "$wp" ]; then echo "spyro: installed WP-CLI at $wp"; else
+    echo "spyro: could not install WP-CLI (the server needs curl or wget, and internet access). Install it yourself and set wp_cli_path on the profile."
+    exit 127
+  fi
+fi
+set -- "$@" "$wp"
+}}"""
+
+
+@click.command(context_settings={"ignore_unknown_options": True})
 @click.argument("cmd_args", nargs=-1)
-@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
-    """Run WP-CLI commands on the remote host."""
+@click.option("--no-escalate", is_flag=True, help="Run as the SSH user (no sudo or su)")
+@click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 60)")
+@click.option("--profile", "-p", default=None, help="Profile name (auto-detects if only one exists)")
+def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, timeout: float | None, profile: str | None) -> None:
+    """Run WP-CLI commands on the remote host.
+
+    Everything after `wp` is passed to WP-CLI as written, flags included:
+
+      spyro wp plugin list --status=active -p staging
+
+      spyro wp search-replace old.example.com new.example.com --dry-run -p staging
+    """
+    profile = resolve_profile(profile)
+
     if not cmd_args:
         raise click.UsageError("a command is required: spyro wp <command> [--profile NAME]")
 
@@ -1084,16 +1231,22 @@ def cmd_wp(cmd_args: tuple[str, ...], no_escalate: bool, profile: str) -> None:
     if not p.wordpress:
         raise click.ClickException(f"Profile '{profile}' is not configured for WordPress")
 
-    # Find WP-CLI on remote
-    wp_bin = _find_wp_cli(
-        build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key), p.wp_cli_path
-    )
+    if p.sudo and not p.sudo_user and not no_escalate and "--allow-root" not in cmd_args:
+        # WP-CLI refuses to run as root; say how to fix it in spyro terms, before connecting.
+        raise click.ClickException(
+            f"Profile '{profile}' would run WP-CLI as root, which WP-CLI refuses. Set sudo_user to the "
+            f"user that owns the site (e.g. sudo_user = \"www-data\"), pass --no-escalate to run as "
+            f"{p.user}, or add --allow-root to run as root anyway."
+        )
+
+    wp_bin = safe_quote(p.wp_cli_path) if p.wp_cli_path else '"$@"'
+    lookup = "" if p.wp_cli_path else f"{_wp_lookup(p.sudo and not no_escalate)} && "
     wp_cmd = (
-        f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}"
+        f"{_capistrano_cd(p.remote_path)} && {lookup}{_sudo_prefix(p, no_escalate)}"
         f"{wp_bin} {' '.join(safe_quote(a) for a in cmd_args)}"
     )
     _run_svc_cmd(
-        profile, wp_cmd, timeout=60.0,
+        profile, wp_cmd, timeout=60.0, cli_timeout=timeout,
         escalate=p.sudo and not no_escalate, prefix="",
     )
 
@@ -1153,6 +1306,10 @@ def _remote_copy_needs_sudo(
         )
     command += (
         'parent=$(dirname -- "$target"); '
+        # A folder that is merely missing is not "protected": judge by the
+        # nearest ancestor that exists (it is the one mkdir would write to).
+        'while [ ! -e "$parent" ] && [ "$parent" != / ] && [ "$parent" != . ]; '
+        'do parent=$(dirname -- "$parent"); done; '
         'if [ -e "$target" ]; then '
         '[ -w "$target" ] && [ -w "$parent" ]; '
         'else [ -w "$parent" ]; fi; '
@@ -1222,11 +1379,14 @@ def _sudo_copy_to_remote(
         f"{mkdir}sudo cp -R -- {safe_quote(stage_source)} {safe_quote(remote_dest)}; "
         f"result=$?; rm -rf -- {safe_quote(stage)}; exit $result"
     )
+    creds: dict[str, object] = {"sudo_password": sudo_pw}
+    if p.su:
+        install, creds = _escalated(p, profile_name, install)
     sudo_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
     sudo_args.insert(1, "-t")
     sudo_args.append(install)
     return runner.run(
-        sudo_args, password=ssh_pw, sudo_password=sudo_pw,
+        sudo_args, password=ssh_pw, **creds,
         on_output=lambda line: _remote(line, f"  [{profile_name}] "), timeout=timeout,
     )
 
@@ -1239,8 +1399,12 @@ def _copy_to_profile(
     parents: bool = False,
     timeout: float = 120.0,
     from_home: bool = False,
+    mkdir: bool = False,
 ) -> int:
     """Copy files to/from a single profile. Returns exit code.
+
+    *mkdir* creates the destination folder when it is missing (DEST itself when
+    it ends in "/", else its parent); *parents* also re-creates SRC's path under it.
 
     Relative remote paths are relative to the profile's remote_path (when it
     sets one), or to the login user's home directory with from_home.
@@ -1273,11 +1437,11 @@ def _copy_to_profile(
             sudo_pw = prompt_for_credential(profile_name, p.user)
             exit_code = _sudo_copy_to_remote(
                 resolved_src, remote_dest, recursive, profile_name, p,
-                runner, ssh_pw, sudo_pw, timeout, parents=parents,
+                runner, ssh_pw, sudo_pw, timeout, parents=parents or mkdir,
             )
             shown_src, shown_dest = src, remote_dest
         else:
-            if parents:
+            if parents or mkdir:
                 remote_parent = posixpath.dirname(remote_dest)
                 mkdir_ssh = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
                 mkdir_ssh.append(f"mkdir -p {_shell_path(remote_parent)}")
@@ -1329,6 +1493,8 @@ def _copy_to_profile(
             f"raise the limit with --timeout", style="red"))
     else:
         console.print(Text(f"  [{profile_name}] Copy failed (exit code: {exit_code})", style="red"))
+        if src_is_local and not (mkdir or parents):
+            console.print(Text(f"  [{profile_name}] If the remote folder does not exist, add --mkdir to create it", style="yellow"))
     return exit_code
 
 
@@ -1336,7 +1502,8 @@ def _copy_to_profile(
 @click.argument("src")
 @click.argument("dest")
 @click.option("--recursive", "-r", is_flag=True, help="Copy directories")
-@click.option("--parents", is_flag=True, help="Create parent directories on remote")
+@click.option("--mkdir", is_flag=True, help="Create the remote destination folder if it does not exist")
+@click.option("--parents", is_flag=True, help="Re-create SRC's relative path under DEST (like `cp --parents`)")
 @click.option("--profile", "-p", multiple=True, default=None, help="Profile name (can be used multiple times)")
 @click.option("--all", "all_profiles", is_flag=True, help="Copy to all profiles")
 @click.option("--except", "except_profiles", default="", help="Comma-separated profiles to exclude when using --all")
@@ -1345,7 +1512,7 @@ def _copy_to_profile(
     "--home", "--root", "from_home", is_flag=True,
     help="Resolve relative remote paths from your home directory instead of the profile's remote_path",
 )
-def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str, timeout: float | None, from_home: bool) -> None:
+def cmd_cp(src: str, dest: str, recursive: bool, mkdir: bool, parents: bool, profile: tuple[str, ...] | None, all_profiles: bool, except_profiles: str, timeout: float | None, from_home: bool) -> None:
     """Securely copy files with auto-sudo escalation.
 
     Local-to-remote copies on sudo-enabled profiles check destination permissions.
@@ -1365,6 +1532,7 @@ def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[s
       spyro cp .env :.env -p staging --home        # ~/.env
       spyro cp file.txt /remote/ -p staging        # absolute: unchanged
       spyro cp file.txt :sub/ --all
+      spyro cp app.conf /etc/myapp/conf.d/ --mkdir -p staging   # folder is created
       spyro cp file.txt /remote/ --all --except ird-server,production
       spyro cp file.txt /remote/ -p staging -p dev
     """
@@ -1389,18 +1557,18 @@ def cmd_cp(src: str, dest: str, recursive: bool, parents: bool, profile: tuple[s
             targets = [n.strip() for n in env_profile.split(",") if n.strip()]
         else:
             console.print("[red]Specify at least one --profile/-p, --all, or set SPYRO_PROFILE[/red]")
-            return
+            raise SystemExit(1)
 
     if not targets:
         console.print("[red]No profiles matched[/red]")
-        return
+        raise SystemExit(1)
 
     console.print(Text(f"Copying to {len(targets)} profile(s): {', '.join(targets)}\n", style="bold cyan"))
 
     resolved_timeout = _get_timeout(config, timeout, 120.0)
     results: dict[str, int] = {}
     for name in targets:
-        ec = _copy_to_profile(src, dest, recursive, name, parents=parents, timeout=resolved_timeout, from_home=from_home)
+        ec = _copy_to_profile(src, dest, recursive, name, parents=parents, timeout=resolved_timeout, from_home=from_home, mkdir=mkdir)
         results[name] = ec
 
     # Summary
@@ -1436,17 +1604,20 @@ def cmd_auth() -> None:
 
 
 @cmd_auth.command("set")  # not `def set`: that would shadow the builtin for this whole module
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--password", "-w", default="", help="Password (omit to prompt)")
 @click.option("--force", "-f", is_flag=True, help="Overwrite without prompting")
-def set_credential(profile: str, password: str, force: bool) -> None:
+@click.option("--su", "su", is_flag=True, help="Store the root password of a `su = true` profile")
+def set_credential(profile: str, password: str, force: bool, su: bool) -> None:
     """Store a credential in the OS keychain.
 
-    One password per profile — used for both SSH and sudo.
+    One password per profile — used for both SSH and sudo. A `su = true`
+    profile has a second one, the root password that `su` asks for: store it
+    with --su.
     If --password is omitted, you'll be prompted securely (no echo).
     """
     import getpass
-    from ..utils.keychain import store_credential, get_credential
+    from ..utils.keychain import SU_ACCOUNT, store_credential, get_credential
 
     # Load profile to get username
     config = load_config()
@@ -1455,6 +1626,8 @@ def set_credential(profile: str, password: str, force: bool) -> None:
         username = p.user
     except Exception:
         username = profile
+    if su:
+        username = SU_ACCOUNT
 
     # Check existing
     existing = get_credential(profile, username)
@@ -1466,7 +1639,7 @@ def set_credential(profile: str, password: str, force: bool) -> None:
     pw = password or getpass.getpass(f"  password for {username}@{profile}: ")
     if not pw:
         console.print(f"  [red]No password provided, skipping[/red]")
-        return
+        raise SystemExit(1)
 
     if store_credential(profile, username, pw):
         console.print(f"[green]  ✓ Credential stored for {username}@{profile}[/green]")
@@ -1475,10 +1648,11 @@ def set_credential(profile: str, password: str, force: bool) -> None:
 
 
 @cmd_auth.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
-def delete(profile: str) -> None:
+@_profile_option
+@click.option("--su", "su", is_flag=True, help="Remove the root password of a `su = true` profile")
+def delete(profile: str, su: bool) -> None:
     """Remove stored credentials from the OS keychain."""
-    from ..utils.keychain import delete_credential, get_credential
+    from ..utils.keychain import SU_ACCOUNT, delete_credential, get_credential
 
     config = load_config()
     try:
@@ -1486,6 +1660,8 @@ def delete(profile: str) -> None:
         username = p.user
     except Exception:
         username = profile
+    if su:
+        username = SU_ACCOUNT
 
     if get_credential(profile, username):
         if delete_credential(profile, username):
@@ -1506,7 +1682,10 @@ def list_credentials() -> None:
         # Keyring backends don't support listing passwords directly,
         # so scan known patterns from config if available
         config = load_config()
+        from ..utils.keychain import SU_ACCOUNT
+
         profiles = [(name, config.get_profile(name).user) for name in config.profile_names]
+        profiles += [(name, SU_ACCOUNT) for name in config.profile_names if config.get_profile(name).su]
     except Exception:
         profiles = []
 
@@ -1566,19 +1745,23 @@ def _run_svc_cmd(
                 raise SystemExit(1)
             return 1
         escalate = p.sudo
+        # Found on a real Debian server: `spyro nginx version` said "command not
+        # found". Server daemons live in sbin, which a non-login SSH PATH lacks.
+        cmd = 'PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"; ' + cmd
 
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
+    creds: dict[str, object] = {"sudo_password": ""}
     if escalate:
         ssh_args.insert(1, "-t")
+        cmd, creds = _escalated(p, profile, cmd)
     ssh_args.append(cmd)
 
     from ..utils.keychain import prompt_for_credential
 
-    sudo_pw = prompt_for_credential(profile, p.user) if escalate else ""
     ssh_pw = prompt_for_credential(profile, p.user)
 
     ec = PTYRunner().run(
-        ssh_args, password=ssh_pw, sudo_password=sudo_pw,
+        ssh_args, password=ssh_pw, **creds,
         on_output=lambda line: _remote(line, prefix), timeout=resolved,
     )
     if show_exit_code:
@@ -1593,7 +1776,7 @@ def cmd_supervisor() -> None:
 
 
 @cmd_supervisor.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def status(profile: str) -> None:
     """Show Supervisor process status."""
     _run_svc_cmd(profile, "sudo supervisorctl status")
@@ -1601,7 +1784,7 @@ def status(profile: str) -> None:
 
 @cmd_supervisor.command()
 @click.argument("process", default="all")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 60)")
 def restart(profile: str, process: str, timeout: float | None) -> None:
     """Restart Supervisor process(es). Default: all."""
@@ -1610,7 +1793,7 @@ def restart(profile: str, process: str, timeout: float | None) -> None:
 
 @cmd_supervisor.command()
 @click.argument("process")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def start(profile: str, process: str) -> None:
     """Start a Supervisor process."""
     _run_svc_cmd(profile, f"sudo supervisorctl start {safe_quote(process)}")
@@ -1618,7 +1801,7 @@ def start(profile: str, process: str) -> None:
 
 @cmd_supervisor.command()
 @click.argument("process")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def stop(profile: str, process: str) -> None:
     """Stop a Supervisor process."""
     _run_svc_cmd(profile, f"sudo supervisorctl stop {safe_quote(process)}")
@@ -1626,7 +1809,7 @@ def stop(profile: str, process: str) -> None:
 
 @cmd_supervisor.command()
 @click.argument("process")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--lines", "-n", default=50, help="Number of lines to tail")
 def tail(profile: str, process: str, lines: int) -> None:
     """Tail Supervisor process stderr log."""
@@ -1643,14 +1826,14 @@ def cmd_redis() -> None:
 
 
 @cmd_redis.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def ping(profile: str) -> None:
     """Ping Redis server."""
     _run_svc_cmd(profile, "redis-cli ping", timeout=10)
 
 
 @cmd_redis.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--section", "-s", default="", help="Info section (server, stats, keyspace, etc.)")
 def info(profile: str, section: str) -> None:
     """Show Redis server info."""
@@ -1659,14 +1842,14 @@ def info(profile: str, section: str) -> None:
 
 @cmd_redis.command()
 @click.argument("command", nargs=-1, required=True)
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def cli(profile: str, command: tuple[str, ...]) -> None:
     """Run an arbitrary redis-cli command."""
     _run_svc_cmd(profile, f"redis-cli {' '.join(safe_quote(a) for a in command)}", timeout=10)
 
 
 @cmd_redis.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def stats(profile: str) -> None:
     """Show Redis key metrics (connections, commands, keyspace)."""
     _run_svc_cmd(profile, 'redis-cli info stats | grep -E "^(total_connections|total_commands|keyspace_|instantaneous)"', timeout=10)
@@ -1682,7 +1865,7 @@ def cmd_php() -> None:
 
 
 @cmd_php.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def version(profile: str) -> None:
     """Show PHP version."""
     if _run_svc_cmd(profile, "php -v 2>/dev/null | head -3", timeout=10, show_exit_code=False, exit_on_error=False) != 0:
@@ -1690,15 +1873,23 @@ def version(profile: str) -> None:
 
 
 @cmd_php.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def fpm_status(profile: str) -> None:
     """Show PHP-FPM status (pools, processes)."""
-    if _run_svc_cmd(profile, 'php-fpm -tt 2>/dev/null || (echo "PHP-FPM config test:" && pgrep -af "php-fpm" 2>/dev/null || echo "not running")', timeout=10, show_exit_code=False, exit_on_error=False) != 0:
-        _run_svc_cmd(profile, "pgrep -af 'php-fpm' 2>/dev/null || echo 'PHP-FPM not running'", timeout=10)
+    # The binary is often versioned (php-fpm8.3) and -t reports on stderr. pgrep
+    # without -f matches process names only, so the shell running this is not listed.
+    sudo = "sudo " if load_config().get_profile(profile).sudo else ""  # pool configs and logs are root-readable
+    _run_svc_cmd(
+        profile,
+        'fpm=$(command -v php-fpm || ls /usr/sbin/php-fpm* 2>/dev/null | tail -1); '
+        f'[ -n "$fpm" ] && {sudo}"$fpm" -t 2>&1 | tail -1; '
+        "pgrep -a php-fpm || echo 'PHP-FPM not running'",
+        timeout=10,
+    )
 
 
 @cmd_php.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--filter", "-f", default="", help="Filter extensions (grep pattern)")
 def extensions(profile: str, filter: str) -> None:
     """List PHP extensions."""
@@ -1710,7 +1901,7 @@ def extensions(profile: str, filter: str) -> None:
 
 
 @cmd_php.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--option", "-o", default="", help="Specific ini option (e.g. memory_limit)")
 def info(profile: str, option: str) -> None:
     """Show PHP configuration."""
@@ -1721,7 +1912,7 @@ def info(profile: str, option: str) -> None:
 
 
 @cmd_php.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart PHP-FPM."""
@@ -1738,35 +1929,35 @@ def cmd_apache() -> None:
 
 
 @cmd_apache.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def version(profile: str) -> None:
     """Show Apache version."""
     _run_svc_cmd(profile, "apache2 -v 2>/dev/null || httpd -v 2>/dev/null || echo 'Apache not found'", timeout=10)
 
 
 @cmd_apache.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def modules(profile: str) -> None:
     """List loaded Apache modules."""
     _run_svc_cmd(profile, "apache2 -M 2>/dev/null || httpd -M 2>/dev/null || echo 'Apache not found'", timeout=10)
 
 
 @cmd_apache.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def status(profile: str) -> None:
     """Show Apache server status."""
     _run_svc_cmd(profile, "apache2ctl status 2>/dev/null || apachectl status 2>/dev/null || (pgrep -x apache2 >/dev/null && echo 'Apache running' || echo 'Apache not running')", timeout=10)
 
 
 @cmd_apache.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def sites(profile: str) -> None:
     """List enabled Apache virtual hosts."""
     _run_svc_cmd(profile, "ls -1 /etc/apache2/sites-enabled/ 2>/dev/null || ls -1 /etc/httpd/sites-enabled/ 2>/dev/null || echo 'No sites-enabled found'", timeout=10)
 
 
 @cmd_apache.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart Apache."""
@@ -1781,14 +1972,14 @@ def cmd_nginx() -> None:
 
 
 @cmd_nginx.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def version(profile: str) -> None:
     """Show Nginx version."""
     _run_svc_cmd(profile, "nginx -v 2>&1 || echo 'Nginx not found'", timeout=10)
 
 
 @cmd_nginx.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def status(profile: str) -> None:
     """Show Nginx server status."""
     sudo = "sudo " if load_config().get_profile(profile).sudo else ""  # certs are root-readable
@@ -1796,14 +1987,14 @@ def status(profile: str) -> None:
 
 
 @cmd_nginx.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def sites(profile: str) -> None:
     """List enabled Nginx site configs."""
     _run_svc_cmd(profile, "ls -1 /etc/nginx/sites-enabled/ 2>/dev/null || ls -1 /etc/nginx/conf.d/ 2>/dev/null || echo 'No site configs found'", timeout=10)
 
 
 @cmd_nginx.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart Nginx."""
@@ -1820,21 +2011,21 @@ def cmd_caddy() -> None:
 
 
 @cmd_caddy.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def version(profile: str) -> None:
     """Show Caddy version."""
     _run_svc_cmd(profile, "caddy version 2>&1 || echo 'Caddy not found'", timeout=10)
 
 
 @cmd_caddy.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def status(profile: str) -> None:
     """Show Caddy server status."""
-    _run_svc_cmd(profile, "(pgrep -x caddy >/dev/null || pgrep -f 'caddy run' >/dev/null) && (caddy version 2>/dev/null || echo 'running') || echo 'Caddy not running'", timeout=10)
+    _run_svc_cmd(profile, "(pgrep -x caddy >/dev/null || pgrep -f '[c]addy run' >/dev/null) && (caddy version 2>/dev/null || echo 'running') || echo 'Caddy not running'", timeout=10)
 
 
 @cmd_caddy.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--timeout", type=float, default=None, help="Timeout in seconds (default: 30)")
 def restart(profile: str, timeout: float | None) -> None:
     """Restart Caddy."""
@@ -1845,6 +2036,12 @@ def restart(profile: str, timeout: float | None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _is_php_file(path: Path) -> bool:
+    """True when *path* opens with a PHP tag (a script), False for bare Tinker lines."""
+    with open(path.expanduser(), "rb") as fh:
+        return fh.read(64).lstrip().startswith(b"<?")
+
+
 def _upload_and_run(
     profile: str,
     local_file: Path,
@@ -1853,6 +2050,7 @@ def _upload_and_run(
     no_escalate: bool,
     label: str,
     timeout: float = 120.0,
+    cli_timeout: float | None = None,
 ) -> int:
     """scp *local_file* to a private remote /tmp name, run ``build_cmd(remote_path)`` there, then delete it.
 
@@ -1892,7 +2090,7 @@ def _upload_and_run(
             )
         command = f"{_capistrano_cd(p.remote_path)} && {_sudo_prefix(p, no_escalate)}{build_cmd(safe_quote(tmp_remote))}"
         return _run_svc_cmd(
-            profile, command, timeout=timeout,
+            profile, command, timeout=timeout, cli_timeout=cli_timeout,
             escalate=p.sudo and not no_escalate, prefix="", exit_on_error=False,
         )
     finally:
@@ -1904,9 +2102,10 @@ def _upload_and_run(
 @click.command()
 @click.option("--eval", "-e", default="", help="Evaluate expression and exit")
 @click.option("--file", "-f", type=click.Path(exists=True), help="Run PHP file")
-@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> None:
+@click.option("--no-escalate", is_flag=True, help="Run as the SSH user (no sudo or su)")
+@click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 120)")
+@_profile_option
+def cmd_tinker(eval: str, file: str | None, no_escalate: bool, timeout: float | None, profile: str) -> None:
     """Run Laravel Tinker interactively or with --eval/--file.
 
     Examples:
@@ -1925,15 +2124,17 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
     if file:
         _exit_with(_upload_and_run(
             profile, Path(file).expanduser().resolve(),
-            lambda remote: f"php artisan tinker < {remote}",
-            no_escalate=no_escalate, label="tinker",
+            # *remote* is spyro's own /tmp/spyro-tinker-<hex>.php: nothing in it needs escaping
+            (lambda remote: "php artisan tinker --execute=" + safe_quote(f'require "{remote}";'))
+            if _is_php_file(Path(file)) else (lambda remote: f"php artisan tinker < {remote}"),
+            no_escalate=no_escalate, label="tinker", cli_timeout=timeout,
         ))
         return
 
     cd_cmd = _capistrano_cd(p.remote_path)
     if eval:
         tinker_cmd = f"{cd_cmd} && {_sudo_prefix(p, no_escalate)}php artisan tinker --execute={safe_quote(eval)}"
-        _run_svc_cmd(profile, tinker_cmd, timeout=120.0, escalate=escalate, prefix="")
+        _run_svc_cmd(profile, tinker_cmd, timeout=120.0, cli_timeout=timeout, escalate=escalate, prefix="")
         return
 
     # Interactive REPL: needs a remote tty whether or not sudo is involved
@@ -1941,13 +2142,16 @@ def cmd_tinker(eval: str, file: str | None, no_escalate: bool, profile: str) -> 
 
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
     ssh_args.insert(1, "-t")
-    ssh_args.append(f"{cd_cmd} && {_sudo_prefix(p, no_escalate)}php artisan tinker")
+    repl = f"{cd_cmd} && {_sudo_prefix(p, no_escalate)}php artisan tinker"
     ssh_pw = prompt_for_credential(profile, p.user)
-    sudo_pw = ssh_pw if escalate else ""
+    creds: dict[str, object] = {"sudo_password": ssh_pw if escalate else ""}
+    if escalate and p.su:
+        repl, creds = _escalated(p, profile, repl)
+    ssh_args.append(repl)
 
     console.print(f"[cyan]Starting Tinker on {profile}...[/cyan]")
     console.print("[dim]Exit with Ctrl+D or type 'exit'[/dim]")
-    PTYRunner().interactive_run(ssh_args, password=ssh_pw, sudo_password=sudo_pw, timeout=30.0)
+    PTYRunner().interactive_run(ssh_args, password=ssh_pw, **creds, timeout=30.0)
 
 
 # ---------------------------------------------------------------------------
@@ -2038,9 +2242,10 @@ def build_eval_php(expression: str, json_output: bool = False, no_aliases: bool 
 @click.argument("expression")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.option("--no-aliases", is_flag=True, help="Skip PsySH-style short aliases (require full namespaces)")
-@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
-@click.option("--profile", "-p", required=True, help="Profile name")
-def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: bool, profile: str) -> None:
+@click.option("--no-escalate", is_flag=True, help="Run as the SSH user (no sudo or su)")
+@click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 120)")
+@_profile_option
+def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: bool, timeout: float | None, profile: str) -> None:
     """Evaluate a PHP expression on the remote Laravel server (PHP only).
 
     For shell commands, Python, Node or Docker use ``spyro run``.
@@ -2080,7 +2285,7 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
             f.write(build_eval_php(expression, json_output, no_aliases))
         _exit_with(_upload_and_run(
             profile, tmp_local, lambda remote: f"php {remote}",
-            no_escalate=no_escalate, label="eval",
+            no_escalate=no_escalate, label="eval", cli_timeout=timeout,
         ))
     finally:
         tmp_local.unlink(missing_ok=True)
@@ -2088,9 +2293,10 @@ def cmd_eval(expression: str, json_output: bool, no_aliases: bool, no_escalate: 
 
 @click.command()
 @click.argument("file", type=click.Path(exists=True, dir_okay=False, readable=True))
-@click.option("--profile", "-p", required=True, help="Profile name")
-@click.option("--no-escalate", is_flag=True, help="Don't use sudo")
-def cmd_script(file: str, profile: str, no_escalate: bool) -> None:
+@_profile_option
+@click.option("--no-escalate", is_flag=True, help="Run as the SSH user (no sudo or su)")
+@click.option("--timeout", type=float, default=None, help="Command timeout in seconds (default: 120)")
+def cmd_script(file: str, profile: str, no_escalate: bool, timeout: float | None) -> None:
     """Upload a PHP file and run it with plain ``php`` on the remote server.
 
     Reads a local .php file, uploads it to the remote server, executes it
@@ -2120,7 +2326,7 @@ def cmd_script(file: str, profile: str, no_escalate: bool) -> None:
 
     _exit_with(_upload_and_run(
         profile, file_path, lambda remote: f"php {remote}",
-        no_escalate=no_escalate, label="script",
+        no_escalate=no_escalate, label="script", cli_timeout=timeout,
     ))
 
 
@@ -2165,7 +2371,7 @@ def cmd_db(ctx: click.Context) -> None:
 
 @cmd_db.command()
 @click.option("--port", type=int, help="Override local port")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def tunnel(port: int | None, profile: str) -> None:
     """Start tunnel and print connection URL."""
     p, db, local_port = _db_target(profile, port=port)
@@ -2178,7 +2384,7 @@ def tunnel(port: int | None, profile: str) -> None:
 
 @cmd_db.command()
 @click.option("--no-tunnel", is_flag=True, help="Skip tunnel management")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def shell(no_tunnel: bool, profile: str) -> None:
     """Launch pre-authenticated database CLI (mysql/mariadb/psql)."""
     _, db, local_port = _db_target(profile, no_tunnel=no_tunnel)
@@ -2191,7 +2397,7 @@ def shell(no_tunnel: bool, profile: str) -> None:
 
 @cmd_db.command()
 @click.option("--port", type=int, help="Override local port")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def ping(port: int | None, profile: str) -> None:
     """Test database connectivity through the tunnel."""
     p, db, local_port = _db_target(profile, port=port)
@@ -2222,7 +2428,7 @@ def ping(port: int | None, profile: str) -> None:
 @cmd_db.command()
 @click.argument("query")
 @click.option("--port", type=int, help="Override local port")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def query(profile: str, query: str, port: int | None) -> None:
     """Run a SQL query through the tunnel."""
     ec, output = _run_db_query(profile, query, tunnel_port=port)
@@ -2234,7 +2440,7 @@ def query(profile: str, query: str, port: int | None) -> None:
 
 @cmd_db.command()
 @click.option("--port", type=int, help="Override local port")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def list_databases(port: int | None, profile: str) -> None:
     """List databases on the remote server."""
     sql = "\\l" if _detect_db_client(profile) == "psql" else "SHOW DATABASES"
@@ -2261,19 +2467,19 @@ def cmd_logs(ctx: click.Context) -> None:
       nginx-error  Tail Nginx error log
       apache       Tail Apache access log
       php          Tail PHP-FPM log
-      supervisor   Tail Spyro supervisor tunnel log (default)
+      tunnel       Tail spyro's own tunnel log for a profile (default)
     """
     if ctx.invoked_subcommand is None:
         from ..utils.paths import spyro_home
         log_dir = spyro_home() / "logs"
         if not log_dir.exists() or not any(log_dir.iterdir()):
             console.print("[yellow]No supervisor log files found[/yellow]")
-            console.print("Try: spyro logs laravel -p staging  or  spyro logs supervisor staging")
+            console.print("Try: spyro logs laravel -p staging  or  spyro logs tunnel staging")
             return
         console.print("[cyan]Available supervisor logs:[/cyan]")
         for log_file in sorted(log_dir.glob("*.log")):
             console.print(f"  {log_file.stem}.log")
-        console.print("\n[yellow]Use: spyro logs supervisor <profile> [-f][/yellow]")
+        console.print("\n[yellow]Use: spyro logs tunnel <profile> [-f][/yellow]")
 
 
 _LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
@@ -2316,7 +2522,7 @@ def _laravel_log_command(
 
 
 @cmd_logs.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--lines", "-n", default=50, help="Number of lines (matches when filtering)")
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
 @click.option("--grep", "-g", "grep_pattern", default=None, help="Only lines matching this extended regex (awk ERE)")
@@ -2341,56 +2547,72 @@ def laravel(profile: str, lines: int, follow: bool, grep_pattern: str | None, le
 
 
 @cmd_logs.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--lines", "-n", default=50, help="Number of lines")
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
 def nginx(profile: str, lines: int, follow: bool) -> None:
     """Tail Nginx access log."""
     tail_flag = " -f" if follow else ""
-    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/nginx/access.log 2>/dev/null || tail -n {int(lines)}{tail_flag} /var/log/nginx/*access* 2>/dev/null || echo 'Nginx access log not found'", timeout=None if follow else 15)
+    tail = ("sudo " if load_config().get_profile(profile).sudo else "") + "tail"  # logs are usually root/adm-only
+    _run_svc_cmd(profile, f"{tail} -n {int(lines)}{tail_flag} /var/log/nginx/access.log 2>/dev/null || {tail} -n {int(lines)}{tail_flag} /var/log/nginx/*access* 2>/dev/null || echo 'Nginx access log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command(name="nginx-error")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--lines", "-n", default=50, help="Number of lines")
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
 def nginx_error(profile: str, lines: int, follow: bool) -> None:
     """Tail Nginx error log."""
     tail_flag = " -f" if follow else ""
-    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/nginx/error.log 2>/dev/null || echo 'Nginx error log not found'", timeout=None if follow else 15)
+    tail = ("sudo " if load_config().get_profile(profile).sudo else "") + "tail"  # logs are usually root/adm-only
+    _run_svc_cmd(profile, f"{tail} -n {int(lines)}{tail_flag} /var/log/nginx/error.log 2>/dev/null || echo 'Nginx error log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--lines", "-n", default=50, help="Number of lines")
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
 def apache(profile: str, lines: int, follow: bool) -> None:
     """Tail Apache access log."""
     tail_flag = " -f" if follow else ""
-    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/apache2/access.log 2>/dev/null || tail -n {int(lines)}{tail_flag} /var/log/httpd/access_log 2>/dev/null || echo 'Apache access log not found'", timeout=None if follow else 15)
+    tail = ("sudo " if load_config().get_profile(profile).sudo else "") + "tail"  # logs are usually root/adm-only
+    _run_svc_cmd(profile, f"{tail} -n {int(lines)}{tail_flag} /var/log/apache2/access.log 2>/dev/null || {tail} -n {int(lines)}{tail_flag} /var/log/httpd/access_log 2>/dev/null || echo 'Apache access log not found'", timeout=None if follow else 15)
 
 
 @cmd_logs.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--lines", "-n", default=50, help="Number of lines")
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
 def php(profile: str, lines: int, follow: bool) -> None:
     """Tail PHP-FPM error log."""
     tail_flag = " -f" if follow else ""
-    _run_svc_cmd(profile, f"tail -n {int(lines)}{tail_flag} /var/log/php*-fpm.log 2>/dev/null || tail -n {int(lines)}{tail_flag} /var/log/php*.log 2>/dev/null || echo 'PHP-FPM log not found'", timeout=None if follow else 15)
+    tail = ("sudo " if load_config().get_profile(profile).sudo else "") + "tail"  # logs are usually root/adm-only
+    _run_svc_cmd(profile, f"{tail} -n {int(lines)}{tail_flag} /var/log/php*-fpm.log 2>/dev/null || {tail} -n {int(lines)}{tail_flag} /var/log/php*.log 2>/dev/null || echo 'PHP-FPM log not found'", timeout=None if follow else 15)
 
 
-@cmd_logs.command()
+@cmd_logs.command("tunnel")
 @click.argument("profile_name", required=True)
 @click.option("--follow", "-f", is_flag=True, help="Follow log output")
-def supervisor(profile_name: str, follow: bool) -> None:
-    """Tail Spyro supervisor tunnel log."""
+def logs_tunnel(profile_name: str, follow: bool) -> None:
+    """Tail spyro's own tunnel log for a profile (a local file; nothing to do with remote Supervisor)."""
     from ..utils.paths import spyro_home
     log_file = spyro_home() / "logs" / f"{profile_name}.log"
     if not log_file.exists():
-        console.print(f"[red]No supervisor log for '{profile_name}'[/red]")
-        return
+        console.print(f"[red]No tunnel log for '{profile_name}'[/red]")
+        raise SystemExit(1)
     _show_log(log_file, follow)
+
+
+def _hidden_alias(group: click.Group, command: click.Command, name: str) -> None:
+    """Keep an old or duplicate command name working without listing it in --help."""
+    import copy
+
+    alias = copy.copy(command)
+    alias.hidden = True
+    group.add_command(alias, name)
+
+
+_hidden_alias(cmd_logs, logs_tunnel, "supervisor")  # its name before it clashed with `spyro supervisor`
 
 
 @cmd_db.command()
@@ -2399,7 +2621,7 @@ def supervisor(profile_name: str, follow: bool) -> None:
 @click.option("--gzip", "-z", is_flag=True, help="Compress with gzip")
 @click.option("--no-data", "-d", is_flag=True, help="Schema only, no data")
 @click.option("--where", "-w", default="", help="WHERE clause for row filter")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def dump(profile: str, tables: str, output: str, gzip: bool, no_data: bool, where: str) -> None:
     """Dump remote database to local file.
 
@@ -2665,7 +2887,7 @@ def cmd_update(force: bool, check: bool) -> None:
     latest_tag = _fetch_latest_version()
     if latest_tag is None:
         console.print("[red]Could not determine latest version from GitHub[/red]")
-        return
+        raise SystemExit(1)
 
     console.print(f"  Remote latest: v{latest_tag}")
 
@@ -2811,6 +3033,7 @@ def _profile_summary(p: ProfileConfig) -> dict[str, object]:
         "wordpress": p.wordpress,
         "sudo": p.sudo,
         "sudo_user": p.sudo_user,
+        "su": p.su,
         "forwarded_ports": p.forwarded_ports,
         "db": {"driver": p.db.driver, "name": p.db.name, "host": p.db.host, "port": p.db.port},
     }
@@ -2836,6 +3059,8 @@ def cmd_profiles(profile: str | None, json_output: bool) -> None:
         table.add_column(col, overflow="fold")
     for r in rows:
         sudo = "no" if not r["sudo"] else (f"yes ({r['sudo_user']})" if r["sudo_user"] else "yes")
+        if r["su"]:
+            sudo = sudo.replace("yes", "via su", 1)
         path = r["remote_path"] if r["remote_path_set"] else f"{r['remote_path']} (default)"
         table.add_row(
             escape(str(r["name"])),
@@ -2958,13 +3183,13 @@ def config_validate(resolve: bool) -> None:
         config = load_config()
     except SystemExit as e:
         console.print(f"[red]✗ Could not load config: {escape(str(e))}[/red]")
-        return
+        raise SystemExit(1)
 
     console.print("[bold cyan]Spyro Config Validate[/bold cyan]\n")
 
     if not config.profiles:
         console.print("[red]No profiles defined in spyro.toml[/red]")
-        return
+        raise SystemExit(1)
 
     for name, profile in config.profiles.items():
         console.print(f"[bold]Checking profile:[/bold] {name}")
@@ -3061,23 +3286,24 @@ def cmd_ps(profile: str | None, grep: str, json_output: bool) -> None:
     config = load_config()
     p = config.get_profile(profile)
 
+    _open_master(p, profile)
     ssh_args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
     # `ps aux` for people; a fixed, header-less column set (args last) for JSON.
     ps_cmd = (
         "ps -eo user=,pid=,pcpu=,pmem=,vsz=,rss=,tty=,stat=,args=" if json_output else "ps aux"
     )
     if grep:
-        ps_cmd += f" | grep -i -- {safe_quote(grep)}"
+        ps_cmd += f" | grep -i -- {safe_quote(grep)} | grep -v -e 'grep -i -- ' -e 'ps -eo user=' -e 'ps aux'"
     ssh_args.append(ps_cmd)
 
     try:
         result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=15)
     except subprocess.TimeoutExpired:
         console.print("[red]Process list timed out[/red]")
-        return
+        raise SystemExit(1)
     except FileNotFoundError:
         console.print("[red]ssh not found[/red]")
-        return
+        raise SystemExit(1)
 
     output = result.stdout.strip()
     # grep exits 1 when nothing matched; that is not an ssh/ps failure
@@ -3085,7 +3311,7 @@ def cmd_ps(profile: str | None, grep: str, json_output: bool) -> None:
         stderr = result.stderr.strip()
         if stderr:
             console.print(Text(stderr, style="red"))
-        return
+        raise SystemExit(result.returncode)
 
     if not output:
         console.print("[yellow]No matching processes[/yellow]")
@@ -3121,7 +3347,7 @@ def cmd_env() -> None:
 
 
 @cmd_env.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 def diff(profile: str) -> None:
     """Compare local .env with remote .env."""
     import difflib
@@ -3176,7 +3402,7 @@ def diff(profile: str) -> None:
 
 
 @cmd_env.command()
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.argument("source", default=".env", required=False)
 def push(profile: str, source: str) -> None:
     """Push local .env file to remote server."""
@@ -3306,18 +3532,19 @@ def _env_write(
     rest = " ".join(safe_quote(a) for a in (
         hashlib.sha256(old).hexdigest(), hashlib.sha256(new).hexdigest(), ts, str(_ENV_KEEP_BACKUPS),
     ))
-    # $HOME expands in the login shell, before any sudo
-    inner = f'sh -c {safe_quote(_ENV_WRITE)} sh {safe_quote(real)} "$HOME"/{staged} {rest}'
+    # $HOME expands in the login shell, before any sudo. Under su the whole line
+    # runs in root's shell, where $HOME is root's: use the directory su was
+    # started in, which is still the SSH user's home.
+    home = '"$PWD"' if p.su and not writable else '"$HOME"'
+    inner = f'sh -c {safe_quote(_ENV_WRITE)} sh {safe_quote(real)} {home}/{staged} {rest}'
     args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-    sudo_pw = ""
+    creds: dict[str, object] = {"sudo_password": ""}
     if not writable:
-        from ..utils.keychain import prompt_for_credential
         args.insert(1, "-t")
-        inner = "sudo " + inner
-        sudo_pw = prompt_for_credential(profile, p.user)
+        inner, creds = _escalated(p, profile, "sudo " + inner)
     args.append(inner)
     out: list[str] = []
-    ec = runner.run(args, password=ssh_pw, sudo_password=sudo_pw, on_output=out.append, timeout=60)
+    ec = runner.run(args, password=ssh_pw, **creds, on_output=out.append, timeout=60)
     if ec == 3:
         raise click.ClickException(f"{real} changed since it was read; nothing written. Run the command again.")
     if ec != 0:
@@ -3352,15 +3579,14 @@ def _env_reload(p: "ProfileConfig", profile: str, ssh_pw: str) -> None:
         f"if [ -d vendor/laravel/octane ]; then echo '> octane:reload'; {art} octane:reload || true; fi"
     )
     args = build_ssh_args(host=p.host, user=p.user, port=p.port, key=p.key)
-    sudo_pw = ""
+    creds: dict[str, object] = {"sudo_password": ""}
     if sp:
-        from ..utils.keychain import prompt_for_credential
         args.insert(1, "-t")
-        sudo_pw = prompt_for_credential(profile, p.user)
+        script, creds = _escalated(p, profile, script)
     args.append(script)
     err_console.print("[cyan]Reloading Laravel so the change is picked up...[/cyan]")
     ec = PTYRunner().run(
-        args, password=ssh_pw, sudo_password=sudo_pw,
+        args, password=ssh_pw, **creds,
         on_output=lambda line: err_console.print(Text("  " + line), soft_wrap=True), timeout=120,
     )
     if ec != 0:
@@ -3575,12 +3801,12 @@ def _env_drop(action: str, keys: tuple[str, ...], all_: bool):
 @_env_write_options
 @click.argument("keys", nargs=-1, required=True)
 def env_unset(profile, file, dry_run, yes, as_json, all_, force, no_reload, keys):
-    """Delete KEY(s) from the remote env file. `remove` is an alias; `hide` comments out instead."""
+    """Delete KEY(s) from the remote env file (`hide` comments them out instead)."""
     _env_apply(profile, file, _env_drop("removed", keys, all_),
                dry_run=dry_run, yes=yes, as_json=as_json, force=force, no_reload=no_reload)
 
 
-cmd_env.add_command(env_unset, "remove")
+_hidden_alias(cmd_env, env_unset, "remove")
 
 
 @cmd_env.command("hide")
@@ -3631,7 +3857,7 @@ def _env_load(profile: str, file: str):
 
 
 @cmd_env.command("keys")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
 def env_keys(profile, file, as_json):
@@ -3645,7 +3871,7 @@ def env_keys(profile, file, as_json):
 
 
 @cmd_env.command("has")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
 @click.argument("key")
 def env_has(profile, file, key):
@@ -3661,7 +3887,7 @@ def env_has(profile, file, key):
 
 
 @cmd_env.command("backups")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
 def env_backups(profile, file):
     """List the backups spyro keeps next to the env file (newest first)."""
@@ -3686,7 +3912,7 @@ def env_backups(profile, file):
 
 
 @cmd_env.command("restore")
-@click.option("--profile", "-p", required=True, help="Profile name")
+@_profile_option
 @click.option("--file", "file", default=".env", show_default=True, help="Env file (must be in env_files)")
 @click.option("--dry-run", is_flag=True, help="Show the redacted diff, write nothing")
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (required without a terminal)")

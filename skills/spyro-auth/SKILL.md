@@ -11,7 +11,7 @@ Manage stored credentials (macOS Keychain / Linux Secret Service).
 
 ## Before you run it
 
-Passwords live only in the OS keychain (service `spyro-cli`), never in spyro.toml. Non-interactive runs use `SPYRO_PASSWORD` or `SPYRO_PASSWORD_<PROFILE>` (upper-case) instead.
+Passwords live only in the OS keychain (service `spyro-cli`), never in spyro.toml. Non-interactive runs use `SPYRO_PASSWORD` or `SPYRO_PASSWORD_<PROFILE>` (upper-case) instead. A `su = true` profile also has a root password: `--su` selects it (`SPYRO_SU_PASSWORD[_<PROFILE>]`).
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -41,7 +41,8 @@ Usage: spyro auth delete [OPTIONS]
   Remove stored credentials from the OS keychain.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
+  --su                Remove the root password of a `su = true` profile
   --help              Show this message and exit.
 ```
 
@@ -63,12 +64,14 @@ Usage: spyro auth set [OPTIONS]
 
   Store a credential in the OS keychain.
 
-  One password per profile — used for both SSH and sudo. If --password is omitted, you'll be
-  prompted securely (no echo).
+  One password per profile — used for both SSH and sudo. A `su = true` profile has a second one, the
+  root password that `su` asks for: store it with --su. If --password is omitted, you'll be prompted
+  securely (no echo).
 
 Options:
-  -p, --profile TEXT   Profile name  [required]
+  -p, --profile TEXT   Profile name (optional with one profile or a [defaults] profile)
   -w, --password TEXT  Password (omit to prompt)
   -f, --force          Overwrite without prompting
+  --su                 Store the root password of a `su = true` profile
   --help               Show this message and exit.
 ```

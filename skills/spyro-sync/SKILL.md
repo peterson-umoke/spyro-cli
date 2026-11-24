@@ -11,7 +11,7 @@ Watch pinned directories and auto-sync to remote server.
 
 ## Before you run it
 
-Uploads pinned directories (`spyro pin`) when files change; `--dry-run` first. Secrets/caches are excluded by framework rules.
+Uploads pinned directories (`spyro pin`) when files change; `--dry-run` first. Secrets/caches are excluded by framework rules. By default it only uploads files that change while it is running and never deletes: `--initial` first uploads every non-excluded file, `--delete` also removes the remote file when one is deleted locally (files only, never excluded ones). It writes as the SSH user, with no sudo: the remote directory must be writable by that user. Missing remote folders are created.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -24,8 +24,13 @@ Usage: spyro sync [OPTIONS]
 
   Watch pinned directories and auto-sync to remote server.
 
+  By default only files that change while it runs are uploaded, and nothing is ever deleted on the
+  server. Excluded files (.env, wp-config.php, ...) are never uploaded or deleted.
+
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --dry-run           Show what would be synced without uploading
+  --initial           First upload every file that is not excluded, then watch
+  --delete            Also delete the remote file when a file is deleted locally
   --help              Show this message and exit.
 ```

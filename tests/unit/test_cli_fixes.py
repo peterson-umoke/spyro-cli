@@ -99,7 +99,7 @@ class TestPs:
 
     def test_grep_filters_the_whole_command_not_just_a_fallback(self, project):
         _, remote = self._run(project, "--grep", "php", stdout="x")
-        assert remote == "ps aux | grep -i -- php"
+        assert remote.startswith("ps aux | grep -i -- php | grep -v ")  # and not the grep itself
 
     def test_json_keeps_the_full_command_and_is_valid(self, project):
         long_cmd = "php-fpm: pool www " + "z" * 150
@@ -162,7 +162,7 @@ class TestAppCommands:
         result, run = self._run("artisan", "migrate", "-p", "a")
         argv = run.call_args.args[0]
         assert argv[1] == "-t"  # remote tty so sudo can prompt
-        assert argv[-1] == "cd /var/www/app && [ -L current ] && cd current || cd /var/www/app && sudo -u www-data php artisan migrate"
+        assert argv[-1] == "cd /var/www/app && [ -L current ] && cd current || cd /var/www/app && sudo -u www-data php artisan --no-interaction migrate"
         assert run.call_args.kwargs["sudo_password"] == "pw"
 
     def test_no_escalate_runs_as_login_user_without_tty(self, project):
@@ -202,7 +202,7 @@ class TestAppCommands:
 
     def test_supervisor_process_name_is_quoted(self, project):
         _, run = self._run("supervisor", "restart", "x; touch /tmp/pwned", "-p", "a")
-        assert run.call_args.args[0][-1] == "sudo supervisorctl restart 'x; touch /tmp/pwned'"
+        assert run.call_args.args[0][-1].endswith("; sudo supervisorctl restart 'x; touch /tmp/pwned'")
 
     def test_upload_and_run_uses_unguessable_name_and_always_cleans_up(self, project, tmp_path):
         script = tmp_path / "s.php"

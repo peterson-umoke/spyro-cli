@@ -11,7 +11,7 @@ List processes on remote server.
 
 ## Before you run it
 
-Uses a plain `ssh` (no keychain password injection): needs key/agent auth or a live ControlMaster.
+Lists remote processes; `--grep` filters (the grep itself is not listed). Works with key auth or a stored password.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 

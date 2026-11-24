@@ -14,6 +14,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -45,6 +46,34 @@ _SUDO_PROMPTS = [
     re.compile(r"sudo\s+password(?:\s+for\s+[^:]+)?\s*:\s*$", re.IGNORECASE),
 ]
 
+# ``su`` cannot be told what to print: its prompt is a bare "Password:", the same
+# text sshd uses. So the remote command announces itself first (see su_command):
+# once this line has been seen the SSH login is over, and the next plain
+# password prompt is su's.
+SU_MARKER = "__spyro_su__"
+
+# Inside the root shell ``sudo`` is redundant and often not installed (that is
+# why the profile uses su), yet spyro's own commands are written with it.
+# ponytail: handles `sudo cmd` and `sudo -u user cmd` only (all spyro emits); other
+# sudo flags fail. Needs a POSIX root shell, and `runuser` (util-linux) for -u.
+# `su` without `-` keeps the SSH user's PATH, which on Debian/Ubuntu has no sbin
+# directories (nginx, service, runuser live there); sudo's secure_path adds them.
+_SU_SHIM = (
+    'PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"; export PATH; '
+    'sudo() { if [ "$1" = -u ]; then u=$2; shift 2; runuser -u "$u" -- env "$@"; '
+    'else env "$@"; fi; }; '
+)
+
+
+def su_command(cmd: str) -> str:
+    """Wrap *cmd* to run in a root shell via ``su`` (profiles with ``su = true``).
+
+    Pass ``su=True`` and the root password as ``sudo_password`` to PTYRunner.
+    ``su`` without ``-`` keeps the working directory of the SSH user.
+    """
+    return f"echo {SU_MARKER}; su root -c {shlex.quote(_SU_SHIM + cmd)}"
+
+
 _HOST_KEY_PROMPTS = [
     re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE),
 ]
@@ -57,10 +86,19 @@ _NO_PASSWORD_MSG = (
     "spyro: SSH is asking for a password but none is stored. "
     "Run: spyro auth set -p <profile>"
 )
+_NO_SU_PASSWORD_MSG = (
+    "spyro: su is asking for the root password but none is stored. "
+    "Run: spyro auth set -p <profile> --su"
+)
 _REJECTED_MSG = (
     "spyro: SSH rejected the stored password. "
     "Update it with: spyro auth set -p <profile> -f"
 )
+
+
+# Printed by the local ssh client when a `-t` session ends: noise after every
+# escalated command, never part of the remote command's output.
+_SSH_CLOSED = re.compile(r"^(?:Shared connection|Connection) to \S+ closed\.$")
 
 
 def _matches(patterns: list[re.Pattern[str]], text: str) -> bool:
@@ -197,8 +235,12 @@ class PTYRunner:
         on_output: OutputCallback | None = None,
         timeout: float | None = 30.0,
         env: dict[str, str] | None = None,
+        su: bool = False,
     ) -> int:
         """Run *argv*, answering prompts. ``timeout=None`` waits indefinitely.
+
+        *su*: argv ends in a :func:`su_command`; *sudo_password* is then the
+        root password and answers su's prompt.
 
         Returns the exit code; 124 on timeout, 255 when SSH asks for a password
         that is missing or was rejected, 127 when the program cannot be run.
@@ -219,7 +261,7 @@ class PTYRunner:
             return self._drive(
                 master_fd, pid,
                 sec_password, sec_sudo,
-                on_output, timeout,
+                on_output, timeout, su,
             )
         finally:
             # Zero credentials immediately after use
@@ -237,8 +279,11 @@ class PTYRunner:
         sudo_password: SecureCredential | None,
         on_output: OutputCallback | None,
         timeout: float | None,
+        su: bool = False,
     ) -> int:
         """Drive the PTY interaction loop."""
+        su_ready = False  # SU_MARKER seen: the next plain "Password:" is su's
+        answered = False  # just answered a prompt: the terminal echoes the Enter as an empty line
         start = time.monotonic()
         eof_count = 0
         sent_password = False
@@ -265,6 +310,17 @@ class PTYRunner:
             # would also match inside "[sudo] password for user: ".
             if _matches(_SUDO_PROMPTS, text):
                 if not sudo_bytes or sudo_attempts >= max_sudo_attempts:
+                    return self._abort_child(pid, 1)
+                os.write(master_fd, sudo_bytes + b"\n")
+                sudo_attempts += 1
+                return True
+            if su_ready and _matches(_AUTH_PROMPTS, text):
+                if sudo_attempts:
+                    # su asks once and exits on a wrong password; a later
+                    # prompt belongs to the command itself.
+                    return False
+                if not sudo_bytes:
+                    notes.append(_NO_SU_PASSWORD_MSG)
                     return self._abort_child(pid, 1)
                 os.write(master_fd, sudo_bytes + b"\n")
                 sudo_attempts += 1
@@ -332,6 +388,15 @@ class PTYRunner:
                 line, self._buffer = self._buffer.split(b"\n", 1)
                 self._line_buffer = line
                 text = strip_ansi(line)
+                if su and text.strip() == SU_MARKER:
+                    su_ready = True
+                    continue
+                if answered:
+                    answered = False
+                    if not text.strip():
+                        continue
+                if _SSH_CLOSED.match(text.strip()):
+                    continue
                 if on_output:
                     on_output(text)
                 result = answer(text.rstrip())
@@ -354,6 +419,7 @@ class PTYRunner:
             if result is True:
                 self._buffer = b""
                 partial_since = None
+                answered = True
             elif result is not False:
                 if on_output:
                     on_output(strip_ansi(self._buffer))
@@ -385,6 +451,7 @@ class PTYRunner:
         sudo_password: str = "",
         timeout: float | None = 30.0,
         env: dict[str, str] | None = None,
+        su: bool = False,
     ) -> int:
         """Run a command interactively in a PTY.
 
@@ -407,7 +474,7 @@ class PTYRunner:
             return self._drive_interactive(
                 master_fd, pid,
                 sec_password, sec_sudo,
-                timeout,
+                timeout, su,
             )
         finally:
             # Zero credentials immediately after use
@@ -424,8 +491,10 @@ class PTYRunner:
         password: SecureCredential | None,
         sudo_password: SecureCredential | None,
         timeout: float | None,
+        su: bool = False,
     ) -> int:
         """Drive the PTY through auth, then relay raw between user terminal and remote."""
+        su_ready = False  # see _drive
         import sys
         import tty
 
@@ -465,6 +534,11 @@ class PTYRunner:
                 return True
             # Sudo before generic auth (see _drive).
             if _matches(_SUDO_PROMPTS, text):
+                if sudo_bytes and not sent_sudo:
+                    os.write(master_fd, sudo_bytes + b"\n")
+                    sent_sudo = True
+                return True
+            if su_ready and _matches(_AUTH_PROMPTS, text):
                 if sudo_bytes and not sent_sudo:
                     os.write(master_fd, sudo_bytes + b"\n")
                     sent_sudo = True
@@ -529,6 +603,9 @@ class PTYRunner:
                         while b"\n" in self._buffer:
                             line, self._buffer = self._buffer.split(b"\n", 1)
                             text = strip_ansi(line)
+                            if su and text.strip() == SU_MARKER:
+                                su_ready = True
+                                continue
                             if answer(text.rstrip()):
                                 continue
                             # Not a prompt — print to user

@@ -43,7 +43,7 @@ Usage: spyro supervisor restart [OPTIONS] [PROCESS]
   Restart Supervisor process(es). Default: all.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --timeout FLOAT     Timeout in seconds (default: 60)
   --help              Show this message and exit.
 ```
@@ -56,7 +56,7 @@ Usage: spyro supervisor start [OPTIONS] PROCESS
   Start a Supervisor process.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -68,7 +68,7 @@ Usage: spyro supervisor status [OPTIONS]
   Show Supervisor process status.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -80,7 +80,7 @@ Usage: spyro supervisor stop [OPTIONS] PROCESS
   Stop a Supervisor process.
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
   --help              Show this message and exit.
 ```
 
@@ -92,7 +92,7 @@ Usage: spyro supervisor tail [OPTIONS] PROCESS
   Tail Supervisor process stderr log.
 
 Options:
-  -p, --profile TEXT   Profile name  [required]
+  -p, --profile TEXT   Profile name (optional with one profile or a [defaults] profile)
   -n, --lines INTEGER  Number of lines to tail
   --help               Show this message and exit.
 ```

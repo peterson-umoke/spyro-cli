@@ -11,7 +11,7 @@ View remote logs (Laravel, Nginx, Apache, PHP-FPM).
 
 ## Before you run it
 
-`logs laravel` tails the NEWEST `storage/logs/laravel*.log` (daily files included). `--level X` keeps entries at X or worse with their stack-trace lines; `-g` is an awk extended regex (no GNU `\b`/`\d`) applied line by line; with both, grep runs after level, so non-matching stack lines drop out. `-n` caps matches when filtering; filtered runs scan the whole newest file. `-f` streams with no timeout. Other subcommands tail nginx/apache/php logs; `logs supervisor <profile>` is spyro's own local tunnel log.
+`logs laravel` tails the NEWEST `storage/logs/laravel*.log` (daily files included). `--level X` keeps entries at X or worse with their stack-trace lines; `-g` is an awk extended regex (no GNU `\b`/`\d`) applied line by line; with both, grep runs after level, so non-matching stack lines drop out. `-n` caps matches when filtering; filtered runs scan the whole newest file. `-f` streams with no timeout. Other subcommands tail nginx/apache/php logs (with sudo on `sudo = true` profiles: those files are usually root-only); `logs tunnel <profile>` is spyro's own local tunnel log.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -26,7 +26,7 @@ Usage: spyro logs [OPTIONS] COMMAND [ARGS]...
 
   Subcommands:   laravel      Tail the Laravel log file   nginx        Tail Nginx access log
   nginx-error  Tail Nginx error log   apache       Tail Apache access log   php          Tail PHP-
-  FPM log   supervisor   Tail Spyro supervisor tunnel log (default)
+  FPM log   tunnel       Tail spyro's own tunnel log for a profile (default)
 
 Options:
   --help  Show this message and exit.
@@ -37,7 +37,7 @@ Commands:
   nginx        Tail Nginx access log.
   nginx-error  Tail Nginx error log.
   php          Tail PHP-FPM error log.
-  supervisor   Tail Spyro supervisor tunnel log.
+  tunnel       Tail spyro's own tunnel log for a profile (a local file; nothing to do with...
 ```
 
 ### `spyro logs apache`
@@ -48,7 +48,7 @@ Usage: spyro logs apache [OPTIONS]
   Tail Apache access log.
 
 Options:
-  -p, --profile TEXT   Profile name  [required]
+  -p, --profile TEXT   Profile name (optional with one profile or a [defaults] profile)
   -n, --lines INTEGER  Number of lines
   -f, --follow         Follow log output
   --help               Show this message and exit.
@@ -68,7 +68,7 @@ Usage: spyro logs laravel [OPTIONS]
     spyro logs laravel -p staging -g 'user=42' -n 100
 
 Options:
-  -p, --profile TEXT              Profile name  [required]
+  -p, --profile TEXT              Profile name (optional with one profile or a [defaults] profile)
   -n, --lines INTEGER             Number of lines (matches when filtering)
   -f, --follow                    Follow log output
   -g, --grep TEXT                 Only lines matching this extended regex (awk ERE)
@@ -85,7 +85,7 @@ Usage: spyro logs nginx [OPTIONS]
   Tail Nginx access log.
 
 Options:
-  -p, --profile TEXT   Profile name  [required]
+  -p, --profile TEXT   Profile name (optional with one profile or a [defaults] profile)
   -n, --lines INTEGER  Number of lines
   -f, --follow         Follow log output
   --help               Show this message and exit.
@@ -99,7 +99,7 @@ Usage: spyro logs nginx-error [OPTIONS]
   Tail Nginx error log.
 
 Options:
-  -p, --profile TEXT   Profile name  [required]
+  -p, --profile TEXT   Profile name (optional with one profile or a [defaults] profile)
   -n, --lines INTEGER  Number of lines
   -f, --follow         Follow log output
   --help               Show this message and exit.
@@ -113,7 +113,7 @@ Usage: spyro logs php [OPTIONS]
   Tail PHP-FPM error log.
 
 Options:
-  -p, --profile TEXT   Profile name  [required]
+  -p, --profile TEXT   Profile name (optional with one profile or a [defaults] profile)
   -n, --lines INTEGER  Number of lines
   -f, --follow         Follow log output
   --help               Show this message and exit.
@@ -124,7 +124,19 @@ Options:
 ```text
 Usage: spyro logs supervisor [OPTIONS] PROFILE_NAME
 
-  Tail Spyro supervisor tunnel log.
+  Tail spyro's own tunnel log for a profile (a local file; nothing to do with remote Supervisor).
+
+Options:
+  -f, --follow  Follow log output
+  --help        Show this message and exit.
+```
+
+### `spyro logs tunnel`
+
+```text
+Usage: spyro logs tunnel [OPTIONS] PROFILE_NAME
+
+  Tail spyro's own tunnel log for a profile (a local file; nothing to do with remote Supervisor).
 
 Options:
   -f, --follow  Follow log output

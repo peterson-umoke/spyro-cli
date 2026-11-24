@@ -11,7 +11,7 @@ Run WP-CLI commands on the remote host.
 
 ## Before you run it
 
-WP-CLI wrapper for `wordpress = true` profiles; runs in `remote_path` with the same sudo rules as `artisan`.
+WP-CLI wrapper for `wordpress = true` profiles; works like `artisan`: runs in `remote_path`, same sudo rules, `-p` optional with one profile, `--timeout`. WP-CLI flags pass through as written (`spyro wp plugin list --status=active -p staging`). If WP-CLI is missing on the server spyro installs it (`/usr/local/bin/wp` with sudo, else `~/.local/bin/wp`); that needs curl or wget and internet on the server, otherwise set `wp_cli_path`. WP-CLI refuses to run as root, so a `sudo = true` profile needs `sudo_user` (the site owner, e.g. `www-data`), `--no-escalate`, or an explicit `--allow-root`. `wp shell` is interactive and will time out: use `spyro ssh`.
 
 Read `spyro profiles` first for hosts and `remote_path`; the `spyro` skill has the safety rules.
 
@@ -24,8 +24,15 @@ Usage: spyro wp [OPTIONS] [CMD_ARGS]...
 
   Run WP-CLI commands on the remote host.
 
+  Everything after `wp` is passed to WP-CLI as written, flags included:
+
+    spyro wp plugin list --status=active -p staging
+
+    spyro wp search-replace old.example.com new.example.com --dry-run -p staging
+
 Options:
-  --no-escalate       Don't use sudo
-  -p, --profile TEXT  Profile name  [required]
+  --no-escalate       Run as the SSH user (no sudo or su)
+  --timeout FLOAT     Command timeout in seconds (default: 60)
+  -p, --profile TEXT  Profile name (auto-detects if only one exists)
   --help              Show this message and exit.
 ```

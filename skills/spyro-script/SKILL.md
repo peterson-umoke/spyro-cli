@@ -38,7 +38,8 @@ Usage: spyro script [OPTIONS] FILE
     spyro script app/scripts/deploy_hook.php -p staging
 
 Options:
-  -p, --profile TEXT  Profile name  [required]
-  --no-escalate       Don't use sudo
+  -p, --profile TEXT  Profile name (optional with one profile or a [defaults] profile)
+  --no-escalate       Run as the SSH user (no sudo or su)
+  --timeout FLOAT     Command timeout in seconds (default: 120)
   --help              Show this message and exit.
 ```
